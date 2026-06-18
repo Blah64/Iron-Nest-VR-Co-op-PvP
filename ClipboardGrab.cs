@@ -98,8 +98,37 @@ namespace IronNestVR
                 _cb = arr[0].TryCast<ClipboardStateController>();
                 _clip = _cb != null ? _cb.transform : null;
                 _holder = _clip != null ? _clip.parent : null;
-                if (_holder != null) Log.LogInfo($"[grab] clipboard ready (holder '{_holder.name}', grip-squeeze near it to move).");
+                if (_holder != null)
+                {
+                    DisablePositionConstrainers();
+                    if (Config.ClipboardScale > 0f && Mathf.Abs(Config.ClipboardScale - 1f) > 0.001f)
+                    {
+                        _holder.localScale = _holder.localScale * Config.ClipboardScale;
+                        Log.LogInfo($"[grab] clipboard scaled x{Config.ClipboardScale:0.##} for VR.");
+                    }
+                    Log.LogInfo($"[grab] clipboard ready (holder '{_holder.name}', grip-squeeze near it to move).");
+                }
             }
+        }
+
+        // The clipboard's resting position is re-applied every frame by ClipboardAspectRatioOffsetFader
+        // (a flat-screen-only feature). That overwrote our grip move, pinning the clipboard to a fixed
+        // distance (orbit). Disable it so the grabbed position actually sticks.
+        private void DisablePositionConstrainers()
+        {
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<ClipboardAspectRatioOffsetFader>(), FindObjectsSortMode.None);
+                if (arr == null) return;
+                int n = 0;
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    var f = arr[i].TryCast<ClipboardAspectRatioOffsetFader>();
+                    if (f != null && f.enabled) { f.enabled = false; n++; }
+                }
+                if (n > 0) Log.LogInfo($"[grab] disabled {n} clipboard position-fader(s) for free placement.");
+            }
+            catch (Exception e) { Log.LogWarning("[grab] fader disable: " + e.Message); }
         }
 
         public void Reset() { _cb = null; _clip = null; _holder = null; _hand = 0; }

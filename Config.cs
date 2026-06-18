@@ -91,6 +91,9 @@ namespace IronNestVR
         public static bool ClipboardGrabEnabled = true;
         // Hand must be within this distance (m) of the clipboard to grab it with the grip button.
         public static float GrabRadius = 0.4f;
+        // Scale the clipboard up for VR: it was authored for the flat ~60° FOV; the VR view is ~94°,
+        // so the same object looks ~half size. 1.8 roughly cancels that. 1 = no change.
+        public static float ClipboardScale = 1.8f;
 
         // --- Interaction diagnostics ---
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).
