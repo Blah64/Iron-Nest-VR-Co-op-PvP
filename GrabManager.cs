@@ -103,15 +103,47 @@ namespace IronNestVR
             var origin = rig.OriginTransform;
             if (origin == null) return;
             bool rotate = Config.HudRotateWithCamera;
+            var cam = Camera.main;
             foreach (var it in _items.Values)
             {
                 if (it == _grabbed || it.Mode != Mode.HeadLocked || it.Move == null) continue;
-                if (!it.HasOffset) CaptureOffset(it, hp, hr, origin); // first frame: keep its current spot
+                if (!it.HasOffset) CaptureInitial(it, hp, hr, origin, cam); // start it in view, in front of you
                 if (rotate)
                     it.Move.SetPositionAndRotation(hp + hr * it.HeadOffPos, hr * it.HeadOffRot);
                 else
                     it.Move.SetPositionAndRotation(origin.TransformPoint(it.OriginOffPos), origin.rotation * it.OriginOffRot);
             }
+        }
+
+        // Initial placement: a HUD prop is authored in front of MAIN CAMERA, but Main Camera doesn't
+        // track the VR head — so its current world pose can be off-screen/behind in VR. Transplant its
+        // Main-Camera-relative (authored) pose onto the VR head so it starts in front of you, in view.
+        private static void CaptureInitial(Item it, Vector3 hp, Quaternion hr, Transform origin, Camera cam)
+        {
+            Vector3 camLocalPos;
+            Quaternion camLocalRot;
+            if (cam != null)
+            {
+                var ct = cam.transform;
+                camLocalPos = ct.InverseTransformPoint(it.Move.position);
+                camLocalRot = Quaternion.Inverse(ct.rotation) * it.Move.rotation;
+            }
+            else
+            {
+                var invH = Quaternion.Inverse(hr);
+                camLocalPos = invH * (it.Move.position - hp);
+                camLocalRot = invH * it.Move.rotation;
+            }
+
+            it.HeadOffPos = camLocalPos;
+            it.HeadOffRot = camLocalRot;
+
+            // Same world pose, expressed in the rig-origin frame too (for the no-rotate follow mode).
+            Vector3 wpos = hp + hr * camLocalPos;
+            Quaternion wrot = hr * camLocalRot;
+            it.OriginOffPos = origin.InverseTransformPoint(wpos);
+            it.OriginOffRot = Quaternion.Inverse(origin.rotation) * wrot;
+            it.HasOffset = true;
         }
 
         private static void CaptureOffset(Item it, Vector3 hp, Quaternion hr, Transform origin)
