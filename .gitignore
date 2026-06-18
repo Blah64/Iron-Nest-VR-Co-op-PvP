@@ -1,0 +1,27 @@
+# Build outputs
+bin/
+obj/
+*.user
+
+# Visual Studio
+.vs/
+*.suo
+*.sln.docstates
+
+# NuGet
+*.nupkg
+packages/
+
+# Unity/BepInEx referenced assemblies (don't commit game DLLs)
+lib/
+libs/
+references/
+Managed/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
