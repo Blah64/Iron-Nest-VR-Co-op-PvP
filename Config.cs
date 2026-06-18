@@ -77,6 +77,11 @@ namespace IronNestVR
         public static float TurnDeadzone = 0.2f;
         // Smooth-turn rate (deg/sec) at full stick deflection.
         public static float TurnSpeedDegPerSec = 110f;
+        // Snap turn instead of smooth: flick the stick to rotate by a fixed angle once.
+        public static bool SnapTurn = false;
+        public static float SnapTurnAngle = 30f;     // degrees per snap
+        public static float SnapTurnThreshold = 0.7f; // stick past this triggers a snap
+        public static float SnapTurnReArm = 0.3f;     // stick must fall below this before the next snap
 
         // --- HUD follow (held clipboard etc. lag-follow the VR head, not the flat camera) ---
         public static bool HudFollowEnabled = true;
@@ -94,6 +99,16 @@ namespace IronNestVR
         // Scale the clipboard up for VR: it was authored for the flat ~60° FOV; the VR view is ~94°,
         // so the same object looks ~half size. 1.8 roughly cancels that. 1 = no change.
         public static float ClipboardScale = 1.8f;
+
+        // --- VR settings menu (click BOTH thumbsticks at once to open/close) ---
+        public static bool MenuEnabled = true;
+        // Where the panel appears, relative to the head when opened (it then stays put in the world).
+        public static float MenuDistance = 0.8f;       // metres in front
+        public static float MenuHeightOffset = -0.05f; // metres below eye level
+        // Overall size multiplier for the whole panel + text (one knob to tune readability).
+        public static float MenuScale = 1f;
+        // Rotate the panel 180° if it ends up facing away from you (handedness sanity flip).
+        public static bool MenuFlip = false;
 
         // --- Interaction diagnostics ---
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).

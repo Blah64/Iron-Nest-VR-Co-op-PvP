@@ -28,6 +28,7 @@ namespace IronNestVR
         private int _hand;         // 0 = none, 1 = left, 2 = right
         private Vector3 _offPos;   // clipboard pose relative to the grabbing controller
         private Quaternion _offRot;
+        private float _appliedScale = 1f; // last ClipboardScale we applied to the holder
 
         public void Tick(VrInput input, CameraRig rig, bool active)
         {
@@ -36,6 +37,7 @@ namespace IronNestVR
                 if (!Config.ClipboardGrabEnabled || !active) { _hand = 0; return; }
                 EnsureFound();
                 if (_holder == null) return;
+                DiagThrottled();
                 var origin = rig.OriginTransform;
                 if (origin == null) return;
 
@@ -86,28 +88,35 @@ namespace IronNestVR
             rot = origin.rotation * lr;
         }
 
+        private int _boundId; // instance id of the ClipboardStateController we're bound to
+
         private void EnsureFound()
         {
-            if (_holder != null) return;
+            // Re-scan once a second ALWAYS (not just when unbound): a scene change (e.g. loading a
+            // Campaign Mission) destroys the old clipboard and spawns a new one. Comparing instance ids
+            // re-binds to the new clipboard reliably, without depending on a stale reference reading null.
             if (Time.unscaledTime < _nextFind) return;
             _nextFind = Time.unscaledTime + 1f;
 
             var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<ClipboardStateController>(), FindObjectsSortMode.None);
-            if (arr != null && arr.Length > 0)
+            if (arr == null || arr.Length == 0) return;
+            var cb = arr[0].TryCast<ClipboardStateController>();
+            if (cb == null) return;
+
+            int id = cb.GetInstanceID();
+            if (id == _boundId && _holder != null) return; // already bound to this one (same scene)
+
+            _cb = cb;
+            _clip = cb.transform;
+            _holder = _clip != null ? _clip.parent : null;
+            _boundId = id;
+            if (_holder != null)
             {
-                _cb = arr[0].TryCast<ClipboardStateController>();
-                _clip = _cb != null ? _cb.transform : null;
-                _holder = _clip != null ? _clip.parent : null;
-                if (_holder != null)
-                {
-                    DisablePositionConstrainers();
-                    if (Config.ClipboardScale > 0f && Mathf.Abs(Config.ClipboardScale - 1f) > 0.001f)
-                    {
-                        _holder.localScale = _holder.localScale * Config.ClipboardScale;
-                        Log.LogInfo($"[grab] clipboard scaled x{Config.ClipboardScale:0.##} for VR.");
-                    }
-                    Log.LogInfo($"[grab] clipboard ready (holder '{_holder.name}', grip-squeeze near it to move).");
-                }
+                DisablePositionConstrainers();
+                _appliedScale = 1f;
+                ReconcileScale();
+                Log.LogInfo($"[grab] clipboard ready (holder '{_holder.name}', grip-squeeze near it to move).");
+                LogClipboardDiag("found");
             }
         }
 
@@ -131,6 +140,49 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[grab] fader disable: " + e.Message); }
         }
 
-        public void Reset() { _cb = null; _clip = null; _holder = null; _hand = 0; }
+        // One-shot / throttled diagnostic: where is the clipboard, is it active, does a camera see it?
+        private float _nextDiag;
+        public void DiagThrottled()
+        {
+            if (_holder == null || _clip == null) return;
+            if (Time.unscaledTime < _nextDiag) return;
+            _nextDiag = Time.unscaledTime + 2f;
+            LogClipboardDiag("tick");
+        }
+
+        private void LogClipboardDiag(string why)
+        {
+            try
+            {
+                var cam = Camera.main;
+                Vector3 camp = cam != null ? cam.transform.position : Vector3.zero;
+                var rend = _clip.GetComponentInChildren<Renderer>(true);
+                bool rEnabled = rend != null && rend.enabled;
+                bool rVisible = rend != null && rend.isVisible;
+                float dist = Vector3.Distance(_clip.position, camp);
+                Log.LogInfo($"[grab] DIAG {why}: holderLpos={_holder.localPosition} holderScale={_holder.localScale} " +
+                            $"clipLpos={_clip.localPosition} clipWpos={_clip.position} cam={camp} dist={dist:0.00} " +
+                            $"active={_clip.gameObject.activeInHierarchy} rend={(rend != null)} en={rEnabled} vis={rVisible}");
+            }
+            catch (Exception e) { Log.LogWarning("[grab] diag: " + e.Message); }
+        }
+
+        // Re-apply Config.ClipboardScale to the holder when it changes (driven by the VR settings menu).
+        // Safe to call every frame; only multiplies the delta when the target scale actually moves.
+        public void ReconcileScale()
+        {
+            if (_holder == null) return;
+            float target = Config.ClipboardScale > 0f ? Config.ClipboardScale : 1f;
+            if (Mathf.Abs(target - _appliedScale) <= 0.001f) return;
+            try
+            {
+                _holder.localScale = _holder.localScale * (target / _appliedScale);
+                _appliedScale = target;
+                Log.LogInfo($"[grab] clipboard rescaled x{target:0.##}.");
+            }
+            catch (Exception e) { Log.LogWarning("[grab] rescale: " + e.Message); }
+        }
+
+        public void Reset() { _cb = null; _clip = null; _holder = null; _hand = 0; _appliedScale = 1f; _boundId = 0; }
     }
 }

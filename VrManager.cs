@@ -26,6 +26,9 @@ namespace IronNestVR
         private Locomotion _locomotion;
         private HudFollower _hud;
         private ClipboardGrab _clipGrab;
+        private VrSettingsMenu _menu;
+        private bool _prevChord;
+        private float _appliedRenderScale;
         private bool _xrReady;
         private float _nextXrTry;
         private string _lastError;
@@ -68,6 +71,14 @@ namespace IronNestVR
 
                 if (RecenterPressed()) _rig.Recenter();
 
+                // Apply a queued resolution-scale change (from the menu) between frames: rebuild the
+                // swapchains + eye RTs at the new size. Only when the menu is closed, to avoid churn.
+                if (!_menu.IsOpen && Mathf.Abs(Config.RenderScale - _appliedRenderScale) > 0.001f)
+                {
+                    if (_xr.ResizeEyes(out var rerr)) { _rig.Destroy(); _appliedRenderScale = Config.RenderScale; }
+                    else Log.LogWarning("[resize] failed: " + rerr);
+                }
+
                 bool shouldRender = _xr.BeginFrameLocateViews();
 
                 // Controller input + cockpit interaction. Pose locate needs the frame's predicted
@@ -80,11 +91,25 @@ namespace IronNestVR
                     _xr.Input.Sync();
                     _xr.Input.LocatePoses(_xr.LocalSpace, _xr.PredictedDisplayTime);
                     if (_xr.Input.RecenterEdge) _rig.Recenter();
-                    HandleMenuEsc(_xr.Input);
-                    _locomotion.Tick(_xr.Input, _rig, dt);
-                    _clipGrab.Tick(_xr.Input, _rig, active);
+
+                    // Click BOTH thumbsticks at once to open/close the VR settings menu.
+                    bool chord = _xr.Input.StickClickL && _xr.Input.StickClickR;
+                    if (chord && !_prevChord) _menu.Toggle(_rig);
+                    _prevChord = chord;
+
+                    if (_menu.IsOpen)
+                    {
+                        _menu.Tick(_xr.Input, _rig); // menu owns the trigger while open
+                    }
+                    else
+                    {
+                        HandleMenuEsc(_xr.Input);
+                        _locomotion.Tick(_xr.Input, _rig, dt);
+                        _clipGrab.Tick(_xr.Input, _rig, active);
+                    }
+                    _clipGrab.ReconcileScale(); // live clipboard size, even with the menu open
                 }
-                _interactor.Apply(_xr.Input, _rig, dt, active);
+                _interactor.Apply(_xr.Input, _rig, dt, active, active && _menu.IsOpen);
 
                 if (shouldRender) _xr.RenderAndSubmit(_rig, _bridge);
                 else _xr.EndFrame();
@@ -132,6 +157,9 @@ namespace IronNestVR
                 _locomotion = new Locomotion();
                 _hud = new HudFollower();
                 _clipGrab = new ClipboardGrab();
+                _menu = new VrSettingsMenu();
+                _prevChord = false;
+                _appliedRenderScale = Config.RenderScale;
                 _xrReady = true;
                 _lastError = null;
                 Dbg.Reset();
@@ -176,6 +204,8 @@ namespace IronNestVR
             _hud = null;
             _clipGrab?.Reset();
             _clipGrab = null;
+            try { _menu?.Dispose(); } catch { }
+            _menu = null;
             try { _rig?.Destroy(); } catch { }
             _rig = null;
             try { _xr?.Dispose(); } catch { }

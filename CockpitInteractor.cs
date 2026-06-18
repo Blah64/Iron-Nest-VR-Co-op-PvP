@@ -43,7 +43,9 @@ namespace IronNestVR
         private float _nextGeoLog;
 
         /// <param name="active">true only when the session is focused and input is ready.</param>
-        public void Apply(VrInput input, CameraRig rig, float dt, bool active)
+        /// <param name="suppressClick">true while the VR settings menu owns the trigger: keep the
+        /// laser/hover alive but don't synthesize clicks/keys into the game.</param>
+        public void Apply(VrInput input, CameraRig rig, float dt, bool active, bool suppressClick = false)
         {
             try
             {
@@ -91,8 +93,17 @@ namespace IronNestVR
 
                 UpdateLaser(wp, wr);
 
-                HandleClick(input);
-                HandleInteract(input);
+                if (suppressClick)
+                {
+                    // The VR settings menu has the trigger this frame: release anything held in the
+                    // game and don't click/keypress, but keep pointing the laser at the panel.
+                    EndAllInput();
+                }
+                else
+                {
+                    HandleClick(input);
+                    HandleInteract(input);
+                }
 
                 GeometryLog(wp, wr);
             }
@@ -274,7 +285,7 @@ namespace IronNestVR
                 _cam.nearClipPlane = 0.01f;
                 _cam.fieldOfView = 60f;
             }
-            if (_laserGo == null && Config.ShowLaser)
+            if (_laserGo == null)
             {
                 _laserGo = new GameObject("IronNestVR_Laser");
                 UnityEngine.Object.DontDestroyOnLoad(_laserGo);
@@ -327,7 +338,7 @@ namespace IronNestVR
             bool hovering = false;
             try { hovering = _mgr.CurrentHover != null; } catch { }
             if (hovering != _hoverColor) { _hoverColor = hovering; ApplyLaserColor(hovering); }
-            ShowLaser(true);
+            ShowLaser(Config.ShowLaser); // live on/off from the VR settings menu
         }
 
         private void GeometryLog(Vector3 wp, Quaternion wr)

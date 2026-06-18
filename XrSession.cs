@@ -379,6 +379,30 @@ namespace IronNestVR
             return true;
         }
 
+        /// <summary>
+        /// Re-apply <see cref="Config.RenderScale"/> at runtime: destroy the swapchains and re-query the
+        /// eye render size. The swapchains are recreated lazily on the next <see cref="RenderAndSubmit"/>
+        /// (which also rebuilds the rig's eye RTs once the caller has Destroy()'d it). Call only between
+        /// frames (not inside Begin/EndFrame).
+        /// </summary>
+        public bool ResizeEyes(out string error)
+        {
+            error = null;
+            try
+            {
+                if (_swapchainsReady)
+                {
+                    _xr.DestroySwapchain(_swapchains[0]);
+                    _xr.DestroySwapchain(_swapchains[1]);
+                    _swapchainsReady = false;
+                }
+                QueryEyeSizes(); // re-reads Config.RenderScale
+                Log.LogInfo($"[resize] eye render size now {EyeWidth}x{EyeHeight} (scale {Config.RenderScale:0.00}).");
+                return true;
+            }
+            catch (Exception e) { error = e.Message; return false; }
+        }
+
         /// <summary>Acquire + wait the next image of an eye's swapchain; returns its ID3D11Texture2D ptr.</summary>
         private IntPtr AcquireEye(int eye)
         {

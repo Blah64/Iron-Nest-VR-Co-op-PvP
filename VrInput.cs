@@ -33,6 +33,8 @@ namespace IronNestVR
         private XrAction _aMove;     // left thumbstick -> locomotion
         private XrAction _aTurn;     // right thumbstick -> view turn
         private XrAction _aInteract; // right A button -> [E] interact
+        private XrAction _aStickL;   // left thumbstick click  \ both at once -> open VR menu
+        private XrAction _aStickR;   // right thumbstick click /
         private XrAction _aHaptic;   // vibration output
 
         private Space _aimSpace, _gripSpace, _gripSpaceL;
@@ -46,6 +48,7 @@ namespace IronNestVR
         private float _moveX, _moveY;
         private float _turnX, _turnY;
         private bool _interact;
+        private bool _stickL, _stickR;
 
         public Posef AimPose => _aimPose;
         public Posef GripPose => _gripPose;
@@ -63,6 +66,8 @@ namespace IronNestVR
         public float TurnX => _turnX;
         public bool InteractHeld => _interact;
         public bool MenuHeld => _menu;
+        public bool StickClickL => _stickL;
+        public bool StickClickR => _stickR;
 
         // -------- setup (once, after instance) --------
 
@@ -89,6 +94,8 @@ namespace IronNestVR
             if (!MakeAction("move", "Move", ActionType.Vector2fInput, out _aMove, out error)) return false;
             if (!MakeAction("turn", "Turn", ActionType.Vector2fInput, out _aTurn, out error)) return false;
             if (!MakeAction("interact", "Use Key", ActionType.BooleanInput, out _aInteract, out error)) return false;
+            if (!MakeAction("stick_l", "Menu Open L", ActionType.BooleanInput, out _aStickL, out error)) return false;
+            if (!MakeAction("stick_r", "Menu Open R", ActionType.BooleanInput, out _aStickR, out error)) return false;
             if (!MakeAction("haptic", "Haptic", ActionType.VibrationOutput, out _aHaptic, out error)) return false;
 
             // One suggestion call per profile; a profile the runtime rejects is non-fatal (others cover it).
@@ -107,6 +114,8 @@ namespace IronNestVR
                 (_aMove, "/user/hand/left/input/thumbstick"),
                 (_aTurn, "/user/hand/right/input/thumbstick"),
                 (_aInteract, "/user/hand/right/input/a/click"),
+                (_aStickL, "/user/hand/left/input/thumbstick/click"),
+                (_aStickR, "/user/hand/right/input/thumbstick/click"),
                 (_aHaptic, "/user/hand/right/output/haptic"),
             }) ? 1 : 0;
             ok += Suggest("/interaction_profiles/valve/index_controller", new[]
@@ -122,6 +131,8 @@ namespace IronNestVR
                 (_aMove, "/user/hand/left/input/thumbstick"),
                 (_aTurn, "/user/hand/right/input/thumbstick"),
                 (_aInteract, "/user/hand/right/input/a/click"),
+                (_aStickL, "/user/hand/left/input/thumbstick/click"),
+                (_aStickR, "/user/hand/right/input/thumbstick/click"),
                 (_aHaptic, "/user/hand/right/output/haptic"),
             }) ? 1 : 0;
             ok += Suggest("/interaction_profiles/microsoft/motion_controller", new[]
@@ -223,6 +234,8 @@ namespace IronNestVR
             _recenter = GetBool(_aRecenter);
             _menu = GetBool(_aMenu);
             _interact = GetBool(_aInteract);
+            _stickL = GetBool(_aStickL);
+            _stickR = GetBool(_aStickR);
             GetVector2(_aMove, out _moveX, out _moveY);
             GetVector2(_aTurn, out _turnX, out _turnY);
             _grabL = GetBool(_aGrabL);

@@ -19,16 +19,31 @@ namespace IronNestVR
         private CharacterController _cc;
         private float _nextFind;
         private bool _loggedFound;
+        private bool _snapArmed = true; // snap turn fires once per stick flick
 
         public void Tick(VrInput input, CameraRig rig, float dt)
         {
             if (dt <= 0f) return;
 
-            // Right-stick smooth view turn (self-contained in the rig; no game objects needed).
+            // Right-stick view turn (self-contained in the rig; no game objects needed).
             if (Config.TurnEnabled)
             {
                 float tx = input.TurnX;
-                if (Mathf.Abs(tx) > Config.TurnDeadzone)
+                if (Config.SnapTurn)
+                {
+                    // Discrete snap: rotate a fixed angle on the rising flick, then wait for re-arm.
+                    if (_snapArmed && Mathf.Abs(tx) >= Config.SnapTurnThreshold)
+                    {
+                        rig.ApplyTurn(Mathf.Sign(tx) * Config.SnapTurnAngle);
+                        input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
+                        _snapArmed = false;
+                    }
+                    else if (Mathf.Abs(tx) < Config.SnapTurnReArm)
+                    {
+                        _snapArmed = true;
+                    }
+                }
+                else if (Mathf.Abs(tx) > Config.TurnDeadzone)
                 {
                     float scaledT = (Mathf.Abs(tx) - Config.TurnDeadzone) / (1f - Config.TurnDeadzone);
                     rig.ApplyTurn(Mathf.Sign(tx) * scaledT * Config.TurnSpeedDegPerSec * dt);
