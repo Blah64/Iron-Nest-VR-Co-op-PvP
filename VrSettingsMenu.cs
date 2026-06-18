@@ -292,6 +292,8 @@ namespace IronNestVR
                      d => Config.SnapTurnAngle = Clamp(Config.SnapTurnAngle + d * 5f, 10f, 90f));
             AddFloat("Move Speed", () => Config.MoveSpeedScale.ToString("0.0") + "x",
                      d => Config.MoveSpeedScale = Clamp(Config.MoveSpeedScale + d * 0.1f, 0.2f, 3f));
+            AddToggle("HUD Rotates w/View", () => Config.HudRotateWithCamera ? "On" : "Off",
+                      () => Config.HudRotateWithCamera = !Config.HudRotateWithCamera);
             AddToggle("Laser Pointer", () => Config.ShowLaser ? "On" : "Off",
                       () => Config.ShowLaser = !Config.ShowLaser);
             AddAction("Recenter View", () => { _rig?.Recenter(); });

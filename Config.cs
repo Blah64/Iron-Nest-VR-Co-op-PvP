@@ -94,6 +94,9 @@ namespace IronNestVR
 
         // --- Clipboard grab-to-place ---
         public static bool ClipboardGrabEnabled = true;
+        // Head-locked props (HUD clipboard + watch) rotate WITH the VR camera when true; when false
+        // they keep a fixed orientation and only follow your position (you turn to look at them).
+        public static bool HudRotateWithCamera = true;
         // Hand must be within this distance (m) of the clipboard to grab it with the grip button.
         public static float GrabRadius = 0.4f;
         // Scale the clipboard up for VR: it was authored for the flat ~60° FOV; the VR view is ~94°,

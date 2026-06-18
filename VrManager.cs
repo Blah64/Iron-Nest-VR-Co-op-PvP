@@ -25,7 +25,7 @@ namespace IronNestVR
         private CockpitInteractor _interactor;
         private Locomotion _locomotion;
         private HudFollower _hud;
-        private ClipboardGrab _clipGrab;
+        private GrabManager _grab;
         private VrSettingsMenu _menu;
         private bool _prevChord;
         private float _appliedRenderScale;
@@ -105,9 +105,9 @@ namespace IronNestVR
                     {
                         HandleMenuEsc(_xr.Input);
                         _locomotion.Tick(_xr.Input, _rig, dt);
-                        _clipGrab.Tick(_xr.Input, _rig, active);
+                        _grab.Tick(_xr.Input, _rig, active);
                     }
-                    _clipGrab.ReconcileScale(); // live clipboard size, even with the menu open
+                    _grab.ReconcileScale(); // live clipboard size, even with the menu open
                 }
                 _interactor.Apply(_xr.Input, _rig, dt, active, active && _menu.IsOpen);
 
@@ -156,7 +156,7 @@ namespace IronNestVR
                 _interactor = new CockpitInteractor();
                 _locomotion = new Locomotion();
                 _hud = new HudFollower();
-                _clipGrab = new ClipboardGrab();
+                _grab = new GrabManager();
                 _menu = new VrSettingsMenu();
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
@@ -202,8 +202,8 @@ namespace IronNestVR
             _locomotion = null;
             try { _hud?.Dispose(); } catch { }
             _hud = null;
-            _clipGrab?.Reset();
-            _clipGrab = null;
+            _grab?.Reset();
+            _grab = null;
             try { _menu?.Dispose(); } catch { }
             _menu = null;
             try { _rig?.Destroy(); } catch { }
