@@ -97,6 +97,7 @@ namespace IronNestVR
         {
             if (!_open) return;
             try { Hands?.CancelCalibration(); } catch { } // don't leave a grip hijacked after the menu shuts
+            try { Config.Save(); } catch { }               // persist menu edits + hand calibration for next session
             Destroy();
             _open = false;
             _hoverIndex = -1;

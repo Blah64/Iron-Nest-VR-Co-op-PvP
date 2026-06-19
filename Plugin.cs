@@ -26,6 +26,9 @@ namespace IronNestVR
             Logger = Log;
             Log.LogInfo($"{Name} {Version} loading — Unity {Application.unityVersion}");
 
+            // Restore persisted VR settings (menu tunables + hand calibration) before the rig comes up.
+            IronNestVR.Config.Load();
+
             // Make our MonoBehaviour type callable from the IL2CPP runtime.
             ClassInjector.RegisterTypeInIl2Cpp<VrManager>();
 

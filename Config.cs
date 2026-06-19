@@ -1,3 +1,7 @@
+using System;
+using System.Globalization;
+using System.IO;
+using System.Text;
 using UnityEngine;
 
 namespace IronNestVR
@@ -189,5 +193,104 @@ namespace IronNestVR
         public static bool HandManipSuppressDetents = true;
         // Haptic tick amplitude on grab/release and per detent-step crossed while turning a dial.
         public static float DetentHapticAmplitude = 0.3f;
+
+        // ---------------- persistence ----------------
+        // The plain static fields stay the source of truth; Save/Load just mirror the user-tunable subset
+        // (everything the in-VR menu + hand calibration changes) to a key=value file so it survives between
+        // sessions. Loaded once at startup (Plugin.Load); saved when the settings menu closes.
+
+        private static string SettingsPath => Path.Combine(BepInEx.Paths.ConfigPath, "IronNestVR.cfg");
+
+        public static void Save()
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("# IronNestVR settings — written by the in-VR menu. Delete this file to reset to defaults.");
+                WF(sb, "ClipboardScale", ClipboardScale);
+                WF(sb, "WatchScale", WatchScale);
+                WF(sb, "RenderScale", RenderScale);
+                WB(sb, "SnapTurn", SnapTurn);
+                WF(sb, "TurnSpeedDegPerSec", TurnSpeedDegPerSec);
+                WF(sb, "SnapTurnAngle", SnapTurnAngle);
+                WF(sb, "MoveSpeedScale", MoveSpeedScale);
+                WB(sb, "HudRotateWithCamera", HudRotateWithCamera);
+                WB(sb, "LaserAlwaysOn", LaserAlwaysOn);
+                WB(sb, "HandsEnabled", HandsEnabled);
+                WF(sb, "HandScale", HandScale);
+                WV(sb, "HandOffsetPosR", HandOffsetPosR);
+                WV(sb, "HandOffsetEulR", HandOffsetEulR);
+                WV(sb, "HandOffsetPosL", HandOffsetPosL);
+                WV(sb, "HandOffsetEulL", HandOffsetEulL);
+                WB(sb, "FingerCurlEnabled", FingerCurlEnabled);
+                WF(sb, "FingerCurlMaxDeg", FingerCurlMaxDeg);
+                WI(sb, "FingerCurlAxis", FingerCurlAxis);
+                WF(sb, "FingerCurlSign", FingerCurlSign);
+                File.WriteAllText(SettingsPath, sb.ToString());
+                Plugin.Logger?.LogInfo("[config] saved settings to " + SettingsPath);
+            }
+            catch (Exception e) { Plugin.Logger?.LogWarning("[config] save failed: " + e.Message); }
+        }
+
+        public static void Load()
+        {
+            try
+            {
+                if (!File.Exists(SettingsPath)) return;
+                var lines = File.ReadAllLines(SettingsPath);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i].Trim();
+                    if (line.Length == 0 || line[0] == '#') continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    Apply(line.Substring(0, eq).Trim(), line.Substring(eq + 1).Trim());
+                }
+                Plugin.Logger?.LogInfo("[config] loaded settings from " + SettingsPath);
+            }
+            catch (Exception e) { Plugin.Logger?.LogWarning("[config] load failed: " + e.Message); }
+        }
+
+        private static void Apply(string k, string v)
+        {
+            switch (k)
+            {
+                case "ClipboardScale": ClipboardScale = PF(v, ClipboardScale); break;
+                case "WatchScale": WatchScale = PF(v, WatchScale); break;
+                case "RenderScale": RenderScale = PF(v, RenderScale); break;
+                case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
+                case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
+                case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;
+                case "MoveSpeedScale": MoveSpeedScale = PF(v, MoveSpeedScale); break;
+                case "HudRotateWithCamera": HudRotateWithCamera = PB(v, HudRotateWithCamera); break;
+                case "LaserAlwaysOn": LaserAlwaysOn = PB(v, LaserAlwaysOn); break;
+                case "HandsEnabled": HandsEnabled = PB(v, HandsEnabled); break;
+                case "HandScale": HandScale = PF(v, HandScale); break;
+                case "HandOffsetPosR": HandOffsetPosR = PV(v, HandOffsetPosR); break;
+                case "HandOffsetEulR": HandOffsetEulR = PV(v, HandOffsetEulR); break;
+                case "HandOffsetPosL": HandOffsetPosL = PV(v, HandOffsetPosL); break;
+                case "HandOffsetEulL": HandOffsetEulL = PV(v, HandOffsetEulL); break;
+                case "FingerCurlEnabled": FingerCurlEnabled = PB(v, FingerCurlEnabled); break;
+                case "FingerCurlMaxDeg": FingerCurlMaxDeg = PF(v, FingerCurlMaxDeg); break;
+                case "FingerCurlAxis": FingerCurlAxis = PI(v, FingerCurlAxis); break;
+                case "FingerCurlSign": FingerCurlSign = PF(v, FingerCurlSign); break;
+            }
+        }
+
+        private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+        private static void WF(StringBuilder sb, string k, float v) => sb.AppendLine(k + "=" + v.ToString("R", Inv));
+        private static void WI(StringBuilder sb, string k, int v) => sb.AppendLine(k + "=" + v.ToString(Inv));
+        private static void WB(StringBuilder sb, string k, bool v) => sb.AppendLine(k + "=" + (v ? "true" : "false"));
+        private static void WV(StringBuilder sb, string k, Vector3 v) =>
+            sb.AppendLine(k + "=" + v.x.ToString("R", Inv) + " " + v.y.ToString("R", Inv) + " " + v.z.ToString("R", Inv));
+        private static float PF(string v, float def) => float.TryParse(v, NumberStyles.Float, Inv, out var r) ? r : def;
+        private static int PI(string v, int def) => int.TryParse(v, NumberStyles.Integer, Inv, out var r) ? r : def;
+        private static bool PB(string v, bool def) => bool.TryParse(v, out var r) ? r : def;
+        private static Vector3 PV(string v, Vector3 def)
+        {
+            var p = v.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (p.Length != 3) return def;
+            return new Vector3(PF(p[0], def.x), PF(p[1], def.y), PF(p[2], def.z));
+        }
     }
 }
