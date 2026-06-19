@@ -236,15 +236,17 @@ namespace IronNestVR
             Log.LogInfo($"[grab] {how}-grabbed '{it.Name}' ({(hand == 2 ? "right" : "left")}, {it.Mode}).");
         }
 
-        // A prop is grabbable unless it's a world manual that's currently inactive or mid pick-up-zoom
-        // (the game owns its transform then — grabbing would fight the zoom animation).
+        // A prop is grabbable unless it's a world manual that's inactive or mid pick-up/put-back ANIMATION
+        // (the game's coroutine owns the transform then — grabbing would fight the lerp). We DO allow
+        // grabbing while it's floated-up-to-read (isHeld && settled): PickUpZoomTarget has no Update, so
+        // once the move coroutine finishes nothing re-poses it — this is the state the user grabs it in.
         private static bool Grabbable(Item it)
         {
             if (it == null || it.Move == null) return false;
             if (it.Zoom != null)
             {
                 if (!it.Move.gameObject.activeInHierarchy) return false;
-                try { if (it.Zoom.isHeld || it.Zoom.IsMoving) return false; } catch { }
+                try { if (it.Zoom.IsMoving) return false; } catch { }
             }
             return true;
         }
