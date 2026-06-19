@@ -60,8 +60,9 @@ namespace IronNestVR
         public static float LaserMaxDistance = 8f;
         // Reach distance in hand-grab mode — you must put your hand on/into the control.
         public static float HandMaxDistance = 0.30f;
-        // Draw the laser/pointer line.
-        public static bool ShowLaser = true;
+        // Laser/pointer line. When false (default), it only appears while aimed at something
+        // interactable; when true it's drawn at all times.
+        public static bool LaserAlwaysOn = false;
         public static float LaserWidth = 0.004f;
 
         // --- Locomotion (left thumbstick) ---

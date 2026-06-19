@@ -298,8 +298,8 @@ namespace IronNestVR
                      d => Config.MoveSpeedScale = Clamp(Config.MoveSpeedScale + d * 0.1f, 0.2f, 3f));
             AddToggle("HUD Rotates w/View", () => Config.HudRotateWithCamera ? "On" : "Off",
                       () => Config.HudRotateWithCamera = !Config.HudRotateWithCamera);
-            AddToggle("Laser Pointer", () => Config.ShowLaser ? "On" : "Off",
-                      () => Config.ShowLaser = !Config.ShowLaser);
+            AddToggle("Laser Always On", () => Config.LaserAlwaysOn ? "On" : "Off",
+                      () => Config.LaserAlwaysOn = !Config.LaserAlwaysOn);
 
             // --- Hand tuning (live) ---
             AddToggle("Hands", () => Config.HandsEnabled ? "On" : "Off",

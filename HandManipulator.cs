@@ -7,21 +7,15 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// "Gravity glove" manipulation of cockpit dials/levers. The laser stays the targeting tool; when
-    /// the RIGHT grip is squeezed while the laser is on a <c>DialInteractable</c> or
-    /// <c>LinearSliderInteractable</c>, the hand model flies onto the control and rides it, and the
-    /// control is driven directly from controller motion — even though your real hand is across the
-    /// cockpit:
-    ///  • <b>Dial</b>: the controller's twist about the dial's world spin axis (swing-twist decomposition,
-    ///    accumulated per-frame so there's no wrap) maps to dial rotation via
-    ///    <c>SetAccumulatedValueUnlimited</c>.
-    ///  • <b>Lever</b>: the controller's travel along the lever's world axis (<c>GetAxisWorld</c>) maps to
-    ///    handle distance via <c>SetSliderValue(MapDistanceToValue(d))</c>.
-    ///
-    /// We drive the control's own value API rather than the pointer-drag path, so the motion comes from
-    /// the hand, not from sweeping the laser. Detents are suppressed while held (restored on release so
-    /// it snaps), and auto-reset is disabled so the value sticks. Right-hand only (only the right aim
-    /// ray exists); the left hand stays a cosmetic follower.
+    /// "Gravity glove" grab of cockpit dials/levers. The laser stays the targeting tool; squeezing the
+    /// RIGHT grip while the laser is on a <c>DialInteractable</c>/<c>LinearSliderInteractable</c> flies the
+    /// hand model onto the control and starts the GAME'S OWN drag on it (<c>BeginDialDrag</c> /
+    /// <c>BeginSliderDrag</c>) — the exact path the trigger uses, so the control actually turns/slides and
+    /// the turret reacts (the prior value-API drive rotated the knob but bypassed the drag/broker state, so
+    /// it never registered as a real interaction). While held, the control follows the controller pointer
+    /// (the <see cref="CockpitInteractor"/> keeps its raycast camera pinned down the controller every
+    /// frame), and the hand is stuck RIGIDLY to the control's transform so it rides the actual knob/handle.
+    /// Right-hand only (only the right aim ray exists); the left hand stays a cosmetic follower.
     /// </summary>
     internal sealed class HandManipulator
     {
@@ -34,19 +28,13 @@ namespace IronNestVR
         private LinearSliderInteractable _lever;
 
         private bool _prevGrab;
-        private Vector3 _axisW;            // world spin (dial) / travel (lever) axis
-        private Vector3 _pivot;            // dial centre (for rotating the hand anchor)
-        private Quaternion _prevCtrlRot;   // for per-frame twist deltas (dial)
-        private Vector3 _startCtrlPos;     // controller pose at grab (lever)
-        private float _startValue;         // dial accumulated angle / lever distance at grab
-        private float _applied;            // accumulated angle delta (dial) — for detent haptic steps
-        private float _lastDetentMark;
 
-        private Vector3 _handPos;          // current hand anchor riding the control
+        // The hand's grab pose expressed in the control's LOCAL space, reapplied each frame so the hand
+        // rides the actual knob/handle as the game moves it.
+        private Vector3 _stickLocalPos;
+        private Quaternion _stickLocalRot;
+        private Vector3 _handPos;
         private Quaternion _handRot;
-
-        // restored on release
-        private bool _savedDetents, _savedReset;
 
         public bool Active => _kind != Kind.None;
 
@@ -72,8 +60,7 @@ namespace IronNestVR
             catch (Exception e)
             {
                 Log.LogWarning("[manip] " + e.Message);
-                // Best-effort restore on a torn-down control, then reset.
-                try { RestoreFlags(); } catch { }
+                EndDrag();
                 _kind = Kind.None; _dial = null; _lever = null;
                 try { hands.ClearGrab(true); } catch { }
             }
@@ -100,42 +87,32 @@ namespace IronNestVR
         {
             _dial = dial;
             _kind = Kind.Dial;
-            _axisW = SafeNormalize(dial.transform.TransformDirection(dial.rotationAxis), dial.transform.up);
-            _pivot = dial.transform.position;
-            _startValue = dial.AccumulatedValue;
-            _applied = 0f;
-            _lastDetentMark = 0f;
-
-            GetWorld(origin, input.GripPose, out _, out Quaternion cr);
-            _prevCtrlRot = cr;
-            _handPos = hitPoint;
-            _handRot = cr;
-
-            _savedDetents = dial.useDetents;
-            _savedReset = dial.ResetToDefaultValueWithoutNoInput;
-            if (Config.HandManipSuppressDetents) dial.useDetents = false;
-            dial.ResetToDefaultValueWithoutNoInput = false;
-
+            StickTo(dial.transform, hitPoint, input, origin);
+            try { dial.BeginDialDrag(); } catch (Exception e) { Log.LogWarning("[manip] BeginDialDrag: " + e.Message); }
             hands.SetGrab(true, _handPos, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[manip] grabbed dial '{dial.name}' (start angle {_startValue:0.0}).");
+            Log.LogInfo($"[manip] grabbed dial '{dial.name}' (native drag).");
         }
 
         private void EngageLever(LinearSliderInteractable lever, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
         {
             _lever = lever;
             _kind = Kind.Lever;
-            _axisW = SafeNormalize(lever.GetAxisWorld(), lever.transform.up);
-            _startValue = lever.currentDistance;
-
-            GetWorld(origin, input.GripPose, out Vector3 cp, out Quaternion cr);
-            _startCtrlPos = cp;
-            _handPos = hitPoint;
-            _handRot = cr;
-
+            StickTo(lever.transform, hitPoint, input, origin);
+            try { lever.BeginSliderDrag(); } catch (Exception e) { Log.LogWarning("[manip] BeginSliderDrag: " + e.Message); }
             hands.SetGrab(true, _handPos, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[manip] grabbed lever '{lever.name}' (start dist {_startValue:0.000}).");
+            Log.LogInfo($"[manip] grabbed lever '{lever.name}' (native drag).");
+        }
+
+        // Record the grab pose relative to the control's transform, and seed the hand there now.
+        private void StickTo(Transform ctrl, Vector3 hitPoint, VrInput input, Transform origin)
+        {
+            GetWorld(origin, input.GripPose, out _, out Quaternion cr);
+            _stickLocalPos = ctrl.InverseTransformPoint(hitPoint);
+            _stickLocalRot = Quaternion.Inverse(ctrl.rotation) * cr;
+            _handPos = hitPoint;
+            _handRot = cr;
         }
 
         // ---------------- drive ----------------
@@ -145,116 +122,36 @@ namespace IronNestVR
             bool held = input.GrabR && input.GripValid;
             if (!held) { Release(input, hands, "released"); return; }
 
-            if (_kind == Kind.Dial) DriveDial(input, origin, hands);
-            else if (_kind == Kind.Lever) DriveLever(input, origin, hands);
-        }
+            Transform ctrl = _kind == Kind.Dial ? (_dial != null ? _dial.transform : null)
+                           : _kind == Kind.Lever ? (_lever != null ? _lever.transform : null) : null;
+            if (ctrl == null) { Release(input, hands, "control gone"); return; }
 
-        private void DriveDial(VrInput input, Transform origin, HandVisuals hands)
-        {
-            if (_dial == null) { Release(input, hands, "dial gone"); return; }
-
-            GetWorld(origin, input.GripPose, out _, out Quaternion cr);
-            Quaternion inc = cr * Quaternion.Inverse(_prevCtrlRot);
-            _prevCtrlRot = cr;
-
-            float step = TwistDegrees(inc, _axisW) * Config.DialTwistSensitivity;
-            _applied += step;
-
-            float angle = _startValue + _applied;
-            if (TryGetRange(_dial, out float lo, out float hi)) angle = Mathf.Clamp(angle, lo, hi);
-            _dial.SetAccumulatedValueUnlimited(angle, true, false);
-
-            // The hand rides the dial: rotate its anchor about the spin axis by the same step.
-            _handPos = RotateAround(_handPos, _pivot, _axisW, step);
-            _handRot = Quaternion.AngleAxis(step, _axisW) * _handRot;
+            // The game turns/slides the control from the controller pointer (native drag); we only keep
+            // the hand stuck to the moving knob/handle.
+            _handPos = ctrl.TransformPoint(_stickLocalPos);
+            _handRot = ctrl.rotation * _stickLocalRot;
             hands.SetGrab(true, _handPos, _handRot);
-
-            DetentHaptic(input);
-        }
-
-        private void DriveLever(VrInput input, Transform origin, HandVisuals hands)
-        {
-            if (_lever == null) { Release(input, hands, "lever gone"); return; }
-
-            GetWorld(origin, input.GripPose, out Vector3 cp, out _);
-            float delta = Vector3.Dot(cp - _startCtrlPos, _axisW) * Config.LeverMoveSensitivity;
-            float dist = _startValue + delta;
-            float lo = _lever.minDistance, hi = _lever.maxDistance;
-            if (hi > lo) dist = Mathf.Clamp(dist, lo, hi);
-
-            _lever.SetSliderValue(_lever.MapDistanceToValue(dist));
-
-            // The hand rides the handle along the travel axis.
-            hands.SetGrab(true, _handPos + _axisW * (dist - _startValue), _handRot);
-        }
-
-        // Haptic tick each time the dial crosses a detent step while turning.
-        private void DetentHaptic(VrInput input)
-        {
-            if (_dial == null) return;
-            float stepSize;
-            try { if (!_savedDetents || _dial.detentStepSize <= 0f) return; stepSize = _dial.detentStepSize; }
-            catch { return; }
-            if (Mathf.Abs(_applied - _lastDetentMark) >= stepSize)
-            {
-                _lastDetentMark = _applied;
-                input.Haptic(Config.DetentHapticAmplitude, 0.02f);
-            }
         }
 
         // ---------------- release ----------------
 
         private void Release(VrInput input, HandVisuals hands, string why)
         {
-            RestoreFlags();
+            EndDrag();
             try { hands.ClearGrab(true); } catch { }
             try { input.Haptic(Config.DetentHapticAmplitude, 0.03f); } catch { }
             Log.LogInfo($"[manip] released ({why}).");
             _kind = Kind.None; _dial = null; _lever = null;
         }
 
-        private void RestoreFlags()
+        // End the game's native drag on whatever we hold (mirrors Begin*Drag).
+        private void EndDrag()
         {
-            if (_kind == Kind.Dial && _dial != null)
-            {
-                try { _dial.useDetents = _savedDetents; } catch { }
-                try { _dial.ResetToDefaultValueWithoutNoInput = _savedReset; } catch { }
-            }
+            try { if (_kind == Kind.Dial && _dial != null) _dial.EndDialDrag(); } catch { }
+            try { if (_kind == Kind.Lever && _lever != null) _lever.EndSliderDrag(); } catch { }
         }
 
         // ---------------- helpers ----------------
-
-        // Prefer the dial's clamped range; fall back to its raw min/max; skip clamping if unset.
-        private static bool TryGetRange(DialInteractable d, out float lo, out float hi)
-        {
-            lo = 0f; hi = 0f;
-            try
-            {
-                lo = d.ClampedMinRotationAngle; hi = d.ClampedMaxRotationAngle;
-                if (hi > lo) return true;
-                lo = d.minRotationAngle; hi = d.maxRotationAngle;
-                return hi > lo;
-            }
-            catch { return false; }
-        }
-
-        // Signed rotation (degrees) of quaternion dq about a unit axis — the "twist" of a swing-twist
-        // decomposition. Stable for the small per-frame deltas we feed it.
-        private static float TwistDegrees(Quaternion dq, Vector3 axis)
-        {
-            Vector3 ra = new Vector3(dq.x, dq.y, dq.z);
-            Vector3 proj = Vector3.Project(ra, axis);
-            float s = Vector3.Dot(proj, axis);                 // signed sin(theta/2) about axis
-            float ang = 2f * Mathf.Atan2(s, dq.w) * Mathf.Rad2Deg;
-            if (ang > 180f) ang -= 360f; else if (ang < -180f) ang += 360f;
-            return ang;
-        }
-
-        private static Vector3 RotateAround(Vector3 point, Vector3 pivot, Vector3 axis, float deg)
-            => pivot + Quaternion.AngleAxis(deg, axis) * (point - pivot);
-
-        private static Vector3 SafeNormalize(Vector3 v, Vector3 fallback)
-            => v.sqrMagnitude > 1e-8f ? v.normalized : fallback.normalized;
 
         // Walk up from a hit collider to the first transform carrying component T.
         private static T FindUp<T>(Transform t) where T : Component
@@ -277,7 +174,7 @@ namespace IronNestVR
 
         public void Reset()
         {
-            try { RestoreFlags(); } catch { }
+            EndDrag();
             _kind = Kind.None; _dial = null; _lever = null; _prevGrab = false;
         }
     }

@@ -360,7 +360,8 @@ namespace IronNestVR
             bool hovering = false;
             try { hovering = _mgr.CurrentHover != null; } catch { }
             if (hovering != _hoverColor) { _hoverColor = hovering; ApplyLaserColor(hovering); }
-            ShowLaser(Config.ShowLaser); // live on/off from the VR settings menu
+            // Always-on draws it constantly; otherwise only when aimed at an interactable (CurrentHover).
+            ShowLaser(Config.LaserAlwaysOn || hovering);
         }
 
         private void GeometryLog(Vector3 wp, Quaternion wr)
