@@ -74,6 +74,12 @@ namespace IronNestVR
                     RepointInteractionCameras(_cam);
                 }
 
+                // Menus flip the cursor manager to FreeMouse (cursor follows the OS mouse, off-centre),
+                // which puts a constant angular offset on the UI ray. Hold it in FPSLocked + lock-to-
+                // centre so the ray stays == controller forward. Re-asserted every frame because the
+                // game flips it back when a menu/popup takes focus.
+                if (Config.MenuForceCenter) ForceCenterCursor();
+
                 if (!input.AimValid)
                 {
                     // Tracking lost this frame: stop pointing/clicking but stay engaged (don't thrash).
@@ -163,6 +169,22 @@ namespace IronNestVR
             SetRaycastCameraOn(Il2CppType.Of<DialInteractable>(), cam);
             SetRaycastCameraOn(Il2CppType.Of<LinearSliderInteractable>(), cam);
             SetRaycastCameraOn(Il2CppType.Of<HoverTooltip>(), cam);
+        }
+
+        // Pin the game's virtual cursor to screen-centre while we drive interaction, so the UI raycast
+        // (cursorScreenPos through our controller cam) points exactly down the controller. In FPSLocked
+        // with lockToCenterWhenFPSLocked the manager re-centres the cursor itself every frame; we just
+        // make sure it stays in that mode (menus flip it to FreeMouse) and the flag is set.
+        private void ForceCenterCursor()
+        {
+            try
+            {
+                if (_mgr.CurrentMode != DynamicCursorManager.PresentationMode.FPSLocked)
+                    _mgr.SwitchToFPSLocked();
+                var vc = _mgr.virtualCursor;
+                if (vc != null && !vc.lockToCenterWhenFPSLocked) vc.lockToCenterWhenFPSLocked = true;
+            }
+            catch { }
         }
 
         private static void SetRaycastCameraOn(Il2CppSystem.Type t, Camera cam)
@@ -349,6 +371,18 @@ namespace IronNestVR
             string hover = "none";
             try { var h = _mgr.CurrentHover; if (h != null) hover = h.name; } catch { }
             Log.LogInfo($"[interact] ctrl=({wp.x:0.00},{wp.y:0.00},{wp.z:0.00}) fwd=({f.x:0.00},{f.y:0.00},{f.z:0.00}) hover={hover}");
+
+            // UI-cursor mapping (issue C): how the game maps our pointer to a SCREEN position for menus.
+            // If this shifts with render scale, the eye-RT pixel space is leaking into the UI raycast.
+            try
+            {
+                Vector2 ptr = _mgr.GetActivePointerScreenPosition();
+                var mc = UnityEngine.InputSystem.Mouse.current;
+                Vector2 mouse = mc != null ? mc.position.ReadValue() : Vector2.zero;
+                Log.LogInfo($"[ui] screen={Screen.width}x{Screen.height} ptrCam={_cam.pixelWidth}x{_cam.pixelHeight} " +
+                            $"pointerScreenPos={ptr} mouse={mouse}");
+            }
+            catch (Exception e) { Log.LogWarning("[ui] " + e.Message); }
         }
 
         private void ShowLaser(bool on)

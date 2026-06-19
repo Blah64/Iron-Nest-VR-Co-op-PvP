@@ -50,6 +50,7 @@ namespace IronNestVR
         private void Update()
         {
             ScanSceneOnce();
+            Diagnostics.Tick();
 
             if (Config.SelfTestRender) { RunSelfTest(); return; }
 

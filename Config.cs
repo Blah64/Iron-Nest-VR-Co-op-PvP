@@ -83,8 +83,11 @@ namespace IronNestVR
         public static float SnapTurnThreshold = 0.7f; // stick past this triggers a snap
         public static float SnapTurnReArm = 0.3f;     // stick must fall below this before the next snap
 
-        // --- HUD follow (held clipboard etc. lag-follow the VR head, not the flat camera) ---
-        public static bool HudFollowEnabled = true;
+        // --- HUD follow (legacy) ---
+        // Superseded by GrabManager, which now head-locks BOTH the clipboard and the watch with a
+        // runtime toggle (HudRotateWithCamera). HudFollower reparented the watch under its own anchor
+        // and ALWAYS followed head yaw, which fought GrabManager and ignored the toggle — so it's off.
+        public static bool HudFollowEnabled = false;
         // Exponential lag time-constant (s): higher = lazier/smoother follow.
         public static float HudFollowPosLag = 0.18f;
         public static float HudFollowRotLag = 0.22f;
@@ -94,14 +97,19 @@ namespace IronNestVR
 
         // --- Clipboard grab-to-place ---
         public static bool ClipboardGrabEnabled = true;
+        // Also let the world "operating manual" clipboard props (PickUpZoomTarget) be grip-grabbed and
+        // repositioned in 3D (world-locked). Trigger still does the game's click-to-zoom-and-read.
+        public static bool ManualGrabEnabled = true;
         // Head-locked props (HUD clipboard + watch) rotate WITH the VR camera when true; when false
         // they keep a fixed orientation and only follow your position (you turn to look at them).
-        public static bool HudRotateWithCamera = true;
+        public static bool HudRotateWithCamera = false;
         // Hand must be within this distance (m) of the clipboard to grab it with the grip button.
         public static float GrabRadius = 0.4f;
         // Scale the clipboard up for VR: it was authored for the flat ~60° FOV; the VR view is ~94°,
-        // so the same object looks ~half size. 1.8 roughly cancels that. 1 = no change.
-        public static float ClipboardScale = 1.8f;
+        // so the same object looks ~half size. 1 = no change.
+        public static float ClipboardScale = 2.5f;
+        // Same idea for the gun watch (independent knob — it's a different size to start with).
+        public static float WatchScale = 1f;
 
         // --- VR settings menu (click BOTH thumbsticks at once to open/close) ---
         public static bool MenuEnabled = true;
@@ -112,6 +120,14 @@ namespace IronNestVR
         public static float MenuScale = 1f;
         // Rotate the panel 180° if it ends up facing away from you (handedness sanity flip).
         public static bool MenuFlip = false;
+
+        // --- Menu / UI aiming ---
+        // The game's cursor manager raycasts UI through a SCREEN point (the virtual cursor position).
+        // In menus it flips to FreeMouse, so the cursor sits at the (off-centre) mouse position and the
+        // ray gains a constant angular offset from the controller — you have to aim to the side, and the
+        // offset shifts with render scale. Forcing FPSLocked + lock-to-centre while we drive the cursor
+        // pins it to screen-centre, so the ray == controller forward (no offset, render-scale-independent).
+        public static bool MenuForceCenter = true;
 
         // --- Interaction diagnostics ---
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).

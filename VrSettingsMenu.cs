@@ -282,6 +282,8 @@ namespace IronNestVR
 
             AddFloat("Clipboard Size", () => Config.ClipboardScale.ToString("0.0") + "x",
                      d => Config.ClipboardScale = Clamp(Config.ClipboardScale + d * 0.1f, 0.5f, 4f));
+            AddFloat("Watch Size", () => Config.WatchScale.ToString("0.0") + "x",
+                     d => Config.WatchScale = Clamp(Config.WatchScale + d * 0.1f, 0.3f, 4f));
             AddFloat("Resolution Scale", () => Mathf.RoundToInt(Config.RenderScale * 100f) + "%",
                      d => Config.RenderScale = Clamp(Config.RenderScale + d * 0.05f, 0.2f, 1f));
             AddToggle("Turn Mode", () => Config.SnapTurn ? "Snap" : "Smooth",

@@ -33,9 +33,11 @@ namespace IronNestVR
         {
             public string Name;
             public Transform Move;     // transform whose world pose we set
-            public Transform Prox;     // proximity target for grabbing
+            public Transform Prox;     // proximity target for grabbing (fallback)
+            public Renderer Rend;      // visible mesh — grab by its bounds centre (parent pivot can be offset)
             public Mode Mode;
             public bool IsHudClip;     // the one we scale for VR
+            public PickUpZoomTarget Zoom; // non-null for world "operating manual" props (the game's pick-up-to-read)
             // Resting offset captured (on find / grab-release) in two frames so the
             // "rotate with camera" toggle can switch at runtime: head-relative (rotates with view)
             // and rig-origin-relative (follows position, fixed orientation).
@@ -54,6 +56,8 @@ namespace IronNestVR
 
         private Item _hud;             // the HUD clipboard item (for scaling)
         private float _appliedScale = 1f;
+        private Item _watch;           // the gun-watch item (for scaling)
+        private float _appliedWatchScale = 1f;
         private bool _fadersOff;
 
         // ---------------- per-frame ----------------
@@ -76,7 +80,7 @@ namespace IronNestVR
                 else
                 {
                     bool held = _hand == 2 ? (input.GrabR && input.GripValid) : (input.GrabL && input.GripValidL);
-                    if (!held || _grabbed.Move == null) Release(rig);
+                    if (!held || !Grabbable(_grabbed)) Release(rig); // drop if grip released, destroyed, or a manual started zooming
                     else
                     {
                         Posef p = _hand == 2 ? input.GripPose : input.GripPoseL;
@@ -165,8 +169,9 @@ namespace IronNestVR
             float bd = Config.GrabRadius;
             foreach (var it in _items.Values)
             {
-                if (it.Prox == null) continue;
-                float d = Vector3.Distance(cp, it.Prox.position);
+                if (!Grabbable(it)) continue;
+                Vector3 pp = ProxPoint(it);
+                float d = Vector3.Distance(cp, pp);
                 if (d <= bd) { bd = d; best = it; }
             }
             if (best == null) return;
@@ -178,6 +183,28 @@ namespace IronNestVR
             _gRot = inv * best.Move.rotation;
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
             Log.LogInfo($"[grab] grabbed '{best.Name}' ({(hand == 2 ? "right" : "left")} grip, {best.Mode}).");
+        }
+
+        // A prop is grabbable unless it's a world manual that's currently inactive or mid pick-up-zoom
+        // (the game owns its transform then — grabbing would fight the zoom animation).
+        private static bool Grabbable(Item it)
+        {
+            if (it == null || it.Move == null) return false;
+            if (it.Zoom != null)
+            {
+                if (!it.Move.gameObject.activeInHierarchy) return false;
+                try { if (it.Zoom.isHeld || it.Zoom.IsMoving) return false; } catch { }
+            }
+            return true;
+        }
+
+        // Where the prop visibly is, for grab proximity: the renderer bounds centre when available
+        // (the watch's pivot is offset from its visible face), else the proximity transform.
+        private static Vector3 ProxPoint(Item it)
+        {
+            if (it.Rend != null) return it.Rend.bounds.center;
+            if (it.Prox != null) return it.Prox.position;
+            return it.Move != null ? it.Move.position : Vector3.zero;
         }
 
         private void Release(CameraRig rig)
@@ -224,6 +251,7 @@ namespace IronNestVR
                         {
                             Name = hud ? "HUD clipboard" : ("tutorial clipboard '" + clip.name + "'"),
                             Move = move, Prox = clip,
+                            Rend = move.GetComponentInChildren<Renderer>(true),
                             Mode = hud ? Mode.HeadLocked : Mode.WorldLocked,
                             IsHudClip = hud
                         };
@@ -250,8 +278,44 @@ namespace IronNestVR
                     seen.Add(id);
                     if (!_items.ContainsKey(id))
                     {
-                        _items[id] = new Item { Name = "watch '" + watch.name + "'", Move = watch, Prox = watch, Mode = Mode.HeadLocked };
+                        var it = new Item { Name = "watch '" + watch.name + "'", Move = watch, Prox = watch, Rend = watch.GetComponentInChildren<Renderer>(true), Mode = Mode.HeadLocked };
+                        _items[id] = it;
+                        _watch = it;
+                        _appliedWatchScale = 1f;
+                        DisableWatchAnimators(watch); // stop the wrist-raise Animator re-posing it each frame
+                        ReconcileScale();
                         Log.LogInfo($"[grab] tracking watch '{watch.name}' (HeadLocked).");
+                    }
+                }
+            }
+
+            // Operating-manual / instruction clipboards scattered in the world (PickUpZoomTarget props):
+            // grip-grab to reposition them in 3D, world-locked (no camera rotate). Tracked even while
+            // inactive (so there's no add/remove churn) but only grabbable while resting + visible.
+            if (Config.ManualGrabEnabled)
+            {
+                var marr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PickUpZoomTarget>(), FindObjectsInactive.Include, FindObjectsSortMode.None);
+                if (marr != null)
+                {
+                    for (int i = 0; i < marr.Length; i++)
+                    {
+                        var pz = marr[i].TryCast<PickUpZoomTarget>();
+                        if (pz == null) continue;
+                        Transform t = pz.transform;
+                        if (t == null) continue;
+                        int id = t.GetInstanceID();
+                        seen.Add(id);
+                        if (!_items.ContainsKey(id))
+                        {
+                            _items[id] = new Item
+                            {
+                                Name = "manual '" + t.name + "'",
+                                Move = t, Prox = t,
+                                Rend = t.GetComponentInChildren<Renderer>(true),
+                                Mode = Mode.WorldLocked,
+                                Zoom = pz
+                            };
+                        }
                     }
                 }
             }
@@ -265,6 +329,7 @@ namespace IronNestVR
                 {
                     if (_grabbed != null && _items[id] == _grabbed) { _grabbed = null; _hand = 0; }
                     if (_hud != null && _items[id] == _hud) { _hud = null; }
+                    if (_watch != null && _items[id] == _watch) { _watch = null; }
                     _items.Remove(id);
                 }
             }
@@ -296,16 +361,24 @@ namespace IronNestVR
 
         public void ReconcileScale()
         {
-            if (_hud == null || _hud.Move == null) return;
-            float target = Config.ClipboardScale > 0f ? Config.ClipboardScale : 1f;
-            if (Mathf.Abs(target - _appliedScale) <= 0.001f) return;
+            ApplyScale(_hud, Config.ClipboardScale, ref _appliedScale, "clipboard");
+            ApplyScale(_watch, Config.WatchScale, ref _appliedWatchScale, "watch");
+        }
+
+        // Scale a prop by multiplying only the delta since last applied, so a live settings slider
+        // resizes it without compounding. Drive-followers set position/rotation (not scale), so scale sticks.
+        private static void ApplyScale(Item it, float cfg, ref float applied, string label)
+        {
+            if (it == null || it.Move == null) return;
+            float target = cfg > 0f ? cfg : 1f;
+            if (Mathf.Abs(target - applied) <= 0.001f) return;
             try
             {
-                _hud.Move.localScale = _hud.Move.localScale * (target / _appliedScale);
-                _appliedScale = target;
-                Log.LogInfo($"[grab] clipboard rescaled x{target:0.##}.");
+                it.Move.localScale = it.Move.localScale * (target / applied);
+                applied = target;
+                Log.LogInfo($"[grab] {label} rescaled x{target:0.##}.");
             }
-            catch (Exception e) { Log.LogWarning("[grab] rescale: " + e.Message); }
+            catch (Exception e) { Log.LogWarning($"[grab] {label} rescale: " + e.Message); }
         }
 
         // The clipboards' rest position is re-applied each frame by ClipboardAspectRatioOffsetFader
@@ -327,6 +400,29 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[grab] fader disable: " + e.Message); }
         }
 
+        // The watch ("Gun Watch Parent") carries an Animator (+ AnimatorBoolTogglers) that animates its
+        // local pose each frame (wrist raise / show-hide) — it overwrites our grab/head-lock placement,
+        // so the watch was unmovable AND followed the flat camera regardless of the rotate toggle. The
+        // needles are driven by the GunStopwatch SCRIPT (not the Animator), so disabling the Animator
+        // keeps the hands ticking; it just stops the transform from being re-posed. Same idea as the
+        // clipboard's position-fader. (The watch then stays visible, which is what we want in VR.)
+        private static void DisableWatchAnimators(Transform watch)
+        {
+            try
+            {
+                var arr = watch.GetComponentsInChildren<Animator>(true);
+                if (arr == null) return;
+                int n = 0;
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    var a = arr[i];
+                    if (a != null && a.enabled) { a.enabled = false; n++; }
+                }
+                if (n > 0) Log.LogInfo($"[grab] disabled {n} watch animator(s).");
+            }
+            catch (Exception e) { Log.LogWarning("[grab] watch animator disable: " + e.Message); }
+        }
+
         private static void GetWorld(Transform origin, Posef pose, out Vector3 pos, out Quaternion rot)
         {
             var lp = new Vector3(pose.Position.X, pose.Position.Y, -pose.Position.Z);
@@ -338,8 +434,8 @@ namespace IronNestVR
         public void Reset()
         {
             _items.Clear();
-            _hud = null; _grabbed = null; _hand = 0;
-            _appliedScale = 1f; _fadersOff = false;
+            _hud = null; _watch = null; _grabbed = null; _hand = 0;
+            _appliedScale = 1f; _appliedWatchScale = 1f; _fadersOff = false;
             _nextScan = 0f;
         }
     }
