@@ -133,5 +133,43 @@ namespace IronNestVR
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).
         public static bool LogInteractGeometry = true;
         public static float InteractLogIntervalSec = 2f;
+
+        // --- Phase 6: VR hand models + physical dial/lever grab ("gravity glove") ---
+        // Render tracked hand models at the controller grip poses. Loaded from an AssetBundle
+        // shipped beside the plugin; if the bundle or a prefab is missing, a simple primitive hand
+        // is used instead so the grab mechanic still works without the art.
+        public static bool HandsEnabled = true;
+        // AssetBundle file (looked for next to IronNestVR.dll) and the prefab asset names inside it.
+        // If HandPrefabLeft is absent, the right prefab is mirrored (negative-X scale) for the left.
+        public static string HandBundleFile = "hands.bundle";
+        public static string HandPrefabRight = "HandRight";
+        public static string HandPrefabLeft = "HandLeft";
+        // Re-map any non-URP material on the loaded hand to URP/Lit (a bundle built outside a URP
+        // project renders magenta otherwise). Turn off if your bundle already uses URP shaders.
+        public static bool HandFixMaterials = true;
+        // Uniform scale + local pose offset of the hand model from the raw grip pose (wrist origins
+        // and authored scales vary between assets — tune so the palm sits where your hand is).
+        public static float HandScale = 1f;
+        public static float HandPosOffsetX = 0f, HandPosOffsetY = 0f, HandPosOffsetZ = 0f;
+        public static float HandEulerX = 0f, HandEulerY = 0f, HandEulerZ = 0f;
+        // Animator float params driven by trigger (index curl) and grip (fist). Set to "" to disable
+        // if your hand prefab has no Animator/controller with these parameters.
+        public static string HandTriggerParam = "Trigger";
+        public static string HandGripParam = "Grip";
+
+        // Physical grab of dials/levers: right-hand grip while the laser is on a control snaps the
+        // hand onto it and drives it from controller motion (the laser stays your targeting tool).
+        public static bool HandManipEnabled = true;
+        // Seconds to lerp the hand from the controller to the grabbed control (and back on release).
+        public static float HandSnapTime = 0.12f;
+        // Dial: degrees of dial rotation per degree of controller twist about the dial's spin axis.
+        public static float DialTwistSensitivity = 1f;
+        // Lever: metres of handle travel per metre of controller travel along the lever's axis.
+        public static float LeverMoveSensitivity = 1f;
+        // Hold a dial smoothly by disabling its detents while grabbed; restored on release so it
+        // snaps to the nearest detent. Turn off if a dial misbehaves.
+        public static bool HandManipSuppressDetents = true;
+        // Haptic tick amplitude on grab/release and per detent-step crossed while turning a dial.
+        public static float DetentHapticAmplitude = 0.3f;
     }
 }

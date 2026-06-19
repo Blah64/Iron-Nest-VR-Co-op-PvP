@@ -26,6 +26,8 @@ namespace IronNestVR
         private Locomotion _locomotion;
         private HudFollower _hud;
         private GrabManager _grab;
+        private HandVisuals _hands;
+        private HandManipulator _handManip;
         private VrSettingsMenu _menu;
         private bool _prevChord;
         private float _appliedRenderScale;
@@ -101,16 +103,21 @@ namespace IronNestVR
                     if (_menu.IsOpen)
                     {
                         _menu.Tick(_xr.Input, _rig); // menu owns the trigger while open
+                        _handManip.Tick(_xr.Input, _rig, _hands, false); // release any held control
                     }
                     else
                     {
                         HandleMenuEsc(_xr.Input);
                         _locomotion.Tick(_xr.Input, _rig, dt);
-                        _grab.Tick(_xr.Input, _rig, active);
+                        // Gravity-glove dial/lever grab runs first; while it holds a control it owns the
+                        // right grip, so the prop GrabManager stands down to avoid fighting over it.
+                        _handManip.Tick(_xr.Input, _rig, _hands, true);
+                        if (!_handManip.Active) _grab.Tick(_xr.Input, _rig, active);
                     }
                     _grab.ReconcileScale(); // live clipboard size, even with the menu open
+                    _hands.Tick(_xr.Input, _rig, active); // pose hand models (after manip sets overrides)
                 }
-                _interactor.Apply(_xr.Input, _rig, dt, active, active && _menu.IsOpen);
+                _interactor.Apply(_xr.Input, _rig, dt, active, active && (_menu.IsOpen || _handManip.Active));
 
                 if (shouldRender) _xr.RenderAndSubmit(_rig, _bridge);
                 else _xr.EndFrame();
@@ -158,6 +165,8 @@ namespace IronNestVR
                 _locomotion = new Locomotion();
                 _hud = new HudFollower();
                 _grab = new GrabManager();
+                _hands = new HandVisuals();
+                _handManip = new HandManipulator();
                 _menu = new VrSettingsMenu();
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
@@ -205,6 +214,10 @@ namespace IronNestVR
             _hud = null;
             _grab?.Reset();
             _grab = null;
+            _handManip?.Reset();
+            _handManip = null;
+            try { _hands?.Dispose(); } catch { }
+            _hands = null;
             try { _menu?.Dispose(); } catch { }
             _menu = null;
             try { _rig?.Destroy(); } catch { }

@@ -23,6 +23,14 @@
     <PluginDeployDir>$(BepInExDir)\plugins\IronNestVR</PluginDeployDir>
   </PropertyGroup>
 
+  <!-- The Unity project 'IronNestHands' (used to build the hand AssetBundle) lives under this source
+       dir; keep its package-cache/sample scripts out of the plugin's default compile glob. -->
+  <ItemGroup>
+    <Compile Remove="IronNestHands\**" />
+    <EmbeddedResource Remove="IronNestHands\**" />
+    <None Remove="IronNestHands\**" />
+  </ItemGroup>
+
   <ItemGroup>
     <!-- Managed OpenXR + D3D11/DXGI bindings (pure C#, no native build needed) -->
     <PackageReference Include="Silk.NET.OpenXR" Version="2.22.0" />
@@ -48,6 +56,8 @@
     <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(InteropDir)\UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(InteropDir)\UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.AnimationModule"><HintPath>$(InteropDir)\UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
+    <!-- AssetBundle loading for the VR hand models (Phase 6) -->
+    <Reference Include="UnityEngine.AssetBundleModule"><HintPath>$(InteropDir)\UnityEngine.AssetBundleModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.Mathematics"><HintPath>$(InteropDir)\Unity.Mathematics.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Assembly-CSharp"><HintPath>$(InteropDir)\Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Assembly-CSharp-firstpass"><HintPath>$(InteropDir)\Assembly-CSharp-firstpass.dll</HintPath><Private>false</Private></Reference>
