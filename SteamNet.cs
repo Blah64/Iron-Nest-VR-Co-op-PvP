@@ -72,12 +72,23 @@ namespace IronNestVR
 
                 // Register into the game's shared dispatcher. Each in its own try so the log pinpoints any
                 // IL2CPP generic instantiation the build didn't AOT-compile (then we'd pivot to Heathen).
-                try { _cbEnter = Callback<LobbyEnter_t>.Create((Action<LobbyEnter_t>)OnLobbyEnter); Log.LogInfo("[net]  + LobbyEnter callback registered"); }
+                // Re-register only what isn't already registered, so a retry doesn't double-register the
+                // generics that succeeded last pass (a failing one means the build didn't AOT-compile it).
+                try { if (_cbEnter == null) { _cbEnter = Callback<LobbyEnter_t>.Create((Action<LobbyEnter_t>)OnLobbyEnter); Log.LogInfo("[net]  + LobbyEnter callback registered"); } }
                 catch (Exception e) { Log.LogError("[net] LobbyEnter callback FAILED: " + e); }
-                try { _crCreate = CallResult<LobbyCreated_t>.Create((Action<LobbyCreated_t, bool>)OnLobbyCreated); Log.LogInfo("[net]  + LobbyCreated callresult registered"); }
+                try { if (_crCreate == null) { _crCreate = CallResult<LobbyCreated_t>.Create((Action<LobbyCreated_t, bool>)OnLobbyCreated); Log.LogInfo("[net]  + LobbyCreated callresult registered"); } }
                 catch (Exception e) { Log.LogError("[net] LobbyCreated callresult FAILED: " + e); }
-                try { _crList = CallResult<LobbyMatchList_t>.Create((Action<LobbyMatchList_t, bool>)OnLobbyList); Log.LogInfo("[net]  + LobbyMatchList callresult registered"); }
+                try { if (_crList == null) { _crList = CallResult<LobbyMatchList_t>.Create((Action<LobbyMatchList_t, bool>)OnLobbyList); Log.LogInfo("[net]  + LobbyMatchList callresult registered"); } }
                 catch (Exception e) { Log.LogError("[net] LobbyMatchList callresult FAILED: " + e); }
+
+                // LobbyEnter + LobbyCreated are essential: without them create/join silently never report
+                // success. Don't claim READY (which lights up the UI) until both are registered — retry instead.
+                if (_cbEnter == null || _crCreate == null)
+                {
+                    Log.LogError($"[net] essential callbacks missing — NOT ready (retrying). enter={_cbEnter != null} create={_crCreate != null} list={_crList != null}");
+                    return;
+                }
+                if (_crList == null) Log.LogWarning("[net] lobby-list callresult missing — browse disabled, but create/join work");
 
                 _inited = true;
                 Log.LogInfo("[net] READY. Keys:  F9 create lobby | F10 refresh list | F11 join #0 | F12 leave");
@@ -216,6 +227,15 @@ namespace IronNestVR
         private static void OnLobbyEnter(LobbyEnter_t e)
         {
             var id = new CSteamID { m_SteamID = e.m_ulSteamIDLobby };
+            // Check the enter response BEFORE mutating state — a full/locked/denied join (likely here, since
+            // MaxMembers=2 makes "full" a normal path) must not leave us in a phantom lobby. CoopP2P sees
+            // InLobby=false next tick and clears its peer/session/avatar.
+            if (e.m_EChatRoomEnterResponse != (uint)EChatRoomEnterResponse.k_EChatRoomEnterResponseSuccess)
+            {
+                Log.LogError($"[net] ENTER FAILED for lobby {id.m_SteamID} — response={(EChatRoomEnterResponse)e.m_EChatRoomEnterResponse} ({e.m_EChatRoomEnterResponse})");
+                CurrentLobby = default; InLobby = false;
+                return;
+            }
             CurrentLobby = id; InLobby = true;
             int members = SteamMatchmaking.GetNumLobbyMembers(id);
             Log.LogInfo($"[net] ENTERED lobby {id.m_SteamID} — {members} member(s)  (enterResponse={e.m_EChatRoomEnterResponse})");

@@ -22,6 +22,9 @@ namespace IronNestVR
 
         private const int Channel = 0;
         private const byte MSG_POSE = 1;
+        // Exact wire sizes so truncated packets are rejected instead of parsing stale buffer bytes.
+        private const int HeadPacketLen = 2 + 12 + 16;        // msg + flag + headPos(3f) + headRot(4f) = 30
+        private const int HandPacketLen = 2 + (12 + 16) * 3;  // + left + right = 86
 
         private static bool _inited;
         private static ulong _myId;
@@ -62,8 +65,40 @@ namespace IronNestVR
 
         private static void OnSessionRequest(P2PSessionRequest_t r)
         {
-            try { SteamNetworking.AcceptP2PSessionWithUser(r.m_steamIDRemote); Log.LogInfo($"[p2p] accepted P2P session from {r.m_steamIDRemote.m_SteamID}"); }
+            try
+            {
+                // Accepting a session NAT-punches and reveals our IP to the requester, so only accept from a
+                // current lobby member. (Gate the accept on membership — looser than HasPeer==sender so we
+                // don't reject the peer's first request before UpdatePeer has resolved them; consume is strict.)
+                if (!IsCurrentLobbyMember(r.m_steamIDRemote))
+                {
+                    Log.LogWarning($"[p2p] ignoring P2P session from non-lobby sender {r.m_steamIDRemote.m_SteamID}");
+                    return;
+                }
+                SteamNetworking.AcceptP2PSessionWithUser(r.m_steamIDRemote);
+                Log.LogInfo($"[p2p] accepted P2P session from {r.m_steamIDRemote.m_SteamID}");
+            }
             catch (Exception e) { Log.LogWarning("[p2p] accept: " + e.Message); }
+        }
+
+        private static bool IsCurrentLobbyMember(CSteamID id)
+        {
+            if (!SteamNet.InLobby) return false;
+            try
+            {
+                var lobby = SteamNet.CurrentLobby;
+                int n = SteamMatchmaking.GetNumLobbyMembers(lobby);
+                for (int i = 0; i < n; i++)
+                    if (SteamMatchmaking.GetLobbyMemberByIndex(lobby, i).m_SteamID == id.m_SteamID) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private static void CloseSession(CSteamID id)
+        {
+            try { SteamNetworking.CloseP2PSessionWithUser(id); Log.LogInfo($"[p2p] closed P2P session with {id.m_SteamID}"); }
+            catch (Exception e) { Log.LogWarning("[p2p] close: " + e.Message); }
         }
 
         public static void Tick(float dt)
@@ -84,7 +119,7 @@ namespace IronNestVR
         {
             if (!SteamNet.InLobby)
             {
-                if (HasPeer) { HasPeer = false; Log.LogInfo("[p2p] not in lobby — peer cleared"); }
+                if (HasPeer) { CloseSession(Peer); HasPeer = false; Log.LogInfo("[p2p] not in lobby — peer cleared"); }
                 if (!SelfTest) RemoteValid = false;
                 return;
             }
@@ -97,11 +132,17 @@ namespace IronNestVR
                     var m = SteamMatchmaking.GetLobbyMemberByIndex(lobby, i);
                     if (m.m_SteamID != _myId)
                     {
-                        if (!HasPeer || Peer.m_SteamID != m.m_SteamID) { Peer = m; HasPeer = true; Log.LogInfo($"[p2p] peer = {m.m_SteamID}"); }
+                        if (!HasPeer || Peer.m_SteamID != m.m_SteamID)
+                        {
+                            if (HasPeer && Peer.m_SteamID != m.m_SteamID) CloseSession(Peer);  // drop the old peer's session
+                            Peer = m; HasPeer = true;
+                            if (!SelfTest) RemoteValid = false;   // don't carry an old peer's avatar onto the new one
+                            Log.LogInfo($"[p2p] peer = {m.m_SteamID}");
+                        }
                         return;
                     }
                 }
-                if (HasPeer) { HasPeer = false; Log.LogInfo("[p2p] peer left lobby"); }
+                if (HasPeer) { CloseSession(Peer); HasPeer = false; Log.LogInfo("[p2p] peer left lobby"); }
                 if (!SelfTest) RemoteValid = false;
             }
             catch (Exception e) { Log.LogWarning("[p2p] peer: " + e.Message); }
@@ -137,12 +178,27 @@ namespace IronNestVR
                 while (SteamNetworking.IsP2PPacketAvailable(out _, Channel) && guard++ < 64)
                 {
                     if (!SteamNetworking.ReadP2PPacket(_recvArr, (uint)_recvArr.Length, out uint read, out CSteamID from, Channel)) break;
+                    // Only the current lobby peer may drive our avatar — drop anything else (spoof / stale peer).
+                    if (!HasPeer || from.m_SteamID != Peer.m_SteamID) continue;
                     if (read < 2 || _recvArr[0] != MSG_POSE) continue;
-                    bool hands = _recvArr[1] != 0;
+
+                    byte flag = _recvArr[1];
+                    if (flag > 1) continue;                                  // unknown flag (sender only writes 0/1)
+                    bool hands = flag == 1;
+                    if (read < (uint)(hands ? HandPacketLen : HeadPacketLen)) continue;  // truncated — no stale-byte parse
+
+                    // Parse into locals, validate, THEN publish — so a bad packet never leaves torn pose state.
                     int o = 2;
-                    HeadPos = GetV(ref o); HeadRot = GetQ(ref o);
-                    HasHands = hands;
-                    if (hands) { LPos = GetV(ref o); LRot = GetQ(ref o); RPos = GetV(ref o); RRot = GetQ(ref o); }
+                    Vector3 hp = GetV(ref o); Quaternion hr = GetQ(ref o);
+                    Vector3 lp = Vector3.zero, rp = Vector3.zero; Quaternion lr = Quaternion.identity, rr = Quaternion.identity;
+                    if (hands) { lp = GetV(ref o); lr = GetQ(ref o); rp = GetV(ref o); rr = GetQ(ref o); }
+
+                    // NaN/Inf into a Unity transform poisons the hierarchy; a zero quaternion normalizes to NaN.
+                    if (!Finite(hp) || !FiniteRot(hr)) continue;
+                    if (hands && (!Finite(lp) || !Finite(rp) || !FiniteRot(lr) || !FiniteRot(rr))) continue;
+
+                    HeadPos = hp; HeadRot = hr; HasHands = hands;
+                    if (hands) { LPos = lp; LRot = lr; RPos = rp; RRot = rr; }
                     RemoteValid = true; _remoteAge = 0f; _recvd++;
                 }
             }
@@ -153,6 +209,14 @@ namespace IronNestVR
         private static int PutF(int o, float f) { var t = BitConverter.GetBytes(f); _sendArr[o] = t[0]; _sendArr[o + 1] = t[1]; _sendArr[o + 2] = t[2]; _sendArr[o + 3] = t[3]; return o + 4; }
         private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
         private static int PutQ(int o, Quaternion q) { o = PutF(o, q.x); o = PutF(o, q.y); o = PutF(o, q.z); o = PutF(o, q.w); return o; }
+
+        private static bool Finite(float f) => !float.IsNaN(f) && !float.IsInfinity(f);
+        private static bool Finite(Vector3 v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
+        private static bool FiniteRot(Quaternion q)
+        {
+            if (!Finite(q.x) || !Finite(q.y) || !Finite(q.z) || !Finite(q.w)) return false;
+            return (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) > 0.0001f;   // reject degenerate/zero quaternion
+        }
 
         private static float GetF(ref int o) { _f4[0] = _recvArr[o]; _f4[1] = _recvArr[o + 1]; _f4[2] = _recvArr[o + 2]; _f4[3] = _recvArr[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
         private static Vector3 GetV(ref int o) { float x = GetF(ref o), y = GetF(ref o), z = GetF(ref o); return new Vector3(x, y, z); }

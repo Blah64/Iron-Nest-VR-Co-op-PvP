@@ -26,7 +26,8 @@ Managed/
 Thumbs.db
 desktop.ini
 
-*BUNDLE*.md
+OldFiles/
+REVIEW.md
 
 # Unity project used to build the hands AssetBundle — separate concern, not part of the plugin source
 IronNestHands/
