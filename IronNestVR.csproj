@@ -60,6 +60,8 @@
     <Reference Include="UnityEngine.AssetBundleModule"><HintPath>$(InteropDir)\UnityEngine.AssetBundleModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.Mathematics"><HintPath>$(InteropDir)\Unity.Mathematics.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Assembly-CSharp"><HintPath>$(InteropDir)\Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+    <!-- Steamworks.NET (the game's own copy) for Phase 1 co-op lobbies — ride its initialised SteamAPI -->
+    <Reference Include="com.rlabrecque.steamworks.net"><HintPath>$(InteropDir)\com.rlabrecque.steamworks.net.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Assembly-CSharp-firstpass"><HintPath>$(InteropDir)\Assembly-CSharp-firstpass.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.Cinemachine"><HintPath>$(InteropDir)\Unity.Cinemachine.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.InputSystem"><HintPath>$(InteropDir)\Unity.InputSystem.dll</HintPath><Private>false</Private></Reference>

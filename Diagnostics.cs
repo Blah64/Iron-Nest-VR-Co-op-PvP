@@ -18,6 +18,8 @@ namespace IronNestVR
         private static bool _dragDumped;
         private static bool _manualDumped;
         private static int _lastCanvasCount = -1;
+        private static int _coopFpcId = -2;     // re-probe co-op layout when the player rig changes (new scene)
+        private static bool _coopEntitiesDumped; // one-shot combat-entity dump per scene (fires when entities appear)
         private static float _next;
 
         public static void Tick()
@@ -26,6 +28,10 @@ namespace IronNestVR
             _next = Time.unscaledTime + 2f;
             try
             {
+                // Co-op feasibility ground-truth: player rig / body mesh / spawn points / cockpit frame.
+                // Independent of the HUD camera so it captures menu/map scenes too.
+                CoopProbe();
+
                 var cam = Camera.main;
                 if (cam == null) return;
 
@@ -153,6 +159,197 @@ namespace IronNestVR
                 var c = arr[i].TryCast<Component>();
                 if (c == null) continue;
                 Log.LogInfo($"[diag]   - {Path(c.transform)}  comps: {Comps(c.gameObject)}");
+            }
+        }
+
+        // ── Co-op feasibility probe ────────────────────────────────────────────────────────────────
+        // Turns decompile inference into ground truth for the multiplayer scoping: the player rig
+        // structure, whether a reusable body mesh exists (for a remote avatar), the tag-based spawn
+        // points (player-2 placement), and the swaying cockpit frame (the local space a remote avatar
+        // and any positional replicated state must be expressed relative to). Re-dumps whenever the
+        // FirstPersonController instance changes (new scene / mission load). Pure logging.
+        private static void CoopProbe()
+        {
+            try
+            {
+                var fpcArr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<FirstPersonController>(),
+                                 FindObjectsInactive.Include, FindObjectsSortMode.None);
+                int fn = fpcArr != null ? fpcArr.Length : 0;
+                if (fn == 0) return;
+                var fpc0 = fpcArr[0].TryCast<FirstPersonController>();
+                if (fpc0 == null) return;
+                int id = fpc0.GetInstanceID();
+                bool newScene = id != _coopFpcId;
+                if (newScene) { _coopFpcId = id; _coopEntitiesDumped = false; } // re-arm per scene
+
+                // Entities appear mid-scene (combat starts after the intro), so this runs EVERY tick
+                // until it catches the first non-empty set — independent of the once-per-scene rig dump.
+                CoopEntityProbe();
+
+                if (!newScene) return;               // rig/spawn/control already dumped for this scene
+
+                Log.LogInfo($"=== DIAG CO-OP PROBE (FirstPersonController count={fn}) ===");
+
+                // (1) Player rig + body-mesh check (does a reusable avatar mesh exist?).
+                for (int i = 0; i < fn && i < 4; i++)
+                {
+                    var fpc = fpcArr[i].TryCast<FirstPersonController>();
+                    if (fpc == null) continue;
+                    var t = fpc.transform;
+                    Log.LogInfo($"[coop] FPC[{i}] '{Path(t)}' active={fpc.gameObject.activeInHierarchy}");
+                    Log.LogInfo($"[coop]   comps: {Comps(fpc.gameObject)}");
+                    var cr = fpc.cameraRoot;
+                    var amg = fpc.actualMainGameObject;
+                    var mgt = fpc.mainGameObjectTransform;
+                    var cc = fpc.controller;
+                    Log.LogInfo($"[coop]   cameraRoot={(cr != null ? Path(cr) : "null")}");
+                    Log.LogInfo($"[coop]   actualMainGameObject={(amg != null ? Path(amg.transform) : "null")}");
+                    Log.LogInfo($"[coop]   mainGameObjectTransform={(mgt != null ? Path(mgt) : "null")}");
+                    Log.LogInfo($"[coop]   controller={(cc != null ? Path(cc.transform) : "null")}");
+                    DumpRenderers(t);   // search the WHOLE rig root (not just the camera leaf) for a body mesh
+                    Log.LogInfo($"[coop]   cockpit-frame ancestor: {CockpitFrame(t)}");
+                }
+
+                // (2) Tag-based spawn points — how player 2 would be placed.
+                DumpSpawns();
+
+                // (3) Swaying cockpit-frame candidates — the avatar's local parent.
+                DumpAll("MechSwayController", Il2CppType.Of<MechSwayController>());
+                DumpAll("SwingController", Il2CppType.Of<SwingController>());
+                DumpAll("TurretRotationFollowerRigidbody", Il2CppType.Of<TurretRotationFollowerRigidbody>());
+
+                // (4) Turret + per-gun stations (per-gun ownership) and the turret's frame.
+                var turr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<TurretController>(), FindObjectsSortMode.None);
+                if (turr != null && turr.Length > 0)
+                {
+                    var tc = turr[0].TryCast<TurretController>();
+                    if (tc != null) Log.LogInfo($"[coop] TurretController '{Path(tc.transform)}' frame ancestor: {CockpitFrame(tc.transform)}");
+                }
+                var guns = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<GunController>(), FindObjectsSortMode.None);
+                int gn = guns != null ? guns.Length : 0;
+                Log.LogInfo($"[coop] GunController stations: {gn}");
+                for (int i = 0; i < gn && i < 8; i++)
+                {
+                    var g = guns[i].TryCast<GunController>();
+                    if (g != null) Log.LogInfo($"[coop]   - gun[{i}] '{Path(g.transform)}'");
+                }
+
+                // (5) Cockpit control-replication surface: every drag control + its lock-broker tag,
+                // plus the click buttons. This is the set of state both machines must keep in sync, and
+                // the broker tag groups which controls share a lock region.
+                DumpControls("DialInteractable", Il2CppType.Of<DialInteractable>());
+                DumpControls("LinearSliderInteractable", Il2CppType.Of<LinearSliderInteractable>());
+                DumpControls("LookAtTarget(button)", Il2CppType.Of<LookAtTarget>());
+                DumpAll("InteractionLockBroker", Il2CppType.Of<InteractionLockBroker>());
+
+                // (6) Live target enumeration sanity (entities to replicate later).
+                Log.LogInfo($"[coop] EntityLocation in scene: {Count(Il2CppType.Of<EntityLocation>())}");
+            }
+            catch (Exception e) { Log.LogWarning("[coop] " + e.Message); }
+        }
+
+        // Fires once per scene the moment live entities exist (combat starts after the intro), proving
+        // the {ID, Position, Health, State} replication payload is readable at runtime from EntityLocation.
+        private static void CoopEntityProbe()
+        {
+            if (_coopEntitiesDumped) return;
+            var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<EntityLocation>(),
+                          FindObjectsInactive.Include, FindObjectsSortMode.None);
+            int n = arr != null ? arr.Length : 0;
+            if (n == 0) return;
+            _coopEntitiesDumped = true;
+            Log.LogInfo($"=== DIAG CO-OP ENTITIES ({n}) — replication payload sample ===");
+            for (int i = 0; i < n && i < 16; i++)
+            {
+                var el = arr[i].TryCast<EntityLocation>();
+                if (el == null) continue;
+                var e = el.Entity;
+                if (e == null) { Log.LogInfo($"[coop]   - '{Path(el.transform)}' (no MapEntity)"); continue; }
+                var p = e.Position;
+                Log.LogInfo($"[coop]   - id='{e.ID}' name='{e.Name}' role={e.Role} state={e.State} " +
+                            $"hp={e.Health}/{e.MaxHealth} alive={e.IsAlive} pos=({p.x:0.0},{p.y:0.0},{p.z:0.0}) '{Path(el.transform)}'");
+            }
+        }
+
+        // Dial/Slider carry a broker drag-lock (lockBrokerTag) — the per-control ownership primitive co-op
+        // makes network-aware. LookAtTarget buttons have none (instant click = fire-and-forget event).
+        private static void DumpControls(string label, Il2CppSystem.Type t)
+        {
+            var arr = UnityEngine.Object.FindObjectsByType(t, FindObjectsInactive.Include, FindObjectsSortMode.None);
+            int n = arr != null ? arr.Length : 0;
+            Log.LogInfo($"[coop] {label}: {n}");
+            for (int i = 0; i < n && i < 40; i++)
+            {
+                var c = arr[i].TryCast<Component>();
+                if (c == null) continue;
+                string extra = "";
+                try
+                {
+                    var dial = c.TryCast<DialInteractable>();
+                    var slid = c.TryCast<LinearSliderInteractable>();
+                    if (dial != null) extra = $"  brokerLock={dial.useBrokerLockWhileDragging} tag='{dial.lockBrokerTag}'";
+                    else if (slid != null) extra = $"  brokerLock={slid.useBrokerLockWhileDragging} tag='{slid.lockBrokerTag}'";
+                }
+                catch { }
+                Log.LogInfo($"[coop]   - '{Path(c.transform)}'{extra}");
+            }
+        }
+
+        // Count + list every Renderer under the player rig. Zero => no body mesh => the remote avatar
+        // must be built from scratch (reuse the HandVisuals AssetBundle + URP/Lit pipeline).
+        private static void DumpRenderers(Transform root)
+        {
+            try
+            {
+                var rs = root.gameObject.GetComponentsInChildren(Il2CppType.Of<Renderer>(), true);
+                int rn = rs != null ? rs.Length : 0;
+                Log.LogInfo($"[coop]   renderers under rig: {rn}{(rn == 0 ? "  (NO body mesh -> avatar must be built)" : "")}");
+                for (int i = 0; i < rn && i < 12; i++)
+                {
+                    var r = rs[i].TryCast<Renderer>();
+                    if (r != null) Log.LogInfo($"[coop]     - {TypeName(r)} '{Path(r.transform)}'");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[coop] renderers: " + e.Message); }
+        }
+
+        // Nearest ancestor carrying a cockpit-motion component — the swaying frame an avatar (and any
+        // positional replicated state) must be expressed relative to, since the room pitches/rolls.
+        private static string CockpitFrame(Transform t)
+        {
+            for (Transform a = t; a != null; a = a.parent)
+            {
+                var go = a.gameObject;
+                if (go.GetComponent(Il2CppType.Of<MechSwayController>()) != null ||
+                    go.GetComponent(Il2CppType.Of<SwingController>()) != null ||
+                    go.GetComponent(Il2CppType.Of<TurretRotationFollowerRigidbody>()) != null)
+                    return Path(a);
+            }
+            return "(none in ancestry — player NOT parented under the swaying frame)";
+        }
+
+        private static void DumpSpawns()
+        {
+            var sp = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PlayerSpawnPoint>(),
+                         FindObjectsInactive.Include, FindObjectsSortMode.None);
+            int n = sp != null ? sp.Length : 0;
+            Log.LogInfo($"[coop] PlayerSpawnPoint: {n}");
+            for (int i = 0; i < n && i < 16; i++)
+            {
+                var p = sp[i].TryCast<PlayerSpawnPoint>();
+                if (p == null) continue;
+                Log.LogInfo($"[coop]   - '{Path(p.transform)}' playerTag='{p.playerTag}' mode={p.triggerMode} " +
+                            $"applyYaw={p.applyYawRotation} active={p.gameObject.activeInHierarchy}");
+            }
+            var tr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PlayerSpawnTrigger>(),
+                         FindObjectsInactive.Include, FindObjectsSortMode.None);
+            int tn = tr != null ? tr.Length : 0;
+            Log.LogInfo($"[coop] PlayerSpawnTrigger: {tn}");
+            for (int i = 0; i < tn && i < 16; i++)
+            {
+                var p = tr[i].TryCast<PlayerSpawnTrigger>();
+                if (p == null) continue;
+                Log.LogInfo($"[coop]   - '{Path(p.transform)}' spawnPointTag='{p.spawnPointTag}' triggerOnEnable={p.triggerOnEnable}");
             }
         }
 

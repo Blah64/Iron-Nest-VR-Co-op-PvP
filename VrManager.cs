@@ -46,6 +46,48 @@ namespace IronNestVR
             Log.LogInfo("VrManager active. Bringing up OpenXR (needs a headset + active OpenXR runtime).");
         }
 
+        // Flatscreen co-op lobby browser (crossplay counterpart to the in-VR menu page).
+        private void OnGUI()
+        {
+            try { LobbyGui.Draw(); } catch { }
+        }
+
+        // The game is an FPS that locks the OS cursor to centre for mouselook, so the flatscreen lobby
+        // panel is unclickable unless we free the cursor and stop the look while it's open. Done in
+        // LateUpdate (after the game's own Update) so we win the per-frame cursor-lock race.
+        private bool _lookFrozen;
+        private void LateUpdate()
+        {
+            bool flat = LobbyGui.Shown && !_xrReady;
+            LobbyGui.FlatInteractive = flat;
+            if (flat)
+            {
+                try { UnityEngine.Cursor.lockState = UnityEngine.CursorLockMode.None; UnityEngine.Cursor.visible = true; } catch { }
+                SetFpsLook(false);
+                _lookFrozen = true;
+            }
+            else if (_lookFrozen)
+            {
+                SetFpsLook(true);   // hand control back to the game
+                _lookFrozen = false;
+            }
+        }
+
+        private static void SetFpsLook(bool enabled)
+        {
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<FirstPersonController>(), FindObjectsSortMode.None);
+                if (arr != null)
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        var f = arr[i].TryCast<FirstPersonController>();
+                        if (f != null) f.cameraCanMove = enabled;
+                    }
+            }
+            catch { }
+        }
+
         private int _stFrame;
         private bool _stStarted;
 
@@ -53,6 +95,8 @@ namespace IronNestVR
         {
             ScanSceneOnce();
             Diagnostics.Tick();
+            SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
+            LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
 
             if (Config.SelfTestRender) { RunSelfTest(); return; }
 
@@ -171,6 +215,7 @@ namespace IronNestVR
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
                 _xrReady = true;
+                LobbyGui.Shown = false;   // VR uses the in-headset menu page, not the flatscreen panel
                 _lastError = null;
                 Dbg.Reset();
                 Dbg.Step("xr session up; entering frame loop");

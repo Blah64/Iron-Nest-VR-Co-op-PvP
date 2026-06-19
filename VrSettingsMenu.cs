@@ -283,6 +283,19 @@ namespace IronNestVR
             _rows.Clear();
             _idToRow.Clear();
 
+            // --- Co-op lobbies (Phase 1) --- the in-VR counterpart to the flatscreen LobbyGui. Status +
+            // join-slot value text auto-refreshes each tick via RefreshValues, so the list updates live
+            // after "Refresh Lobbies" without rebuilding the menu.
+            AddToggle("Co-op", () => SteamNet.StatusLine(), () => { });
+            AddAction("  Create Lobby", () => SteamNet.CreateLobby());
+            AddAction("  Refresh Lobbies", () => SteamNet.RefreshLobbyList());
+            for (int i = 0; i < 6; i++)
+            {
+                int slot = i;
+                AddToggle("  Join " + (i + 1), () => SteamNet.SlotLabel(slot), () => SteamNet.JoinLobbyByIndex(slot));
+            }
+            AddAction("  Leave Lobby", () => SteamNet.Leave());
+
             AddFloat("Clipboard Size", () => Config.ClipboardScale.ToString("0.0") + "x",
                      d => Config.ClipboardScale = Clamp(Config.ClipboardScale + d * 0.1f, 0.5f, 4f));
             AddFloat("Watch Size", () => Config.WatchScale.ToString("0.0") + "x",
