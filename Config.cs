@@ -158,10 +158,12 @@ namespace IronNestVR
         // VR with the Calibrate tool (grab the hand with the opposite controller and move it) — wrist
         // origins vary between assets, and grabbing it into place beats guessing slider values.
         public static float HandScale = 1f;
-        public static Vector3 HandOffsetPosR = Vector3.zero;   // right hand: model local position (m) under its anchor
-        public static Vector3 HandOffsetEulR = Vector3.zero;   // right hand: model local euler (deg)
-        public static Vector3 HandOffsetPosL = Vector3.zero;   // left hand
-        public static Vector3 HandOffsetEulL = Vector3.zero;
+        // Defaults are a real in-VR calibration (baked in so a fresh install's hands sit roughly right
+        // out of the box); re-Calibrate in the menu for your own controllers, or Reset Hand Offsets.
+        public static Vector3 HandOffsetPosR = new Vector3(0.038537443f, 0.015747365f, 0.02024787f);  // right: model local position (m) under its anchor
+        public static Vector3 HandOffsetEulR = new Vector3(43.800255f, 19.527473f, 309.81247f);       // right: model local euler (deg)
+        public static Vector3 HandOffsetPosL = new Vector3(-0.04657502f, 0.020743763f, 0.0036829882f); // left
+        public static Vector3 HandOffsetEulL = new Vector3(47.386585f, 340.40277f, 69.669525f);
         // Animator float params driven by trigger (index curl) and grip (fist). Set to "" to disable
         // if your hand prefab has no Animator/controller with these parameters.
         public static string HandTriggerParam = "Trigger";
@@ -193,6 +195,16 @@ namespace IronNestVR
         public static bool HandManipSuppressDetents = true;
         // Haptic tick amplitude on grab/release and per detent-step crossed while turning a dial.
         public static float DetentHapticAmplitude = 0.3f;
+
+        // Physical grab of CLICK switches/buttons (LookAtTarget — the simple click-to-activate controls,
+        // not drag dials/levers). Grip-grab one with the laser on it, then PHYSICALLY MOVE your hand: once
+        // the hand travels past SwitchThrowDistance the control fires its click (as if you flipped it).
+        public static bool SwitchGrabEnabled = true;
+        // Metres the grabbed hand must travel from the grab point to trip the switch.
+        public static float SwitchThrowDistance = 0.05f;
+        // Once tripped, the hand must return within this distance of the grab point to re-arm — so a
+        // back-and-forth flips a toggle on then off within one grab (keep < SwitchThrowDistance).
+        public static float SwitchThrowReset = 0.025f;
 
         // ---------------- persistence ----------------
         // The plain static fields stay the source of truth; Save/Load just mirror the user-tunable subset
@@ -226,6 +238,8 @@ namespace IronNestVR
                 WF(sb, "FingerCurlMaxDeg", FingerCurlMaxDeg);
                 WI(sb, "FingerCurlAxis", FingerCurlAxis);
                 WF(sb, "FingerCurlSign", FingerCurlSign);
+                WB(sb, "SwitchGrabEnabled", SwitchGrabEnabled);
+                WF(sb, "SwitchThrowDistance", SwitchThrowDistance);
                 File.WriteAllText(SettingsPath, sb.ToString());
                 Plugin.Logger?.LogInfo("[config] saved settings to " + SettingsPath);
             }
@@ -274,6 +288,8 @@ namespace IronNestVR
                 case "FingerCurlMaxDeg": FingerCurlMaxDeg = PF(v, FingerCurlMaxDeg); break;
                 case "FingerCurlAxis": FingerCurlAxis = PI(v, FingerCurlAxis); break;
                 case "FingerCurlSign": FingerCurlSign = PF(v, FingerCurlSign); break;
+                case "SwitchGrabEnabled": SwitchGrabEnabled = PB(v, SwitchGrabEnabled); break;
+                case "SwitchThrowDistance": SwitchThrowDistance = PF(v, SwitchThrowDistance); break;
             }
         }
 

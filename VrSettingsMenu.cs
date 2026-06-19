@@ -301,6 +301,10 @@ namespace IronNestVR
                       () => Config.HudRotateWithCamera = !Config.HudRotateWithCamera);
             AddToggle("Laser Always On", () => Config.LaserAlwaysOn ? "On" : "Off",
                       () => Config.LaserAlwaysOn = !Config.LaserAlwaysOn);
+            AddToggle("Grab Switches", () => Config.SwitchGrabEnabled ? "On" : "Off",
+                      () => Config.SwitchGrabEnabled = !Config.SwitchGrabEnabled);
+            AddFloat("Switch Throw", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
+                     d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.02f, 0.15f));
 
             // --- Hand tuning (live) ---
             AddToggle("Hands", () => Config.HandsEnabled ? "On" : "Off",
