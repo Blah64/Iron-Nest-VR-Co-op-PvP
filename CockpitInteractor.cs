@@ -33,6 +33,7 @@ namespace IronNestVR
         private GameObject _laserGo;
         private LineRenderer _laser;
         private bool _hoverColor;
+        private bool _forceLaser;   // VR settings menu open -> always show the laser, even outside a mission
 
         private bool _triggerWasHeld;
         private bool _interactWasHeld;
@@ -45,10 +46,11 @@ namespace IronNestVR
         /// <param name="active">true only when the session is focused and input is ready.</param>
         /// <param name="suppressClick">true while the VR settings menu owns the trigger: keep the
         /// laser/hover alive but don't synthesize clicks/keys into the game.</param>
-        public void Apply(VrInput input, CameraRig rig, float dt, bool active, bool suppressClick = false)
+        public void Apply(VrInput input, CameraRig rig, float dt, bool active, bool suppressClick = false, bool forceLaser = false)
         {
             try
             {
+                _forceLaser = forceLaser;
                 rig.UpdateOrigin();
                 var origin = rig.OriginTransform;
 
@@ -58,7 +60,18 @@ namespace IronNestVR
                 if (!want)
                 {
                     if (_engaged) Restore("not in interaction context");
-                    ShowLaser(false);
+                    // Keep the laser visible while the VR menu is open — even outside a mission — so the
+                    // player can see where they're aiming at the panel. Drawn down the controller without
+                    // engaging the game's cursor manager or interaction.
+                    if (forceLaser && origin != null && input.AimValid)
+                    {
+                        EnsureRigObjects();
+                        Posef fp = input.AimPose;
+                        var flp = new Vector3(fp.Position.X, fp.Position.Y, -fp.Position.Z);
+                        var flr = new Quaternion(-fp.Orientation.X, -fp.Orientation.Y, fp.Orientation.Z, fp.Orientation.W);
+                        UpdateLaser(origin.TransformPoint(flp), origin.rotation * flr);
+                    }
+                    else ShowLaser(false);
                     return;
                 }
 
@@ -360,8 +373,9 @@ namespace IronNestVR
             bool hovering = false;
             try { hovering = _mgr.CurrentHover != null; } catch { }
             if (hovering != _hoverColor) { _hoverColor = hovering; ApplyLaserColor(hovering); }
-            // Always-on draws it constantly; otherwise only when aimed at an interactable (CurrentHover).
-            ShowLaser(Config.LaserAlwaysOn || hovering);
+            // Always-on draws it constantly; force-on while the VR menu is open; otherwise only when
+            // aimed at an interactable (CurrentHover).
+            ShowLaser(Config.LaserAlwaysOn || hovering || _forceLaser);
         }
 
         private void GeometryLog(Vector3 wp, Quaternion wr)

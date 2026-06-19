@@ -188,7 +188,7 @@ namespace IronNestVR
                         SendLocalPose(coHp, coHr, true, lp, lr, rp, rr);
                     }
                 }
-                _interactor.Apply(_xr.Input, _rig, dt, active, active && (_menu.IsOpen || _handManip.Active));
+                _interactor.Apply(_xr.Input, _rig, dt, active, active && (_menu.IsOpen || _handManip.Active), _menu.IsOpen);
 
                 if (shouldRender) _xr.RenderAndSubmit(_rig, _bridge);
                 else _xr.EndFrame();
