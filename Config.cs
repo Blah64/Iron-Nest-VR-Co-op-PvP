@@ -1,3 +1,5 @@
+using UnityEngine;
+
 namespace IronNestVR
 {
     /// <summary>
@@ -147,11 +149,14 @@ namespace IronNestVR
         // Re-map any non-URP material on the loaded hand to URP/Lit (a bundle built outside a URP
         // project renders magenta otherwise). Turn off if your bundle already uses URP shaders.
         public static bool HandFixMaterials = true;
-        // Uniform scale + local pose offset of the hand model from the raw grip pose (wrist origins
-        // and authored scales vary between assets — tune so the palm sits where your hand is).
+        // Uniform scale of the hand model. Per-hand local pose offset from the raw grip pose is set in
+        // VR with the Calibrate tool (grab the hand with the opposite controller and move it) — wrist
+        // origins vary between assets, and grabbing it into place beats guessing slider values.
         public static float HandScale = 1f;
-        public static float HandPosOffsetX = 0f, HandPosOffsetY = 0f, HandPosOffsetZ = 0f;
-        public static float HandEulerX = 0f, HandEulerY = 0f, HandEulerZ = 0f;
+        public static Vector3 HandOffsetPosR = Vector3.zero;   // right hand: model local position (m) under its anchor
+        public static Vector3 HandOffsetEulR = Vector3.zero;   // right hand: model local euler (deg)
+        public static Vector3 HandOffsetPosL = Vector3.zero;   // left hand
+        public static Vector3 HandOffsetEulL = Vector3.zero;
         // Animator float params driven by trigger (index curl) and grip (fist). Set to "" to disable
         // if your hand prefab has no Animator/controller with these parameters.
         public static string HandTriggerParam = "Trigger";

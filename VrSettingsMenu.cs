@@ -58,6 +58,7 @@ namespace IronNestVR
         private GameObject _root;
         private TMP_FontAsset _font;
         private CameraRig _rig;
+        internal HandVisuals Hands;   // for the in-menu hand Calibrate tool
         private bool _open;
         private int _hoverIndex = -1;
         private bool _prevTrigger;
@@ -95,6 +96,7 @@ namespace IronNestVR
         public void Close()
         {
             if (!_open) return;
+            try { Hands?.CancelCalibration(); } catch { } // don't leave a grip hijacked after the menu shuts
             Destroy();
             _open = false;
             _hoverIndex = -1;
@@ -304,18 +306,15 @@ namespace IronNestVR
                       () => Config.HandsEnabled = !Config.HandsEnabled);
             AddFloat("Hand Size", () => Config.HandScale.ToString("0.00") + "x",
                      d => Config.HandScale = Clamp(Config.HandScale + d * 0.05f, 0.3f, 2.5f));
-            AddFloat("Hand Right (X)", () => Mathf.RoundToInt(Config.HandPosOffsetX * 1000f) + " mm",
-                     d => Config.HandPosOffsetX = Clamp(Config.HandPosOffsetX + d * 0.005f, -0.15f, 0.15f));
-            AddFloat("Hand Up (Y)", () => Mathf.RoundToInt(Config.HandPosOffsetY * 1000f) + " mm",
-                     d => Config.HandPosOffsetY = Clamp(Config.HandPosOffsetY + d * 0.005f, -0.15f, 0.15f));
-            AddFloat("Hand Fwd (Z)", () => Mathf.RoundToInt(Config.HandPosOffsetZ * 1000f) + " mm",
-                     d => Config.HandPosOffsetZ = Clamp(Config.HandPosOffsetZ + d * 0.005f, -0.15f, 0.15f));
-            AddFloat("Hand Rot X", () => Mathf.RoundToInt(Config.HandEulerX) + " deg",
-                     d => Config.HandEulerX = Wrap360(Config.HandEulerX + d * 15f));
-            AddFloat("Hand Rot Y", () => Mathf.RoundToInt(Config.HandEulerY) + " deg",
-                     d => Config.HandEulerY = Wrap360(Config.HandEulerY + d * 15f));
-            AddFloat("Hand Rot Z", () => Mathf.RoundToInt(Config.HandEulerZ) + " deg",
-                     d => Config.HandEulerZ = Wrap360(Config.HandEulerZ + d * 15f));
+            // Calibrate: tap to arm, then hold the OPPOSITE controller's grip and move the hand into
+            // place (like grabbing the clipboard); release to keep, tap again to finish.
+            AddToggle("Calibrate Right Hand",
+                      () => (Hands != null && Hands.CalibratingRight) ? "hold LEFT grip" : "tap",
+                      () => Hands?.ToggleCalibration(true));
+            AddToggle("Calibrate Left Hand",
+                      () => (Hands != null && Hands.Calibrating && !Hands.CalibratingRight) ? "hold RIGHT grip" : "tap",
+                      () => Hands?.ToggleCalibration(false));
+            AddAction("Reset Hand Offsets", () => Hands?.ResetOffsets());
             AddToggle("Finger Curl", () => Config.FingerCurlEnabled ? "On" : "Off",
                       () => Config.FingerCurlEnabled = !Config.FingerCurlEnabled);
             AddFloat("Curl Amount", () => Mathf.RoundToInt(Config.FingerCurlMaxDeg) + " deg",
@@ -339,8 +338,6 @@ namespace IronNestVR
             => _rows.Add(new Row { Label = label, Kind = Kind.Action, Value = null, Adjust = _ => act() });
 
         private static float Clamp(float v, float lo, float hi) => Mathf.Clamp(v, lo, hi);
-
-        private static float Wrap360(float v) { v %= 360f; return v < 0f ? v + 360f : v; }
 
         private GameObject MakeQuad(Transform parent, Vector3 localPos, Vector3 scale, Color color, bool collider)
         {

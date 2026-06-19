@@ -167,7 +167,7 @@ namespace IronNestVR
                 _grab = new GrabManager();
                 _hands = new HandVisuals();
                 _handManip = new HandManipulator();
-                _menu = new VrSettingsMenu();
+                _menu = new VrSettingsMenu { Hands = _hands };
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
                 _xrReady = true;

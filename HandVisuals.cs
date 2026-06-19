@@ -60,6 +60,34 @@ namespace IronNestVR
         private bool _built;
         private bool _dumpedBones;   // log the hand bone hierarchy only once
 
+        // Calibration: grab a hand model with the OPPOSITE controller and move it; the resulting pose
+        // (expressed in the hand's own controller anchor space) becomes its stored offset. Menu-driven.
+        private enum Calib { None, Right, Left }
+        private Calib _calib;
+        private bool _calibGrab, _prevCalibGrip;
+        private Vector3 _grabCtrlPos, _grabModelPos;
+        private Quaternion _grabCtrlRot, _grabModelRot;
+
+        public bool Calibrating => _calib != Calib.None;
+        public bool CalibratingRight => _calib == Calib.Right;
+
+        public void ToggleCalibration(bool right)
+        {
+            Calib want = right ? Calib.Right : Calib.Left;
+            _calib = (_calib == want) ? Calib.None : want;
+            _calibGrab = false;
+            _prevCalibGrip = true; // swallow a grip that's already held as we enter
+            Log.LogInfo($"[hands] calibrate {(_calib == Calib.None ? "off" : (right ? "RIGHT (hold LEFT grip to move)" : "LEFT (hold RIGHT grip to move)"))}.");
+        }
+
+        public void CancelCalibration() { _calib = Calib.None; _calibGrab = false; }
+
+        public void ResetOffsets()
+        {
+            Config.HandOffsetPosR = Vector3.zero; Config.HandOffsetEulR = Vector3.zero;
+            Config.HandOffsetPosL = Vector3.zero; Config.HandOffsetEulL = Vector3.zero;
+        }
+
         // Unity 6 marshals AssetBundle byte[]/string params through Il2CppSystem.Span.GetPinnableReference,
         // which this il2cpp build never AOT-compiled — so the GENERATED LoadFromFile/LoadFromMemory/LoadAsset
         // wrappers all throw (ReadOnlySpan MissingMethod / "Object was garbage collected"). We bypass them by
@@ -91,6 +119,8 @@ namespace IronNestVR
                 EnsureBuilt();
 
                 float dt = Time.unscaledDeltaTime;
+
+                if (Calibrating) CalibrateTick(input, origin); // updates the offset before it's applied below
 
                 // Right hand: grip pose + trigger (index curl) + grip (other fingers).
                 PoseHand(_right, input.GripValid, origin, input.GripPose,
@@ -140,16 +170,62 @@ namespace IronNestVR
             ApplyCurl(h);
         }
 
-        // Reapply the model child's scale/offset/rotation from Config every frame, so the settings menu
-        // edits it live. HandScale multiplies the model's intrinsic scale; left mirror is a negative X.
+        // Reapply the model child's scale/offset/rotation from Config every frame, so the Calibrate tool
+        // (and any live edit) takes effect without a rebuild. HandScale multiplies the model's intrinsic
+        // scale; left mirror is a negative X. Position/rotation come from the per-hand calibrated offset.
         private void ApplyOffsets(Hand h)
         {
             if (h.Model == null) return;
             float s = Config.HandScale;
             Vector3 bs = h.IntrinsicScale;
+            bool right = (h == _right);
             h.Model.localScale = new Vector3((h.Mirrored ? -1f : 1f) * bs.x * s, bs.y * s, bs.z * s);
-            h.Model.localPosition = new Vector3(Config.HandPosOffsetX, Config.HandPosOffsetY, Config.HandPosOffsetZ);
-            h.Model.localEulerAngles = new Vector3(Config.HandEulerX, Config.HandEulerY, Config.HandEulerZ);
+            h.Model.localPosition = right ? Config.HandOffsetPosR : Config.HandOffsetPosL;
+            h.Model.localEulerAngles = right ? Config.HandOffsetEulR : Config.HandOffsetEulL;
+        }
+
+        // While its grip is held, the OPPOSITE controller rigidly carries the calibrated hand's model
+        // (same feel as grabbing the clipboard). We re-express that world pose in the hand's own
+        // controller-anchor space and store it as the offset, so it sticks once you release.
+        private void CalibrateTick(VrInput input, Transform origin)
+        {
+            bool right = _calib == Calib.Right;
+            Hand h = right ? _right : _left;
+            if (h.Model == null) return;
+
+            // The hand follows its own controller (anchor); the OTHER controller does the grabbing.
+            bool oppValid = right ? input.GripValidL : input.GripValid;
+            bool anchorValid = right ? input.GripValid : input.GripValidL;
+            bool grip = right ? input.GrabL : input.GrabR;
+            if (!oppValid || !anchorValid) { _prevCalibGrip = grip; return; }
+
+            GetWorld(origin, right ? input.GripPoseL : input.GripPose, out Vector3 oppPos, out Quaternion oppRot);
+            GetWorld(origin, right ? input.GripPose : input.GripPoseL, out Vector3 anchorPos, out Quaternion anchorRot);
+
+            if (grip && !_prevCalibGrip)
+            {
+                _grabCtrlPos = oppPos; _grabCtrlRot = oppRot;
+                _grabModelPos = h.Model.position; _grabModelRot = h.Model.rotation;
+                _calibGrab = true;
+                input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
+            }
+            else if (!grip && _prevCalibGrip && _calibGrab)
+            {
+                _calibGrab = false;
+                input.Haptic(Config.DetentHapticAmplitude, 0.03f); // tick: offset captured
+            }
+
+            if (_calibGrab)
+            {
+                Quaternion dq = oppRot * Quaternion.Inverse(_grabCtrlRot);
+                Vector3 newPos = oppPos + dq * (_grabModelPos - _grabCtrlPos);
+                Quaternion newRot = dq * _grabModelRot;
+                Vector3 lp = Quaternion.Inverse(anchorRot) * (newPos - anchorPos);
+                Quaternion lr = Quaternion.Inverse(anchorRot) * newRot;
+                if (right) { Config.HandOffsetPosR = lp; Config.HandOffsetEulR = lr.eulerAngles; }
+                else { Config.HandOffsetPosL = lp; Config.HandOffsetEulL = lr.eulerAngles; }
+            }
+            _prevCalibGrip = grip;
         }
 
         // Curl the finger bones from the smoothed amounts. Index follows the trigger; thumb + other
