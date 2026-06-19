@@ -109,7 +109,7 @@ namespace IronNestVR
         // so the same object looks ~half size. 1 = no change.
         public static float ClipboardScale = 2.5f;
         // Same idea for the gun watch (independent knob — it's a different size to start with).
-        public static float WatchScale = 1f;
+        public static float WatchScale = 2.5f;
 
         // --- VR settings menu (click BOTH thumbsticks at once to open/close) ---
         public static bool MenuEnabled = true;

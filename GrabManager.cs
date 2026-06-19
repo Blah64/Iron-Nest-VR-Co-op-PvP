@@ -59,6 +59,7 @@ namespace IronNestVR
         private Item _watch;           // the gun-watch item (for scaling)
         private float _appliedWatchScale = 1f;
         private bool _fadersOff;
+        private int _lastManualCount = -1;
 
         // ---------------- per-frame ----------------
 
@@ -71,11 +72,21 @@ namespace IronNestVR
                 var origin = rig.OriginTransform;
                 if (origin == null) return;
 
-                // Grab / drag / release.
+                // Grab / drag / release. Right hand: RAY-grab first, because the head-locked watch/clipboard
+                // are always within proximity range and would otherwise hijack every squeeze — so if the
+                // laser is touching a world manual, grab THAT; only fall back to a proximity grab otherwise.
+                // Left hand: proximity only (there's no left aim ray).
                 if (_grabbed == null)
                 {
-                    if (input.GrabR && input.GripValid) TryGrab(2, origin, input.GripPose, input);
-                    else if (input.GrabL && input.GripValidL) TryGrab(1, origin, input.GripPoseL, input);
+                    if (input.GrabR && input.GripValid)
+                    {
+                        bool got = input.AimValid && TryRayGrab(2, origin, input.AimPose, input.GripPose, input);
+                        if (!got) TryGrab(2, origin, input.GripPose, input);
+                    }
+                    else if (input.GrabL && input.GripValidL)
+                    {
+                        TryGrab(1, origin, input.GripPoseL, input);
+                    }
                 }
                 else
                 {
@@ -162,7 +173,7 @@ namespace IronNestVR
             it.HasOffset = true;
         }
 
-        private void TryGrab(int hand, Transform origin, Posef pose, VrInput input)
+        private bool TryGrab(int hand, Transform origin, Posef pose, VrInput input)
         {
             GetWorld(origin, pose, out var cp, out var cr);
             Item best = null;
@@ -174,15 +185,55 @@ namespace IronNestVR
                 float d = Vector3.Distance(cp, pp);
                 if (d <= bd) { bd = d; best = it; }
             }
-            if (best == null) return;
+            if (best == null) return false;
+            Attach(best, hand, cp, cr, input, "grip");
+            return true;
+        }
 
-            _grabbed = best;
+        // Ray/distance grab: grab whatever the laser is actually touching, if it's a world manual — even
+        // out of arm's reach. Uses the CLOSEST hit (matches the visible laser endpoint) and includes
+        // triggers (the manuals' colliders may be triggers). Manuals only (Zoom != null). The manual then
+        // follows the controller at the distance it was grabbed.
+        private float _nextRayLog;
+        private bool TryRayGrab(int hand, Transform origin, Posef aimPose, Posef gripPose, VrInput input)
+        {
+            GetWorld(origin, aimPose, out var ao, out var ar);
+            Vector3 dir = ar * Vector3.forward;
+            if (!Physics.Raycast(ao, dir, out RaycastHit hit, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide))
+                return false;
+            var col = hit.collider;
+            var it = FindItemForCollider(col != null ? col.transform : null);
+            if (it == null || it.Zoom == null || !Grabbable(it))
+            {
+                if (Time.unscaledTime >= _nextRayLog)
+                {
+                    _nextRayLog = Time.unscaledTime + 0.5f;
+                    Log.LogInfo($"[grab] ray hit '{(col != null ? col.name : "null")}' @ {hit.distance:0.0}m — not a grabbable manual.");
+                }
+                return false;
+            }
+            GetWorld(origin, gripPose, out var cp, out var cr);
+            Attach(it, hand, cp, cr, input, "ray@" + hit.distance.ToString("0.0") + "m");
+            return true;
+        }
+
+        // Map a hit collider back to a tracked item by walking up to a transform we know.
+        private Item FindItemForCollider(Transform t)
+        {
+            for (Transform p = t; p != null; p = p.parent)
+                if (_items.TryGetValue(p.GetInstanceID(), out var it)) return it;
+            return null;
+        }
+
+        private void Attach(Item it, int hand, Vector3 cp, Quaternion cr, VrInput input, string how)
+        {
+            _grabbed = it;
             _hand = hand;
             var inv = Quaternion.Inverse(cr);
-            _gPos = inv * (best.Move.position - cp);
-            _gRot = inv * best.Move.rotation;
+            _gPos = inv * (it.Move.position - cp);
+            _gRot = inv * it.Move.rotation;
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[grab] grabbed '{best.Name}' ({(hand == 2 ? "right" : "left")} grip, {best.Mode}).");
+            Log.LogInfo($"[grab] {how}-grabbed '{it.Name}' ({(hand == 2 ? "right" : "left")}, {it.Mode}).");
         }
 
         // A prop is grabbable unless it's a world manual that's currently inactive or mid pick-up-zoom
@@ -333,6 +384,11 @@ namespace IronNestVR
                     _items.Remove(id);
                 }
             }
+
+            // One-shot confirmation that the world manuals registered (debug for ray-grab).
+            int manuals = 0;
+            foreach (var kv in _items) if (kv.Value.Zoom != null) manuals++;
+            if (manuals != _lastManualCount) { _lastManualCount = manuals; Log.LogInfo($"[grab] tracking {manuals} world manual(s) for grab."); }
         }
 
         private static bool IsUnder(Transform t, Transform ancestor)
@@ -436,6 +492,7 @@ namespace IronNestVR
             _items.Clear();
             _hud = null; _watch = null; _grabbed = null; _hand = 0;
             _appliedScale = 1f; _appliedWatchScale = 1f; _fadersOff = false;
+            _lastManualCount = -1;
             _nextScan = 0f;
         }
     }
