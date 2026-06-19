@@ -64,6 +64,13 @@ namespace IronNestVR
         private bool _prevTrigger;
         private int _layer;
 
+        private enum Page { Settings, Lobbies }
+        private Page _page = Page.Settings;
+        private int _scroll;                       // lobby-list scroll offset (windowed view)
+        private const int LOBBY_VISIBLE = 6;       // join slots shown at once on the Lobbies tab
+        private const float TAB_H = 0.05f;
+        private readonly Dictionary<int, int> _idToTab = new Dictionary<int, int>(); // collider id -> page
+
         public bool IsOpen => _open;
 
         public void Toggle(CameraRig rig)
@@ -114,6 +121,7 @@ namespace IronNestVR
                 var origin = rig.OriginTransform;
                 bool gotHit = false;
                 int hoverRow = -1;
+                int hoverTab = -1;
                 Vector3 hitPoint = Vector3.zero;
 
                 if (input.AimValid && origin != null)
@@ -133,9 +141,14 @@ namespace IronNestVR
                             var h = hits[i];
                             var col = h.collider;
                             if (col == null) continue;
-                            if (_idToRow.TryGetValue(col.GetInstanceID(), out int ri) && h.distance < best)
+                            int cid = col.GetInstanceID();
+                            if (_idToRow.TryGetValue(cid, out int ri) && h.distance < best)
                             {
-                                best = h.distance; hoverRow = ri; hitPoint = h.point; gotHit = true;
+                                best = h.distance; hoverRow = ri; hoverTab = -1; hitPoint = h.point; gotHit = true;
+                            }
+                            else if (_idToTab.TryGetValue(cid, out int ti) && h.distance < best)
+                            {
+                                best = h.distance; hoverTab = ti; hoverRow = -1; gotHit = true;
                             }
                         }
                     }
@@ -144,9 +157,10 @@ namespace IronNestVR
                 SetHover(hoverRow);
 
                 bool held = input.TriggerHeld;
-                if (held && !_prevTrigger && gotHit && hoverRow >= 0)
+                if (held && !_prevTrigger && gotHit)
                 {
-                    Activate(hoverRow, hitPoint, rig);
+                    if (hoverTab >= 0) SwitchPage((Page)hoverTab);
+                    else if (hoverRow >= 0) Activate(hoverRow, hitPoint, rig);
                     input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
                 }
                 _prevTrigger = held;
@@ -200,7 +214,7 @@ namespace IronNestVR
         {
             DefineRows();
             int n = _rows.Count;
-            float contentH = PAD + TITLE_H + n * (ROW_H + ROW_GAP) + FOOTER_H + PAD;
+            float contentH = PAD + TITLE_H + TAB_H + n * (ROW_H + ROW_GAP) + FOOTER_H + PAD;
 
             // Place in front of the head, world-locked, facing the player.
             rig.TryGetHeadPose(out var hp, out var hr);
@@ -238,9 +252,14 @@ namespace IronNestVR
             float top = contentH * 0.5f - PAD;
             // Title.
             float titleY = top - TITLE_H * 0.5f;
-            MakeText(_root.transform, "VR SETTINGS", TextAlignmentOptions.Center,
+            MakeText(_root.transform, "IRON NEST VR", TextAlignmentOptions.Center,
                      new Vector3(0f, titleY, Z_TEXT), new Vector2(PANEL_W - 0.06f, TITLE_H * 0.8f), C_LABEL, true);
             float y = top - TITLE_H;
+
+            // Tab bar (Settings | Lobbies) — clickable like rows; switching rebuilds the active page.
+            _idToTab.Clear();
+            BuildTabs(y, Z_ROW, Z_TEXT);
+            y -= TAB_H;
 
             // Rows.
             for (int i = 0; i < n; i++)
@@ -282,20 +301,45 @@ namespace IronNestVR
         {
             _rows.Clear();
             _idToRow.Clear();
+            if (_page == Page.Lobbies) DefineLobbyRows();
+            else DefineSettingsRows();
+        }
 
-            // --- Co-op lobbies (Phase 1) --- the in-VR counterpart to the flatscreen LobbyGui. Status +
-            // join-slot value text auto-refreshes each tick via RefreshValues, so the list updates live
-            // after "Refresh Lobbies" without rebuilding the menu.
-            AddToggle("Co-op", () => SteamNet.StatusLine(), () => { });
-            AddAction("  Create Lobby", () => SteamNet.CreateLobby());
-            AddAction("  Refresh Lobbies", () => SteamNet.RefreshLobbyList());
-            for (int i = 0; i < 6; i++)
+        // The in-VR lobby browser (its own tab). Status + join-slot value text auto-refresh each tick via
+        // RefreshValues, so the list and the scroll window update live without rebuilding the menu.
+        private void DefineLobbyRows()
+        {
+            AddToggle("Status", () => SteamNet.StatusLine(), () => { });
+            AddAction("Create Lobby", () => SteamNet.CreateLobby());
+            AddAction("Refresh List", () => SteamNet.RefreshLobbyList());
+            AddAction("Leave Lobby", () => SteamNet.Leave());
+            AddToggle("Showing", LobbyRangeLabel, () => { });
+            AddAction("Prev Page", () => ScrollLobbies(-1));
+            AddAction("Next Page", () => ScrollLobbies(+1));
+            for (int i = 0; i < LOBBY_VISIBLE; i++)
             {
-                int slot = i;
-                AddToggle("  Join " + (i + 1), () => SteamNet.SlotLabel(slot), () => SteamNet.JoinLobbyByIndex(slot));
+                int slot = i;   // join the lobby at the current scroll window + this slot
+                AddToggle("Join", () => SteamNet.SlotLabel(_scroll + slot), () => SteamNet.JoinLobbyByIndex(_scroll + slot));
             }
-            AddAction("  Leave Lobby", () => SteamNet.Leave());
+            AddAction("Close Menu", Close);
+        }
 
+        private string LobbyRangeLabel()
+        {
+            int n = SteamNet.Lobbies.Count;
+            if (n == 0) return "0 lobbies";
+            int a = _scroll + 1, b = Mathf.Min(_scroll + LOBBY_VISIBLE, n);
+            return $"{a}-{b} of {n}";
+        }
+
+        private void ScrollLobbies(int dir)
+        {
+            int maxScroll = Mathf.Max(0, SteamNet.Lobbies.Count - LOBBY_VISIBLE);
+            _scroll = Mathf.Clamp(_scroll + dir * LOBBY_VISIBLE, 0, maxScroll);
+        }
+
+        private void DefineSettingsRows()
+        {
             AddFloat("Clipboard Size", () => Config.ClipboardScale.ToString("0.0") + "x",
                      d => Config.ClipboardScale = Clamp(Config.ClipboardScale + d * 0.1f, 0.5f, 4f));
             AddFloat("Watch Size", () => Config.WatchScale.ToString("0.0") + "x",
@@ -356,6 +400,42 @@ namespace IronNestVR
             => _rows.Add(new Row { Label = label, Kind = Kind.Action, Value = null, Adjust = _ => act() });
 
         private static float Clamp(float v, float lo, float hi) => Mathf.Clamp(v, lo, hi);
+
+        // Two side-by-side clickable tabs at the top of the panel. Active tab is highlighted; collider ids
+        // map to the page index in _idToTab (handled in Tick alongside the row colliders).
+        private void BuildTabs(float yTop, float zQuad, float zText)
+        {
+            string[] names = { "Settings", "Lobbies" };
+            float usableW = PANEL_W - 0.04f;
+            float tabW = usableW / 2f;
+            float startX = -usableW * 0.5f + tabW * 0.5f;
+            float cy = yTop - TAB_H * 0.5f;
+            for (int p = 0; p < 2; p++)
+            {
+                bool active = (int)_page == p;
+                float tx = startX + p * tabW;
+                var go = MakeQuad(_root.transform, new Vector3(tx, cy, zQuad),
+                                  new Vector3(tabW - 0.008f, TAB_H - 0.006f, 1f), active ? C_ROW_HOVER : C_ROW, true);
+                var mc = go.GetComponent<MeshCollider>();
+                _idToTab[mc != null ? mc.GetInstanceID() : go.GetInstanceID()] = p;
+                MakeText(_root.transform, names[p], TextAlignmentOptions.Center,
+                         new Vector3(tx, cy, zText), new Vector2(tabW - 0.02f, TAB_H * 0.62f),
+                         active ? C_VALUE : C_LABEL, active);
+            }
+        }
+
+        private void SwitchPage(Page p)
+        {
+            if (p == _page || _rig == null) return;
+            _page = p;
+            _scroll = 0;
+            var rig = _rig;
+            Destroy();
+            try { Build(rig); }
+            catch (Exception e) { Log.LogWarning("[menu] tab switch: " + e.Message); Destroy(); _open = false; return; }
+            _hoverIndex = -1;
+            _prevTrigger = true;   // swallow the trigger pull that switched tabs
+        }
 
         private GameObject MakeQuad(Transform parent, Vector3 localPos, Vector3 scale, Color color, bool collider)
         {
@@ -455,6 +535,7 @@ namespace IronNestVR
             _root = null;
             _rows.Clear();
             _idToRow.Clear();
+            _idToTab.Clear();
             _hoverIndex = -1;
             _prevTrigger = false;
         }

@@ -98,6 +98,20 @@ namespace IronNestVR
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
 
+            // Phase 2 co-op: P2P pose channel + remote avatar. Tick (peer discovery + receive) and the
+            // avatar update run in BOTH modes; the VR head+hand send happens in the frame loop below, the
+            // flatscreen camera-pose send happens here. F6 toggles the solo render self-test.
+            if (KeyDown(UnityEngine.InputSystem.Key.F6)) { CoopP2P.SelfTest = !CoopP2P.SelfTest; Log.LogInfo("[p2p] self-test " + (CoopP2P.SelfTest ? "ON" : "OFF")); }
+            CoopP2P.Tick(Time.unscaledDeltaTime);
+            if (!_xrReady)
+            {
+                var fcam = Camera.main;
+                if (fcam != null)
+                    SendLocalPose(fcam.transform.position, fcam.transform.rotation, false,
+                                  Vector3.zero, Quaternion.identity, Vector3.zero, Quaternion.identity);
+            }
+            RemoteAvatar.Update();
+
             if (Config.SelfTestRender) { RunSelfTest(); return; }
 
             if (!_xrReady)
@@ -160,6 +174,19 @@ namespace IronNestVR
                     }
                     _grab.ReconcileScale(); // live clipboard size, even with the menu open
                     _hands.Tick(_xr.Input, _rig, active); // pose hand models (after manip sets overrides)
+
+                    // Co-op: stream our head + hand world poses to the peer (mirrored as fake-remote if F6).
+                    if (_rig.TryGetHeadPose(out var coHp, out var coHr))
+                    {
+                        var origin = _rig.OriginTransform;
+                        Vector3 lp = coHp, rp = coHp; Quaternion lr = coHr, rr = coHr;
+                        if (origin != null)
+                        {
+                            if (_xr.Input.GripValidL) { lp = PoseWorldPos(_xr.Input.GripPoseL, origin); lr = PoseWorldRot(_xr.Input.GripPoseL, origin); }
+                            if (_xr.Input.GripValid)  { rp = PoseWorldPos(_xr.Input.GripPose, origin);  rr = PoseWorldRot(_xr.Input.GripPose, origin); }
+                        }
+                        SendLocalPose(coHp, coHr, true, lp, lr, rp, rr);
+                    }
                 }
                 _interactor.Apply(_xr.Input, _rig, dt, active, active && (_menu.IsOpen || _handManip.Active));
 
@@ -335,6 +362,26 @@ namespace IronNestVR
             else if (!menu && _prevMenu) Win32Input.SendKey(Win32Input.VK_ESCAPE, false);
             _prevMenu = menu;
         }
+
+        // --- Phase 2 co-op pose helpers ---
+        private static Vector3 PoseWorldPos(Posef p, Transform origin)
+        { var lp = new Vector3(p.Position.X, p.Position.Y, -p.Position.Z); return origin.TransformPoint(lp); }
+
+        private static Quaternion PoseWorldRot(Posef p, Transform origin)
+        { var lr = new Quaternion(-p.Orientation.X, -p.Orientation.Y, p.Orientation.Z, p.Orientation.W); return origin.rotation * lr; }
+
+        private void SendLocalPose(Vector3 hp, Quaternion hr, bool hands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)
+        {
+            CoopP2P.SendPose(hp, hr, hands, lp, lr, rp, rr);
+            if (CoopP2P.SelfTest)   // mirror local pose 0.8 m ahead so the avatar is visible solo
+            {
+                Vector3 off = hr * Vector3.forward * 0.8f;
+                CoopP2P.InjectRemote(hp + off, hr, hands, lp + off, lr, rp + off, rr);
+            }
+        }
+
+        private static bool KeyDown(UnityEngine.InputSystem.Key k)
+        { try { var kb = UnityEngine.InputSystem.Keyboard.current; return kb != null && kb[k].wasPressedThisFrame; } catch { return false; } }
 
         private static bool RecenterPressed()
         {
