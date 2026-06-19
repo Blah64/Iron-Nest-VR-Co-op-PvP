@@ -298,6 +298,33 @@ namespace IronNestVR
                       () => Config.HudRotateWithCamera = !Config.HudRotateWithCamera);
             AddToggle("Laser Pointer", () => Config.ShowLaser ? "On" : "Off",
                       () => Config.ShowLaser = !Config.ShowLaser);
+
+            // --- Hand tuning (live) ---
+            AddToggle("Hands", () => Config.HandsEnabled ? "On" : "Off",
+                      () => Config.HandsEnabled = !Config.HandsEnabled);
+            AddFloat("Hand Size", () => Config.HandScale.ToString("0.00") + "x",
+                     d => Config.HandScale = Clamp(Config.HandScale + d * 0.05f, 0.3f, 2.5f));
+            AddFloat("Hand Right (X)", () => Mathf.RoundToInt(Config.HandPosOffsetX * 1000f) + " mm",
+                     d => Config.HandPosOffsetX = Clamp(Config.HandPosOffsetX + d * 0.005f, -0.15f, 0.15f));
+            AddFloat("Hand Up (Y)", () => Mathf.RoundToInt(Config.HandPosOffsetY * 1000f) + " mm",
+                     d => Config.HandPosOffsetY = Clamp(Config.HandPosOffsetY + d * 0.005f, -0.15f, 0.15f));
+            AddFloat("Hand Fwd (Z)", () => Mathf.RoundToInt(Config.HandPosOffsetZ * 1000f) + " mm",
+                     d => Config.HandPosOffsetZ = Clamp(Config.HandPosOffsetZ + d * 0.005f, -0.15f, 0.15f));
+            AddFloat("Hand Rot X", () => Mathf.RoundToInt(Config.HandEulerX) + " deg",
+                     d => Config.HandEulerX = Wrap360(Config.HandEulerX + d * 15f));
+            AddFloat("Hand Rot Y", () => Mathf.RoundToInt(Config.HandEulerY) + " deg",
+                     d => Config.HandEulerY = Wrap360(Config.HandEulerY + d * 15f));
+            AddFloat("Hand Rot Z", () => Mathf.RoundToInt(Config.HandEulerZ) + " deg",
+                     d => Config.HandEulerZ = Wrap360(Config.HandEulerZ + d * 15f));
+            AddToggle("Finger Curl", () => Config.FingerCurlEnabled ? "On" : "Off",
+                      () => Config.FingerCurlEnabled = !Config.FingerCurlEnabled);
+            AddFloat("Curl Amount", () => Mathf.RoundToInt(Config.FingerCurlMaxDeg) + " deg",
+                     d => Config.FingerCurlMaxDeg = Clamp(Config.FingerCurlMaxDeg + d * 5f, 0f, 120f));
+            AddFloat("Curl Axis", () => Config.FingerCurlAxis == 0 ? "X" : Config.FingerCurlAxis == 1 ? "Y" : "Z",
+                     d => Config.FingerCurlAxis = ((Config.FingerCurlAxis + (d >= 0 ? 1 : 2)) % 3));
+            AddToggle("Curl Direction", () => Config.FingerCurlSign >= 0f ? "+" : "-",
+                      () => Config.FingerCurlSign = -Config.FingerCurlSign);
+
             AddAction("Recenter View", () => { _rig?.Recenter(); });
             AddAction("Close Menu", Close);
         }
@@ -312,6 +339,8 @@ namespace IronNestVR
             => _rows.Add(new Row { Label = label, Kind = Kind.Action, Value = null, Adjust = _ => act() });
 
         private static float Clamp(float v, float lo, float hi) => Mathf.Clamp(v, lo, hi);
+
+        private static float Wrap360(float v) { v %= 360f; return v < 0f ? v + 360f : v; }
 
         private GameObject MakeQuad(Transform parent, Vector3 localPos, Vector3 scale, Color color, bool collider)
         {

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -27,15 +28,29 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
+        // One finger joint bone we curl procedurally, remembering its loaded (bind) local rotation.
+        private sealed class FingerJoint
+        {
+            public Transform T;
+            public Quaternion Bind;
+            public bool IsThumb;
+            public bool IsIndex;
+        }
+
         private sealed class Hand
         {
-            public GameObject Root;     // pose anchor (set to the grip pose); model is a child carrying offsets
+            public GameObject Root;        // pose anchor (set to the grip pose); model is a child carrying offsets
             public Transform T;
-            public Animator Anim;       // optional finger-curl driver
+            public Transform Model;        // the instantiated model child (offsets/scale live here)
+            public Vector3 IntrinsicScale; // model localScale as loaded, before HandScale
+            public bool Mirrored;          // model X-mirrored (right prefab reused for left)
+            public Animator Anim;          // optional finger-curl driver (if the prefab ships one)
+            public List<FingerJoint> Joints = new List<FingerJoint>(); // procedural curl bones
+            public float CurlIndex, CurlOther;  // smoothed 0..1 curl amounts
             public bool HasOverride;
             public Vector3 OverridePos;
             public Quaternion OverrideRot;
-            public float Blend;         // 0 = follow controller, 1 = at override target
+            public float Blend;            // 0 = follow controller, 1 = at override target
         }
 
         private readonly Hand _right = new Hand();
@@ -43,6 +58,7 @@ namespace IronNestVR
         private AssetBundle _bundle;
         private bool _bundleTried;
         private bool _built;
+        private bool _dumpedBones;   // log the hand bone hierarchy only once
 
         // Unity 6 marshals AssetBundle byte[]/string params through Il2CppSystem.Span.GetPinnableReference,
         // which this il2cpp build never AOT-compiled — so the GENERATED LoadFromFile/LoadFromMemory/LoadAsset
@@ -76,12 +92,12 @@ namespace IronNestVR
 
                 float dt = Time.unscaledDeltaTime;
 
-                // Right hand: grip pose + trigger (index) + grip (fist).
+                // Right hand: grip pose + trigger (index curl) + grip (other fingers).
                 PoseHand(_right, input.GripValid, origin, input.GripPose,
                          input.Trigger, input.GrabR ? 1f : 0f, dt);
-                // Left hand: grip pose + grip (fist); no left trigger action exists.
-                PoseHand(_left, input.GripValidL, origin, input.GripPoseL,
-                         0f, input.GrabL ? 1f : 0f, dt);
+                // Left hand: no left trigger action exists, so the index follows the grip too (full fist).
+                float lgrip = input.GrabL ? 1f : 0f;
+                PoseHand(_left, input.GripValidL, origin, input.GripPoseL, lgrip, lgrip, dt);
             }
             catch (Exception e)
             {
@@ -112,19 +128,59 @@ namespace IronNestVR
             }
             h.T.SetPositionAndRotation(pos, rot);
 
+            ApplyOffsets(h);   // live, so the in-VR menu can tune scale/pose without a rebuild
+
             // Fingers close fully as the hand reaches the grabbed control (Blend -> 1).
-            ApplyCurl(h, Mathf.Lerp(trigger, 1f, h.Blend), Mathf.Lerp(grip, 1f, h.Blend));
+            float idx = Mathf.Lerp(trigger, 1f, h.Blend);
+            float oth = Mathf.Lerp(grip, 1f, h.Blend);
+            // Ease the on/off grip so the fist doesn't pop (trigger is already analog).
+            float k = Config.FingerCurlSmooth > 0f ? 1f - Mathf.Exp(-Config.FingerCurlSmooth * dt) : 1f;
+            h.CurlIndex = Mathf.Lerp(h.CurlIndex, idx, k);
+            h.CurlOther = Mathf.Lerp(h.CurlOther, oth, k);
+            ApplyCurl(h);
         }
 
-        private void ApplyCurl(Hand h, float trigger, float grip)
+        // Reapply the model child's scale/offset/rotation from Config every frame, so the settings menu
+        // edits it live. HandScale multiplies the model's intrinsic scale; left mirror is a negative X.
+        private void ApplyOffsets(Hand h)
         {
-            if (h.Anim == null) return;
-            try
+            if (h.Model == null) return;
+            float s = Config.HandScale;
+            Vector3 bs = h.IntrinsicScale;
+            h.Model.localScale = new Vector3((h.Mirrored ? -1f : 1f) * bs.x * s, bs.y * s, bs.z * s);
+            h.Model.localPosition = new Vector3(Config.HandPosOffsetX, Config.HandPosOffsetY, Config.HandPosOffsetZ);
+            h.Model.localEulerAngles = new Vector3(Config.HandEulerX, Config.HandEulerY, Config.HandEulerZ);
+        }
+
+        // Curl the finger bones from the smoothed amounts. Index follows the trigger; thumb + other
+        // fingers follow the grip. Each joint rotates off its bind pose about the configured local axis.
+        private void ApplyCurl(Hand h)
+        {
+            // If the prefab shipped an Animator with the named params, prefer that.
+            if (h.Anim != null)
             {
-                if (!string.IsNullOrEmpty(Config.HandTriggerParam)) h.Anim.SetFloat(Config.HandTriggerParam, trigger);
-                if (!string.IsNullOrEmpty(Config.HandGripParam)) h.Anim.SetFloat(Config.HandGripParam, grip);
+                try
+                {
+                    if (!string.IsNullOrEmpty(Config.HandTriggerParam)) h.Anim.SetFloat(Config.HandTriggerParam, h.CurlIndex);
+                    if (!string.IsNullOrEmpty(Config.HandGripParam)) h.Anim.SetFloat(Config.HandGripParam, h.CurlOther);
+                }
+                catch { }
+                return;
             }
-            catch { }
+            if (!Config.FingerCurlEnabled || h.Joints == null || h.Joints.Count == 0) return;
+
+            Vector3 axis = Config.FingerCurlAxis == 0 ? Vector3.right
+                         : Config.FingerCurlAxis == 1 ? Vector3.up : Vector3.forward;
+            float sign = Config.FingerCurlSign * (h.Mirrored ? -1f : 1f);
+            float max = Config.FingerCurlMaxDeg;
+            for (int i = 0; i < h.Joints.Count; i++)
+            {
+                var j = h.Joints[i];
+                if (j.T == null) continue;
+                float amt = j.IsIndex ? h.CurlIndex : h.CurlOther;
+                float deg = sign * amt * max * (j.IsThumb ? 0.6f : 1f); // thumb folds less
+                j.T.localRotation = j.Bind * Quaternion.AngleAxis(deg, axis);
+            }
         }
 
         // Override the right/left hand to a world pose (used while it rides a grabbed control).
@@ -254,13 +310,7 @@ namespace IronNestVR
             if (model == null) model = BuildPrimitive();
 
             model.transform.SetParent(root.transform, false);
-            // Multiply HandScale onto the model's intrinsic scale (FBX=1; the primitive carries its own small
-            // size), so the primitive fallback isn't blown up to a 1 m cube. Mirror via negative X.
-            float s = Config.HandScale;
-            Vector3 bs = model.transform.localScale;
-            model.transform.localScale = new Vector3((mirrored ? -1f : 1f) * bs.x * s, bs.y * s, bs.z * s);
-            model.transform.localPosition = new Vector3(Config.HandPosOffsetX, Config.HandPosOffsetY, Config.HandPosOffsetZ);
-            model.transform.localEulerAngles = new Vector3(Config.HandEulerX, Config.HandEulerY, Config.HandEulerZ);
+            Vector3 bs = model.transform.localScale; // intrinsic; ApplyOffsets multiplies HandScale onto it live
 
             StripColliders(root);   // never let a hand block the laser raycast or physics
             SetLayer(root, 0);      // Default layer — eye cameras copy Main Camera's cullingMask
@@ -269,8 +319,56 @@ namespace IronNestVR
 
             h.Root = root;
             h.T = root.transform;
+            h.Model = model.transform;
+            h.IntrinsicScale = bs;
+            h.Mirrored = mirrored;
             h.Anim = root.GetComponentInChildren<Animator>(true);
+            CollectJoints(h, model.transform);
+            ApplyOffsets(h);        // apply scale/pose once now (then live each frame while shown)
             root.SetActive(false);
+        }
+
+        // Find finger-joint bones for procedural curl by matching their names (the XR Hands FBX has no
+        // Animator). We match finger {thumb/index/middle/ring/little|pinky} × segment
+        // {proximal/intermediate/middle/distal} and remember each bone's bind-pose local rotation.
+        // Metacarpals/tips/wrist are skipped. Logs the full bone list ONCE so exact rig names are knowable.
+        private void CollectJoints(Hand h, Transform model)
+        {
+            h.Joints.Clear();
+            if (h.Anim != null) return; // an Animator-driven prefab curls itself
+
+            var all = model.GetComponentsInChildren<Transform>(true);
+            int n = all != null ? all.Length : 0;
+            int dumped = 0;
+            for (int i = 0; i < n; i++)
+            {
+                var t = all[i];
+                if (t == null) continue;
+                string nm = SafeName(t);
+                if (nm == null) continue;
+                if (!_dumpedBones && dumped < 64) { Log.LogInfo($"[hands] bone: {nm}"); dumped++; }
+                string low = nm.ToLowerInvariant();
+
+                bool thumb = low.Contains("thumb");
+                bool index = low.Contains("index");
+                bool middle = low.Contains("middle");
+                bool ring = low.Contains("ring");
+                bool little = low.Contains("little") || low.Contains("pinky");
+                if (!(thumb || index || middle || ring || little)) continue;
+
+                // Curl the bendy segments; skip metacarpal (palm), tip, and the wrist/hand root.
+                bool curlSeg = low.Contains("proximal") || low.Contains("intermediate")
+                            || low.Contains("distal") || low.Contains("middle");
+                // "middle" is both a finger AND a segment word; for the middle finger require an explicit segment.
+                if (middle && !(low.Contains("proximal") || low.Contains("intermediate") || low.Contains("distal")))
+                    curlSeg = false;
+                if (!curlSeg) continue;
+                if (low.Contains("metacarpal") || low.Contains("tip")) continue;
+
+                h.Joints.Add(new FingerJoint { T = t, Bind = t.localRotation, IsThumb = thumb, IsIndex = index });
+            }
+            _dumpedBones = true;
+            Log.LogInfo($"[hands] {(h.Mirrored ? "L(mirror)" : (h == _right ? "R" : "L"))}: {h.Joints.Count} curl joints from {n} bones.");
         }
 
         // A skinned-mesh FBX moved only by its root often frustum-culls (its bounds don't follow), so it loads
@@ -355,6 +453,13 @@ namespace IronNestVR
             if (cols == null) return;
             for (int i = 0; i < cols.Length; i++)
                 if (cols[i] != null) UnityEngine.Object.Destroy(cols[i]);
+        }
+
+        // Read a name without the injected get_name property (which hits the broken span path in this build);
+        // Object.GetName() is the span-free engine call.
+        private static string SafeName(UnityEngine.Object o)
+        {
+            try { return o != null ? o.GetName() : null; } catch { return null; }
         }
 
         private static void SetLayer(GameObject go, int layer)

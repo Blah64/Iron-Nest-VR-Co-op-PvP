@@ -157,6 +157,18 @@ namespace IronNestVR
         public static string HandTriggerParam = "Trigger";
         public static string HandGripParam = "Grip";
 
+        // Procedural finger curl (for skinned hand FBXs that ship without an Animator, e.g. the XR Hands
+        // sample meshes). We find the finger-joint bones by name and rotate them: the index follows the
+        // analog trigger, the other fingers + thumb follow the grip. Curl axis/sign/angle are tunable in
+        // the in-VR menu because the correct local axis depends on the rig.
+        public static bool FingerCurlEnabled = true;
+        public static float FingerCurlMaxDeg = 70f;   // per-joint curl at full close (proximal/intermediate/distal)
+        // XR Hands rig: each joint's local +Z runs down the finger, so flexion is rotation about local X,
+        // and +angle folds toward the palm (-Y). (Tunable in-menu for other rigs.)
+        public static int FingerCurlAxis = 0;         // local rotate axis: 0=X, 1=Y, 2=Z
+        public static float FingerCurlSign = 1f;      // +1 / -1 (which way the joints fold)
+        public static float FingerCurlSmooth = 14f;   // per-second rate the grip on/off curl eases at
+
         // Physical grab of dials/levers: right-hand grip while the laser is on a control snaps the
         // hand onto it and drives it from controller motion (the laser stays your targeting tool).
         public static bool HandManipEnabled = true;
