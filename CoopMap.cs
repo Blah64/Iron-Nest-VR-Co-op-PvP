@@ -42,7 +42,7 @@ namespace IronNestVR
         public const byte MSG_GRAB = 10;        // [t][itemId i32]                          reliable
         public const byte MSG_POS = 11;         // [t][itemId i32][x,y,z f32]  (board-local) unreliable
         public const byte MSG_PLACE = 12;       // [t][itemId i32][x,y,z f32][slotId i32]   reliable
-        public const byte MSG_MARKER_ADD = 14;  // [t][netId i32][prefabIdx i32][oX,oY,tX,tY f32] reliable  (13 = ctrl JIP snap)
+        public const byte MSG_MARKER_ADD = 14;  // [t][netId i32][prefabName str][oX,oY,tX,tY f32] reliable  (13 = ctrl JIP snap)
         public const byte MSG_MARKER_DEL = 15;  // [t][netId i32]                           reliable
 
         private const float StaleSec = 2f;
@@ -68,6 +68,7 @@ namespace IronNestVR
 
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
+        private static readonly byte[] _scratch = new byte[128];   // string (de)serialization for marker prefab names
 
         // --- bearing/range markers (MapMarkerLineUI) ---
         private sealed class Marker
@@ -76,7 +77,7 @@ namespace IronNestVR
             public GameObject Go;
             public MapMarkerLineUI Ui;
             public int InstanceId;     // Go.GetInstanceID() — diffs against MapMarkerPlacer.placedMarkers
-            public int PrefabIdx;      // which markerPrefabs entry it was drawn from
+            public string PrefabName;  // the marker prefab's name (encodes COLOR/style) — resolved by name on the peer
             public bool IsLocal;       // we created it via local game input (vs mirrored from the peer)
         }
 
@@ -88,6 +89,7 @@ namespace IronNestVR
         private static int _placerIid = -1;
         private static float _nextPlacerScan;
         private static int _markerSeq;
+        private static readonly Dictionary<string, GameObject> _prefabByName = new Dictionary<string, GameObject>();   // resolved marker prefabs (by color/style name)
 
         // ---------------- per-frame ----------------
 
@@ -200,13 +202,14 @@ namespace IronNestVR
                 }
                 case MSG_MARKER_ADD:
                 {
-                    if (len < 25) return;
+                    if (len < 9) return;
                     int netId = GetInt(a, ref o);
-                    int prefabIdx = GetInt(a, ref o);
+                    string prefabName = GetStr(a, ref o, len);
+                    if (o + 16 > len) return;
                     Vector2 origin = new Vector2(GetF(a, ref o), GetF(a, ref o));
                     Vector2 tip = new Vector2(GetF(a, ref o), GetF(a, ref o));
                     if (_markers.ContainsKey(netId)) return;   // already mirrored (dup / JIP re-send)
-                    SpawnMirror(netId, prefabIdx, origin, tip);
+                    SpawnMirror(netId, prefabName ?? "", origin, tip);
                     break;
                 }
                 case MSG_MARKER_DEL:
@@ -330,11 +333,11 @@ namespace IronNestVR
                 try { ui = go.GetComponent<MapMarkerLineUI>(); } catch { }
                 if (ui == null) continue;
                 int netId = NextMarkerId();
-                int idx = ActivePrefabIndex();
-                var m = new Marker { NetId = netId, Go = go, Ui = ui, InstanceId = iid, PrefabIdx = idx, IsLocal = true };
+                string pname = MarkerPrefabName(go);
+                var m = new Marker { NetId = netId, Go = go, Ui = ui, InstanceId = iid, PrefabName = pname, IsLocal = true };
                 _markers[netId] = m; _byInstance[iid] = netId;
                 SendMarkerAdd(m);
-                Log.LogInfo($"[map] local marker placed -> peer (id={netId} idx={idx} dist={SafeF(ui, true):0.0} ang={SafeF(ui, false):0.0})");
+                Log.LogInfo($"[map] local marker placed -> peer (id={netId} prefab='{pname}' dist={SafeF(ui, true):0.0} ang={SafeF(ui, false):0.0})");
             }
 
             // 2) Deletions: any tracked marker whose GameObject left placedMarkers (or was destroyed).
@@ -358,15 +361,13 @@ namespace IronNestVR
         // Peer → mirror a finalized marker: instantiate the same prefab, replay the geometry, finalize, and add
         // it to placedMarkers so it's a first-class marker locally (hoverable/deletable, and that delete
         // propagates back). Registered with its instanceId so our own detection won't re-broadcast it.
-        private static void SpawnMirror(int netId, int prefabIdx, Vector2 origin, Vector2 tip)
+        private static void SpawnMirror(int netId, string prefabName, Vector2 origin, Vector2 tip)
         {
             if (_placer == null) { Log.LogWarning($"[map] marker add (id={netId}) but no MapMarkerPlacer in scene"); return; }
             try
             {
-                GameObject prefab = null;
-                try { var ps = _placer.markerPrefabs; if (ps != null && prefabIdx >= 0 && prefabIdx < ps.Count) prefab = ps[prefabIdx]; } catch { }
-                if (prefab == null) { try { prefab = _placer.activeMarkerPrefab; } catch { } }
-                if (prefab == null) { Log.LogWarning($"[map] marker add (id={netId}): no prefab[{prefabIdx}]"); return; }
+                GameObject prefab = ResolveMarkerPrefab(prefabName);   // by NAME → correct COLOR (placer list is empty; each side's activeMarkerPrefab differs)
+                if (prefab == null) { Log.LogWarning($"[map] marker add (id={netId}): no prefab named '{prefabName}'"); return; }
                 RectTransform mapRect = null;
                 try { mapRect = _placer.mapRect; } catch { }
                 if (mapRect == null) { Log.LogWarning($"[map] marker add (id={netId}): placer has no mapRect"); return; }
@@ -384,9 +385,9 @@ namespace IronNestVR
                 try { var pm = _placer.placedMarkers; if (pm != null) pm.Add(inst); } catch { }
 
                 int iid = inst.GetInstanceID();
-                _markers[netId] = new Marker { NetId = netId, Go = inst, Ui = ui, InstanceId = iid, PrefabIdx = prefabIdx, IsLocal = false };
+                _markers[netId] = new Marker { NetId = netId, Go = inst, Ui = ui, InstanceId = iid, PrefabName = prefabName, IsLocal = false };
                 _byInstance[iid] = netId;
-                Log.LogInfo($"[map] mirrored remote marker <- peer (id={netId} idx={prefabIdx} dist={SafeF(ui, true):0.0} ang={SafeF(ui, false):0.0})");
+                Log.LogInfo($"[map] mirrored remote marker <- peer (id={netId} prefab='{prefabName}' dist={SafeF(ui, true):0.0} ang={SafeF(ui, false):0.0})");
             }
             catch (Exception e) { Log.LogWarning("[map] spawn mirror: " + e.Message); }
         }
@@ -397,7 +398,7 @@ namespace IronNestVR
             Vector2 origin = Vector2.zero, tip = Vector2.zero;
             try { origin = m.Ui.OriginLocal; var t = m.Ui.TipLocalPosition; tip = new Vector2(t.x, t.y); } catch { }
             if (!Finite(origin.x) || !Finite(origin.y) || !Finite(tip.x) || !Finite(tip.y)) return;
-            int o = 0; _buf[o++] = MSG_MARKER_ADD; o = PutInt(o, m.NetId); o = PutInt(o, m.PrefabIdx);
+            int o = 0; _buf[o++] = MSG_MARKER_ADD; o = PutInt(o, m.NetId); o = PutStr(o, m.PrefabName);
             o = PutF(o, origin.x); o = PutF(o, origin.y); o = PutF(o, tip.x); o = PutF(o, tip.y);
             CoopP2P.Send(_buf, o, true);
         }
@@ -409,18 +410,49 @@ namespace IronNestVR
             CoopP2P.Send(_buf, o, true);
         }
 
-        // The prefab a placed marker was drawn from isn't back-referenced on the instance, so we approximate it
-        // with the placer's CURRENT active prefab (the one just used to draw it). Mostly affects marker visual
-        // style; geometry comes from the endpoints.
-        private static int ActivePrefabIndex()
+        // The marker prefab's NAME (which encodes its color/style — e.g. "RED"/"Yellow"/"White"). Unity names an
+        // instantiated marker "<Prefab>(Clone)", so the instance name minus the suffix IS the prefab name it was
+        // drawn from — robust regardless of which prefab is currently "active". Falls back to the placer's active
+        // prefab name. Method borrowed from the reference iron-nest-coop mod (DrawLines.cs), which keys color by
+        // prefab name instead of by index (our index broke because MapMarkerPlacer.markerPrefabs is empty).
+        private static string MarkerPrefabName(GameObject go)
         {
+            string n = null;
+            try { n = go != null ? go.name : null; } catch { }
+            if (!string.IsNullOrEmpty(n))
+            {
+                int idx = n.IndexOf("(Clone)", StringComparison.Ordinal);
+                if (idx >= 0) n = n.Substring(0, idx);
+                n = n.Trim();
+                if (n.Length > 0) return n;
+            }
+            try { var ap = _placer != null ? _placer.activeMarkerPrefab : null; if (ap != null) return ap.name; } catch { }
+            return "";
+        }
+
+        // Resolve a marker prefab by name so the mirror gets the SAME color the sender drew. The placer's own
+        // markerPrefabs list is empty in-scene, so we search ALL loaded GameObjects for an exact name match
+        // (excludes "(Clone)" scene instances) — the same global lookup the reference mod uses. Cached per name.
+        private static GameObject ResolveMarkerPrefab(string name)
+        {
+            if (string.IsNullOrEmpty(name)) { try { return _placer != null ? _placer.activeMarkerPrefab : null; } catch { return null; } }
+            if (_prefabByName.TryGetValue(name, out var cached) && cached != null) return cached;
+
+            try { var ps = _placer != null ? _placer.markerPrefabs : null; if (ps != null) for (int i = 0; i < ps.Count; i++) { var p = ps[i]; if (p != null && p.name == name) { _prefabByName[name] = p; return p; } } } catch { }
+
             try
             {
-                var ap = _placer.activeMarkerPrefab; var ps = _placer.markerPrefabs;
-                if (ap != null && ps != null) for (int i = 0; i < ps.Count; i++) if ((object)ps[i] == (object)ap) return i;
+                var all = Resources.FindObjectsOfTypeAll(Il2CppType.Of<GameObject>());
+                if (all != null) for (int i = 0; i < all.Length; i++)
+                {
+                    var g = all[i].TryCast<GameObject>(); if (g == null) continue;
+                    string gn; try { gn = g.name; } catch { continue; }
+                    if (gn == name) { _prefabByName[name] = g; return g; }
+                }
             }
-            catch { }
-            return 0;
+            catch (Exception e) { Log.LogWarning("[map] resolve prefab '" + name + "': " + e.Message); }
+
+            try { return _placer != null ? _placer.activeMarkerPrefab : null; } catch { return null; }   // last resort
         }
 
         // Collision-free across the two players: FNV of (mySteamId : sequence). Avoid 0 (used as a "none" id).
@@ -463,7 +495,7 @@ namespace IronNestVR
                     var pls = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapMarkerPlacer>(), FindObjectsSortMode.None);
                     var p = (pls != null && pls.Length > 0) ? pls[0].TryCast<MapMarkerPlacer>() : null;
                     int piid = p != null ? p.GetInstanceID() : -1;
-                    if (piid != _placerIid) { ClearMarkers(false); _placerIid = piid; if (p != null) Log.LogInfo($"[map] marker placer found ({(p.markerPrefabs != null ? p.markerPrefabs.Count : 0)} prefabs, host={CoopP2P.IsHost})"); }
+                    if (piid != _placerIid) { ClearMarkers(false); _prefabByName.Clear(); _placerIid = piid; if (p != null) Log.LogInfo($"[map] marker placer found ({(p.markerPrefabs != null ? p.markerPrefabs.Count : 0)} prefabs, host={CoopP2P.IsHost})"); }
                     _placer = p;
                 }
                 catch { _placer = null; }
@@ -551,7 +583,7 @@ namespace IronNestVR
                 else if (it.RemoteOwned) Log.LogInfo($"[map]   remote-owned: '{it.T.name}' localPos={it.RemoteLocal}");
             }
             foreach (var m in _markers.Values)
-                Log.LogInfo($"[map]   marker id={m.NetId} {(m.IsLocal ? "local" : "mirror")} idx={m.PrefabIdx} dist={SafeF(m.Ui, true):0.0} ang={SafeF(m.Ui, false):0.0}");
+                Log.LogInfo($"[map]   marker id={m.NetId} {(m.IsLocal ? "local" : "mirror")} prefab='{m.PrefabName}' dist={SafeF(m.Ui, true):0.0} ang={SafeF(m.Ui, false):0.0}");
         }
 
         // ---------------- helpers ----------------
@@ -573,7 +605,7 @@ namespace IronNestVR
         private static bool EnsureBuf()
         {
             if (_buf != null) return true;
-            try { _buf = new Il2CppStructArray<byte>(32); return true; }
+            try { _buf = new Il2CppStructArray<byte>(128); return true; }   // room for a marker prefab name + endpoints
             catch (Exception e) { Log.LogWarning("[map] buf: " + e.Message); return false; }
         }
 
@@ -581,9 +613,29 @@ namespace IronNestVR
         private static int PutF(int o, float v) { var t = BitConverter.GetBytes(v); _buf[o] = t[0]; _buf[o + 1] = t[1]; _buf[o + 2] = t[2]; _buf[o + 3] = t[3]; return o + 4; }
         private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
 
+        private static int PutStr(int o, string s)
+        {
+            s ??= "";
+            var bytes = Encoding.UTF8.GetBytes(s);
+            int n = bytes.Length; if (n > 64) n = 64;   // marker prefab names are short; cap guards the buffer
+            o = PutInt(o, n);
+            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
+            return o + n;
+        }
+
         private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
         private static float GetF(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
         private static Vector3 GetV(Il2CppStructArray<byte> a, ref int o) { float x = GetF(a, ref o), y = GetF(a, ref o), z = GetF(a, ref o); return new Vector3(x, y, z); }
+
+        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
+        {
+            if (o + 4 > len) return null;
+            int n = GetInt(a, ref o);
+            if (n < 0 || o + n > len || n > _scratch.Length) return null;
+            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
+            o += n;
+            return Encoding.UTF8.GetString(_scratch, 0, n);
+        }
 
         private static bool Finite(float f) => !float.IsNaN(f) && !float.IsInfinity(f);
         private static bool Finite(Vector3 v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
