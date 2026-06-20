@@ -49,6 +49,7 @@ namespace IronNestVR
         private const byte MSG_GROUP = 5;    // [t][group u8][f32 ...]       unreliable turret/gun state
         private const byte MSG_CLICK = 6;    // [t][netId i32]               reliable   LookAtTarget click
         private const byte MSG_FIRE = 7;     // [t][side u8]                 reliable   gun discharge (0=L,1=R)
+        private const byte MSG_SNAP = 13;    // [t][9×f32]                   reliable   join-in-progress turret/gun state
 
         // How long remote ownership / streamed state survives without a refresh. The stream runs at
         // CoopSendHz (~30/s), so 2s easily rides minor packet loss but recovers fast if the peer vanishes
@@ -98,6 +99,10 @@ namespace IronNestVR
         private static readonly int FireKeyL = Fnv("__coop_fire_L"), FireKeyR = Fnv("__coop_fire_R");
         private static bool _firedPrevL, _firedPrevR;
 
+        // Join-in-progress snapshot received before the turret/guns resolved locally (scene still loading on the
+        // joiner). Held here and applied once the registry is ready — see Tick / ApplySnapshot.
+        private static float[] _pendingSnap;
+
         private static TurretController _turret;
         private static GunController _gunL, _gunR;
         private static int _turretIid = -1;
@@ -121,6 +126,7 @@ namespace IronNestVR
             try
             {
                 EnsureRegistry();
+                if (_pendingSnap != null && _turret != null) { ApplySnapshot(_pendingSnap); _pendingSnap = null; }
                 if (_turret == null) return;
 
                 float now = Time.unscaledTime;
@@ -305,6 +311,67 @@ namespace IronNestVR
             // is deferred (Phase 3 follow-up), so we don't force the reload coroutine state here.
         }
 
+        // ---------------- join-in-progress snapshot ----------------
+
+        // Host → new joiner: push the CURRENT turret/gun physical state as one reliable packet, so the joiner
+        // adopts the host's aim/elevation/powder instead of its stale default. The continuous MSG_GROUP stream
+        // only flows while a control is being operated, so without this a joiner who arrives after the host
+        // last touched the turret would see it parked at zero. Also re-asserts any control the host is holding
+        // RIGHT NOW (re-send MSG_GRAB) so the joiner's ownership-refusal is correct from the first frame.
+        // Called by CoopP2P.SendJoinSnapshot (host only, after the peer/session has settled).
+        public static void SendSnapshot()
+        {
+            if (!Config.CoopControlSync) return;
+            if (_turret == null) { Log.LogInfo("[ctrl] JIP snapshot skipped — no turret resolved yet"); return; }
+            if (!EnsureBuf()) return;
+            try
+            {
+                int o = 0; _buf[o++] = MSG_SNAP;
+                o = PutFloat(o, _turret.DesiredRotation);
+                o = PutFloat(o, _turret.CurrentAngle);
+                o = PutFloat(o, _turret.DesiredElevation);
+                o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
+                o = PutFloat(o, _gunL != null ? _gunL.CurrentElevation : 0f);
+                o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
+                o = PutFloat(o, _gunR != null ? _gunR.CurrentElevation : 0f);
+                o = PutFloat(o, _gunL != null ? _gunL.PowderCharges : 0f);
+                o = PutFloat(o, _gunR != null ? _gunR.PowderCharges : 0f);
+                CoopP2P.Send(_buf, o, true);
+
+                int owned = 0;
+                foreach (var c in _byId.Values) if (c.LocalOwned) { SendGrab(c); owned++; }
+                Log.LogInfo($"[ctrl] sent JIP snapshot -> peer (rot={_turret.CurrentAngle:0.0} elev={_turret.DesiredElevation:0.0}, {owned} held controls)");
+            }
+            catch (Exception e) { Log.LogWarning("[ctrl] send snapshot: " + e.Message); }
+        }
+
+        // Joiner: adopt the host's turret/gun state from a snapshot. Applied ONCE (not gated on remote
+        // ownership, unlike the live stream). Skips any group the joiner is somehow already driving locally
+        // (defensive — at join the joiner owns nothing) and rejects non-finite values so a bad packet can't
+        // poison the turret transform.
+        private static void ApplySnapshot(float[] v)
+        {
+            if (_turret == null || v == null || v.Length < 9) return;
+            try
+            {
+                if (!LocallyOwnsGroup(Group.Rotation) && Finite(v[0]) && Finite(v[1]))
+                {
+                    _turret.DesiredRotation = v[0]; _turret.CurrentAngle = v[1];
+                    try { _turret.ApplyRotationToTransforms(); } catch { }
+                }
+                if (!LocallyOwnsGroup(Group.Elevation))
+                {
+                    if (Finite(v[2])) _turret.DesiredElevation = v[2];
+                    if (_gunL != null) { if (Finite(v[3])) _gunL.DesiredElevationAngle = v[3]; if (Finite(v[4])) _gunL.CurrentElevation = v[4]; }
+                    if (_gunR != null) { if (Finite(v[5])) _gunR.DesiredElevationAngle = v[5]; if (Finite(v[6])) _gunR.CurrentElevation = v[6]; }
+                }
+                if (_gunL != null && !LocallyOwnsGroup(Group.GunLeft)) { int p = Mathf.RoundToInt(v[7]); try { if (_gunL.PowderCharges != p) _gunL.SetPowderCharge(p); } catch { } }
+                if (_gunR != null && !LocallyOwnsGroup(Group.GunRight)) { int p = Mathf.RoundToInt(v[8]); try { if (_gunR.PowderCharges != p) _gunR.SetPowderCharge(p); } catch { } }
+                Log.LogInfo($"[ctrl] applied JIP snapshot (rot={v[1]:0.0} desRot={v[0]:0.0} elev={v[2]:0.0} powderL={Mathf.RoundToInt(v[7])} powderR={Mathf.RoundToInt(v[8])})");
+            }
+            catch (Exception e) { Log.LogWarning("[ctrl] apply snapshot: " + e.Message); }
+        }
+
         // ---------------- receive ----------------
 
         public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
@@ -385,6 +452,16 @@ namespace IronNestVR
                     var gun = side == 0 ? _gunL : _gunR;
                     if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
                     _echoUntil[side == 0 ? FireKeyL : FireKeyR] = now + 0.3f;
+                    break;
+                }
+                case MSG_SNAP:
+                {
+                    if (len < 1 + 9 * 4) return;
+                    var v = new float[9];
+                    for (int i = 0; i < 9; i++) v[i] = GetFloat(a, ref o);
+                    Log.LogInfo("[ctrl] received JIP turret snapshot <- peer");
+                    if (_turret != null) ApplySnapshot(v);   // apply now if ready …
+                    else _pendingSnap = v;                    // … else stash for Tick once the registry resolves
                     break;
                 }
                 default:
@@ -693,7 +770,7 @@ namespace IronNestVR
             foreach (var c in _byId.Values) { c.LocalOwned = false; c.RemoteOwned = false; c.PrevDragging = false; c.PrevClicked = false; c.HasRemoteVal = false; }
             for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].Has = false; }
             _pendingGrab.Clear(); _pendingVal.Clear(); _echoUntil.Clear();
-            _firedPrevL = false; _firedPrevR = false;
+            _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
         }
 
         private static bool IsDragging(Ctrl c)

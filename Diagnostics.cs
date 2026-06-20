@@ -33,7 +33,7 @@ namespace IronNestVR
                 if (!_banner)
                 {
                     _banner = true;
-                    Log.LogInfo("[coop] === IronNest VR co-op build — sync: controls(drag+click) + gun-fire + clipboard + map-tokens ===");
+                    Log.LogInfo("[coop] === IronNest VR co-op build — sync: controls(drag+click) + gun-fire + clipboard + map-tokens + join-in-progress ===");
                     Log.LogInfo("[coop] keys: F4 full co-op dump | F6 avatar self-test | F7 flat lobby | F8 recenter | F9-12 lobby create/refresh/join/leave");
                 }
 

@@ -136,6 +136,38 @@ namespace IronNestVR
             }
         }
 
+        // ---------------- join-in-progress snapshot ----------------
+
+        // Host → new joiner: re-broadcast EVERY tracked section's current text + the active tool, so the joiner
+        // sees the clipboard contents that were written before it arrived. The normal diff only emits on CHANGE,
+        // so static pre-join text would otherwise never reach a late joiner. Reuses the idempotent
+        // Write(Replace, Instant) apply path; updating _last here stops our own diff from immediately re-sending.
+        // Called by CoopP2P.SendJoinSnapshot (host only).
+        public static void SendSnapshot()
+        {
+            if (!Config.CoopClipboardSync) return;
+            try
+            {
+                Rebuild(Time.unscaledTime);
+                int n = 0;
+                foreach (var s in _sections)
+                {
+                    if (s == null) continue;
+                    string tag; try { tag = s.UnityTag; } catch { continue; }
+                    if (string.IsNullOrEmpty(tag)) continue;
+                    string text; try { var tt = s.TargetText; text = tt != null ? tt.text : ""; } catch { continue; }
+                    text ??= "";
+                    _last[tag] = text;
+                    SendSection(tag, text);
+                    n++;
+                }
+                int tool = CurrentToolIndex();
+                if (tool >= 0) { SendTool(tool); _lastTool = tool; }
+                Log.LogInfo($"[clip] sent JIP snapshot -> peer ({n} sections, tool={tool})");
+            }
+            catch (Exception e) { Log.LogWarning("[clip] snapshot: " + e.Message); }
+        }
+
         // ---------------- diagnostics ----------------
 
         public static string Status()

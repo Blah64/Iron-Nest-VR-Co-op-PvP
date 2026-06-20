@@ -54,6 +54,11 @@ namespace IronNestVR
         private static int _sent, _recvd;
         private static float _nextSend;   // transmit-rate cap (see Config.CoopSendHz)
 
+        // Join-in-progress: when the host detects a new peer it schedules a one-time full-world snapshot for
+        // CoopSnapshotDelaySec later (0 = none pending). The delay lets both sides resolve the peer + bring the
+        // session up so the snapshot isn't dropped by the receive-side peer gate. Cleared if the peer leaves.
+        private static float _snapAt;
+
         public static void Init()
         {
             if (_inited) return;
@@ -113,6 +118,7 @@ namespace IronNestVR
             Init();
             UpdatePeer();
             Receive();
+            if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
             if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
         }
 
@@ -134,6 +140,7 @@ namespace IronNestVR
             {
                 if (HasPeer) { CloseSession(Peer); HasPeer = false; Log.LogInfo("[p2p] not in lobby — peer cleared"); }
                 IsHost = false;
+                _snapAt = 0f;
                 if (!SelfTest) RemoteValid = false;
                 return;
             }
@@ -153,14 +160,31 @@ namespace IronNestVR
                             Peer = m; HasPeer = true;
                             if (!SelfTest) RemoteValid = false;   // don't carry an old peer's avatar onto the new one
                             Log.LogInfo($"[p2p] peer = {m.m_SteamID}");
+                            // Host pushes a full-world snapshot to the joiner once the session settles.
+                            if (IsHost) { _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo($"[p2p] host: join-in-progress snapshot scheduled in {Config.CoopSnapshotDelaySec:0.0}s"); }
+                            else _snapAt = 0f;
                         }
                         return;
                     }
                 }
                 if (HasPeer) { CloseSession(Peer); HasPeer = false; Log.LogInfo("[p2p] peer left lobby"); }
+                _snapAt = 0f;
                 if (!SelfTest) RemoteValid = false;
             }
             catch (Exception e) { Log.LogWarning("[p2p] peer: " + e.Message); }
+        }
+
+        // Host-only: push a one-time authoritative snapshot of the whole shared world to a freshly-joined peer
+        // so it converges to the host's state instead of its stale default. Each subsystem re-sends its current
+        // state over its own reliable packets (turret/gun, clipboard text, map tokens); the joiner applies them
+        // idempotently through the same paths the live stream uses. Fired from Tick once _snapAt elapses.
+        private static void SendJoinSnapshot()
+        {
+            if (!HasPeer || !IsHost) return;
+            Log.LogInfo("[p2p] host: sending join-in-progress snapshot to new peer");
+            try { CoopControls.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ctrl: " + e.Message); }
+            try { CoopClipboard.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot clip: " + e.Message); }
+            try { CoopMap.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot map: " + e.Message); }
         }
 
         public static void SendPose(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)

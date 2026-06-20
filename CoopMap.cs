@@ -188,7 +188,7 @@ namespace IronNestVR
             CoopP2P.Send(_buf, o, false);
         }
 
-        private static void SendPlace(Item it)
+        private static void SendPlace(Item it, bool log = true)
         {
             if (!EnsureBuf() || _ref == null) return;
             Vector3 local;
@@ -205,7 +205,33 @@ namespace IronNestVR
             catch { }
             int o = 0; _buf[o++] = MSG_PLACE; o = PutInt(o, it.NetId); o = PutV(o, local); o = PutInt(o, slotId);
             CoopP2P.Send(_buf, o, true);
-            Log.LogInfo($"[map] placed '{it.T.name}' (slot={(slotId != 0)}) -> peer");
+            if (log) Log.LogInfo($"[map] placed '{it.T.name}' (slot={(slotId != 0)}) -> peer");
+        }
+
+        // ---------------- join-in-progress snapshot ----------------
+
+        // Host → new joiner: re-send EVERY token's current board-local position + slot so the joiner adopts the
+        // host's map layout instead of its default. Reuses MSG_PLACE (the receiver applies position and sticks
+        // slot placements, then clears ownership — exactly snapshot semantics). Usually a no-op in scenes
+        // without a map board (combat hub only); logs a one-line summary rather than per-token chatter.
+        // Called by CoopP2P.SendJoinSnapshot (host only).
+        public static void SendSnapshot()
+        {
+            if (!Config.CoopMapSync) return;
+            try
+            {
+                EnsureRegistry();
+                if (_ref == null || _items.Count == 0) { Log.LogInfo("[map] JIP snapshot: no map board present — nothing to send"); return; }
+                int n = 0;
+                foreach (var it in _items.Values)
+                {
+                    if (it.Token == null || it.T == null) continue;
+                    SendPlace(it, false);
+                    n++;
+                }
+                Log.LogInfo($"[map] sent JIP snapshot -> peer ({n} tokens)");
+            }
+            catch (Exception e) { Log.LogWarning("[map] snapshot: " + e.Message); }
         }
 
         // ---------------- registry ----------------

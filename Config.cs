@@ -51,6 +51,15 @@ namespace IronNestVR
         // frequent enough to be useful to testers but not so chatty it floods the log.
         public static float CoopDiagIntervalSec = 4f;
 
+        // Co-op join-in-progress: when a second player joins an already-running session, the HOST waits this
+        // long after first detecting them, then pushes a ONE-TIME authoritative snapshot of the current world
+        // (turret/gun aim + powder, clipboard text, map-token layout, held-control ownership) so the joiner
+        // adopts the host's state instead of a stale default. The delay lets BOTH sides resolve the peer and
+        // bring the P2P session up first — until then each side's receive gate drops packets from a not-yet-
+        // resolved peer, so an instant snapshot could be discarded. 1.5s is comfortably past lobby/session
+        // settling without a noticeable "pop-in" wait for the joiner.
+        public static float CoopSnapshotDelaySec = 1.5f;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it
