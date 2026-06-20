@@ -37,6 +37,8 @@ namespace IronNestVR
 
         private static bool _inited;
         private static float _nextTry;
+        private static bool _steamUninit;   // Steam client up, but the GAME never called SteamAPI.Init
+        private static bool _hintLogged;    // throttle the launch-via-Steam hint to once
 
         // Must stay referenced or the registrations are GC'd.
         private static Callback<LobbyEnter_t> _cbEnter;
@@ -65,7 +67,8 @@ namespace IronNestVR
             {
                 if (!SteamAPI.IsSteamRunning()) { Log.LogInfo("[net] waiting for Steam to be ready…"); return; }
 
-                uint appId = SteamUtils.GetAppID().m_AppId;
+                uint appId = SteamUtils.GetAppID().m_AppId;   // throws "not initialized" if game didn't SteamAPI.Init
+                _steamUninit = false;
                 ulong me = SteamUser.GetSteamID().m_SteamID;
                 string persona = SteamFriends.GetPersonaName();
                 Log.LogInfo($"[net] Steam reachable — appId={appId} steamID={me} persona='{persona}'");
@@ -93,7 +96,23 @@ namespace IronNestVR
                 _inited = true;
                 Log.LogInfo("[net] READY. Keys:  F9 create lobby | F10 refresh list | F11 join #0 | F12 leave");
             }
-            catch (Exception e) { Log.LogWarning("[net] init retry: " + e.Message); }
+            catch (Exception e)
+            {
+                // Steam client is running (IsSteamRunning passed) but the GAME process never called
+                // SteamAPI.Init, so every Steamworks.NET call throws "not initialized". Almost always the
+                // game wasn't launched THROUGH Steam (or has no steam_appid.txt next to the exe). Give an
+                // actionable hint once instead of looping a stack trace, and let StatusLine show the cause.
+                _steamUninit = e is InvalidOperationException || e.Message.IndexOf("not initialized", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (_steamUninit)
+                {
+                    if (!_hintLogged)
+                    {
+                        _hintLogged = true;
+                        Log.LogError("[net] Steam API not initialized in this process. LAUNCH THE GAME VIA STEAM (Play button) — or drop a steam_appid.txt containing 4300500 next to the game exe. Steam must be running and online.");
+                    }
+                }
+                else Log.LogWarning("[net] init retry: " + e.Message);
+            }
         }
 
         public static void CreateLobby()
@@ -137,6 +156,9 @@ namespace IronNestVR
             {
                 if (i < 0 || i >= Lobbies.Count) { Log.LogWarning($"[net] join: no lobby #{i} (list has {Lobbies.Count}; press F10 first)"); return; }
                 var e = Lobbies[i];
+                // Clicking Join on the lobby we're ALREADY in would leave+rejoin and tear down a working P2P
+                // session (avatar blinks out). No-op instead — this was the tester's self-inflicted disconnect.
+                if (InLobby && CurrentLobby.m_SteamID == e.Id.m_SteamID) { Log.LogInfo("[net] already in that lobby — ignoring join"); return; }
                 LeaveCurrentIfAny();   // leave our own/previous lobby before joining another
                 Log.LogInfo($"[net] joining '{e.Name}' (id={e.Id.m_SteamID})…");
                 SteamMatchmaking.JoinLobby(e.Id);
@@ -163,7 +185,7 @@ namespace IronNestVR
         {
             try
             {
-                if (!_inited) return "Steam: connecting…";
+                if (!_inited) return _steamUninit ? "Steam not initialized — launch via Steam" : "Steam: connecting…";
                 if (InLobby)
                 {
                     int m = SteamMatchmaking.GetNumLobbyMembers(CurrentLobby);

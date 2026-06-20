@@ -91,8 +91,29 @@ namespace IronNestVR
         private int _stFrame;
         private bool _stStarted;
 
+        // Frame-time tracker: distinguishes uniform slowness (GPU/scene bound) from hitches (a stall spiking
+        // worst-ms). Co-op staleness + smoothness depend on framerate, so log it during bring-up.
+        private float _perfNext;
+        private int _perfFrames;
+        private float _perfWorst;
+
+        private void PerfTick()
+        {
+            float dt = Time.unscaledDeltaTime;
+            _perfFrames++;
+            if (dt > _perfWorst) _perfWorst = dt;
+            if (Time.unscaledTime >= _perfNext)
+            {
+                float span = Config.PerfLogIntervalSec;
+                float fps = _perfFrames / Mathf.Max(span, 0.001f);
+                Log.LogInfo($"[perf] fps~{fps:F1} avg={(1000f * span / Mathf.Max(_perfFrames, 1)):F0}ms worst={_perfWorst * 1000f:F0}ms xr={_xrReady}");
+                _perfFrames = 0; _perfWorst = 0f; _perfNext = Time.unscaledTime + span;
+            }
+        }
+
         private void Update()
         {
+            PerfTick();
             ScanSceneOnce();
             Diagnostics.Tick();
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)

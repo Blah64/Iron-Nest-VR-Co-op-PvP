@@ -17,6 +17,8 @@ namespace IronNestVR
 
         private static GameObject _root, _head, _lhand, _rhand;
         private static bool _built;
+        private static string _shaderUsed = "?";   // which shader Shader.Find actually resolved for the avatar
+        private static float _nextDiag;
 
         public static void Update()
         {
@@ -39,6 +41,7 @@ namespace IronNestVR
                     _lhand.transform.SetPositionAndRotation(CoopP2P.LPos, CoopP2P.LRot);
                     _rhand.transform.SetPositionAndRotation(CoopP2P.RPos, CoopP2P.RRot);
                 }
+                DiagTick();
             }
             catch (Exception e) { Log.LogWarning("[avatar] update: " + e.Message); }
         }
@@ -65,7 +68,34 @@ namespace IronNestVR
             _rhand = Ball(0.07f, new Color(0.4f, 1f, 0.5f)); _rhand.transform.SetParent(_root.transform, false);
 
             _built = true;
-            Log.LogInfo("[avatar] built remote avatar (head + nose + 2 hands)");
+            int mask = 0; string camName = "none"; string scene = "?";
+            try { var cam = Camera.main; if (cam != null) { mask = cam.cullingMask; camName = SafeName(cam); } } catch { }
+            try { scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name; } catch { }
+            bool layerRendered = (mask & (1 << _head.layer)) != 0;
+            // One-shot render context: if avatarLayerRendered=False the local camera culls the avatar; if the
+            // shader is NULL/unexpected it won't draw; scene name flags a "different level loaded" mismatch.
+            Log.LogInfo($"[avatar] built (head+nose+2 hands) shader='{_shaderUsed}' layer={_head.layer} headScale={_head.transform.localScale.x:F2} mainCam='{camName}' cullMask=0x{mask:X} avatarLayerRendered={layerRendered} scene='{scene}'");
+        }
+
+        // Periodic render diagnostic: headVisible (Renderer.isVisible) tells us if ANY active camera actually
+        // drew the head last frame — the key split between "not rendered" (cull/material/layer) and "rendered
+        // but at a position you aren't looking at" (a coordinate problem). Throttled to 5s like the p2p stat.
+        private static void DiagTick()
+        {
+            if (Time.unscaledTime < _nextDiag) return;
+            _nextDiag = Time.unscaledTime + 5f;
+            bool vis = false, en = false;
+            try { var mr = _head.GetComponent<MeshRenderer>(); if (mr != null) { vis = mr.isVisible; en = mr.enabled; } } catch { }
+            Log.LogInfo($"[avatar] active={_root.activeSelf} headPos={V(_head.transform.position)} headVisible={vis} rendEnabled={en} hands={CoopP2P.HasHands} shader='{_shaderUsed}'");
+        }
+
+        private static string V(Vector3 v) => $"({v.x:F2},{v.y:F2},{v.z:F2})";
+
+        private static string SafeName(UnityEngine.Object o)
+        {
+            try { return o.GetName(); } catch { }
+            try { return o.name; } catch { }
+            return "?";
         }
 
         private static GameObject Ball(float dia, Color c)
@@ -92,6 +122,7 @@ namespace IronNestVR
                 var sh = Shader.Find("Universal Render Pipeline/Unlit");
                 if (sh == null) sh = Shader.Find("Universal Render Pipeline/Lit");
                 if (sh == null) sh = Shader.Find("Sprites/Default");
+                _shaderUsed = sh != null ? SafeName(sh) : "NULL";
                 var m = new Material(sh);
                 try { m.color = c; } catch { }
                 try { if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", c); } catch { }

@@ -15,8 +15,23 @@ namespace IronNestVR
         // How often (seconds) to emit a head-pose line to the log during bring-up/debugging.
         public const float PoseLogIntervalSec = 2f;
 
+        // How often (seconds) to emit a frame-rate / worst-frame line to the log.
+        public const float PerfLogIntervalSec = 5f;
+
         // How often (seconds) to retry OpenXR init while no headset/runtime is available yet.
         public const float XrRetryIntervalSec = 5f;
+
+        // Co-op: cap on how many pose packets we transmit per second. A high-fps VR host otherwise floods the
+        // wire (~90/s) with near-redundant poses; 30 Hz keeps the remote avatar smooth (receiver snaps to the
+        // latest pose each frame). A client running BELOW this still sends every frame, so a slow peer is never
+        // throttled further. Set <= 0 to disable the cap (send every frame).
+        public static float CoopSendHz = 30f;
+
+        // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
+        // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
+        // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it
+        // immediately via lobby peer-leave, so this only backstops a peer that's present but not sending.
+        public static float RemoteStaleSeconds = 8f;
 
         // Camera near/far used by the VR eye cameras (cm-scale cockpit → small near plane).
         public const float NearClip = 0.02f;

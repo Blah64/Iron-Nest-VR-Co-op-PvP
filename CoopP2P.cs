@@ -42,11 +42,13 @@ namespace IronNestVR
         public static Vector3 HeadPos; public static Quaternion HeadRot = Quaternion.identity;
         public static bool HasHands;
         public static Vector3 LPos, RPos; public static Quaternion LRot = Quaternion.identity, RRot = Quaternion.identity;
+        public static Vector3 LastSentHead;   // diag: the head world-pos we last transmitted
 
         public static bool SelfTest;   // F6: mirror local pose as a fake remote, to verify avatar rendering solo
 
         private static int _sent, _recvd;
         private static float _nextStat;
+        private static float _nextSend;   // transmit-rate cap (see Config.CoopSendHz)
 
         public static void Init()
         {
@@ -107,11 +109,19 @@ namespace IronNestVR
             Init();
             UpdatePeer();
             Receive();
-            if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > 2f) { RemoteValid = false; Log.LogInfo("[p2p] remote pose stale — hiding avatar"); } }
+            if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
             if (Time.unscaledTime >= _nextStat)
             {
                 _nextStat = Time.unscaledTime + 5f;
-                if (HasPeer || _sent > 0 || _recvd > 0) Log.LogInfo($"[p2p] peer={(HasPeer ? Peer.m_SteamID.ToString() : "none")} sent={_sent} recvd={_recvd} remoteValid={RemoteValid}");
+                if (HasPeer || _sent > 0 || _recvd > 0)
+                {
+                    // Position diag: myCam = where THIS player actually is (ground truth); mySent = the head
+                    // pose we transmit; remHead = where we DRAW the peer. Cross-machine, one player's myCam
+                    // should match the other player's remHead — if not, the two worlds aren't aligned.
+                    Camera cam = null; try { cam = Camera.main; } catch { }
+                    string myCam = cam != null ? V(cam.transform.position) : "n/a";
+                    Log.LogInfo($"[p2p] peer={(HasPeer ? Peer.m_SteamID.ToString() : "none")} sent={_sent} recvd={_recvd} remoteValid={RemoteValid} myCam={myCam} mySent={V(LastSentHead)} remHead={V(HeadPos)} remHands={HasHands}");
+                }
             }
         }
 
@@ -150,7 +160,16 @@ namespace IronNestVR
 
         public static void SendPose(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)
         {
+            LastSentHead = hp;   // record even if we don't send, so the diag shows what we WOULD transmit
             if (!_inited || !HasPeer) return;
+            // Rate cap: skip this frame's send if we're ahead of the target Hz. Framerate below the cap always
+            // passes (now >= _nextSend), so a slow peer keeps sending every frame.
+            float now = Time.unscaledTime;
+            if (Config.CoopSendHz > 0f)
+            {
+                if (now < _nextSend) return;
+                _nextSend = now + 1f / Config.CoopSendHz;
+            }
             try
             {
                 int o = 0;
@@ -209,6 +228,8 @@ namespace IronNestVR
         private static int PutF(int o, float f) { var t = BitConverter.GetBytes(f); _sendArr[o] = t[0]; _sendArr[o + 1] = t[1]; _sendArr[o + 2] = t[2]; _sendArr[o + 3] = t[3]; return o + 4; }
         private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
         private static int PutQ(int o, Quaternion q) { o = PutF(o, q.x); o = PutF(o, q.y); o = PutF(o, q.z); o = PutF(o, q.w); return o; }
+
+        private static string V(Vector3 v) => $"({v.x:F2},{v.y:F2},{v.z:F2})";
 
         private static bool Finite(float f) => !float.IsNaN(f) && !float.IsInfinity(f);
         private static bool Finite(Vector3 v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
