@@ -60,6 +60,13 @@ namespace IronNestVR
         // settling without a noticeable "pop-in" wait for the joiner.
         public static float CoopSnapshotDelaySec = 1.5f;
 
+        // Phase 4 co-op: host-authoritative simulation. The HOST runs the mission node-graph (enemy spawns,
+        // damage, objectives, score); a co-op CLIENT's copy is GATED OFF (Harmony-suppressed MissionGraph /
+        // MissionPassiveGraph Run+Update) so it never double-spawns — it mirrors the host's world instead.
+        // Active ONLY for a client connected to a peer; solo play and the host always run the sim. The gated
+        // methods only execute during a mission, so this never touches the validated hub co-op. See CoopSim.
+        public static bool CoopSimAuthority = true;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it

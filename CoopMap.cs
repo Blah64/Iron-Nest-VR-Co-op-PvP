@@ -25,16 +25,25 @@ namespace IronNestVR
     /// the applied transform; on release we make the placement STICK by calling <c>ItemSlot.PlaceItem</c> when
     /// it landed in a slot (otherwise the game would snap it back to where its own state thinks it is).
     ///
-    /// The dynamically-spawned bearing/range markers (MapMarkerLineUI) have a create/destroy lifecycle and are
-    /// a separate follow-up; the mission-spawned MapEntity targets are host-authoritative (Phase 4).
+    /// ALSO REPLICATES the dynamically-drawn bearing/range MARKERS (<c>MapMarkerLineUI</c>) — these DO have a
+    /// create/destroy lifecycle (unlike the fixed token set). They carry no stable id, so each side assigns its
+    /// own collision-free netId to the markers it creates; their geometry is two endpoints in <c>mapRect</c>-
+    /// LOCAL space (already frame-stable cross-machine — no Barbet transform needed). We replicate the
+    /// FINALIZED set: detect a local finalize (a new GameObject appears in <c>MapMarkerPlacer.placedMarkers</c>)
+    /// → send ADD; the peer instantiates the same prefab and replays Initialize/UpdateLine/FinalizePlacement;
+    /// either side deleting a marker (it leaves placedMarkers) → send DEL; the peer destroys its mirror. The
+    /// live drag-preview is deferred polish. The mission-spawned MapEntity targets are host-authoritative
+    /// (Phase 4).
     /// </summary>
     internal static class CoopMap
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        public const byte MSG_GRAB = 10;   // [t][itemId i32]                          reliable
-        public const byte MSG_POS = 11;    // [t][itemId i32][x,y,z f32]  (board-local) unreliable
-        public const byte MSG_PLACE = 12;  // [t][itemId i32][x,y,z f32][slotId i32]   reliable
+        public const byte MSG_GRAB = 10;        // [t][itemId i32]                          reliable
+        public const byte MSG_POS = 11;         // [t][itemId i32][x,y,z f32]  (board-local) unreliable
+        public const byte MSG_PLACE = 12;       // [t][itemId i32][x,y,z f32][slotId i32]   reliable
+        public const byte MSG_MARKER_ADD = 14;  // [t][netId i32][prefabIdx i32][oX,oY,tX,tY f32] reliable  (13 = ctrl JIP snap)
+        public const byte MSG_MARKER_DEL = 15;  // [t][netId i32]                           reliable
 
         private const float StaleSec = 2f;
 
@@ -60,20 +69,43 @@ namespace IronNestVR
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
 
+        // --- bearing/range markers (MapMarkerLineUI) ---
+        private sealed class Marker
+        {
+            public int NetId;
+            public GameObject Go;
+            public MapMarkerLineUI Ui;
+            public int InstanceId;     // Go.GetInstanceID() — diffs against MapMarkerPlacer.placedMarkers
+            public int PrefabIdx;      // which markerPrefabs entry it was drawn from
+            public bool IsLocal;       // we created it via local game input (vs mirrored from the peer)
+        }
+
+        private static readonly Dictionary<int, Marker> _markers = new Dictionary<int, Marker>();   // netId -> marker
+        private static readonly Dictionary<int, int> _byInstance = new Dictionary<int, int>();        // GO instanceId -> netId
+        private static readonly HashSet<int> _seen = new HashSet<int>();                              // placedMarkers instanceIds this tick
+        private static readonly List<int> _toRemove = new List<int>();
+        private static MapMarkerPlacer _placer;
+        private static int _placerIid = -1;
+        private static float _nextPlacerScan;
+        private static int _markerSeq;
+
         // ---------------- per-frame ----------------
 
         public static void Tick(float dt)
         {
             if (!Config.CoopMapSync) return;
-            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { if (_items.Count > 0) ClearOwnership(); return; }
+            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { if (_items.Count > 0 || _markers.Count > 0) ClearOwnership(); return; }
             try
             {
-                EnsureRegistry();
-                if (_ref == null || _items.Count == 0) return;
+                EnsureRegistry();   // resolves the token board AND the marker placer
 
                 float now = Time.unscaledTime;
                 bool sendNow = Config.CoopSendHz <= 0f || now >= _nextSend;
                 if (sendNow && Config.CoopSendHz > 0f) _nextSend = now + 1f / Config.CoopSendHz;
+
+                DetectLocalMarkers();   // bearing/range markers — independent of the token board
+
+                if (_ref == null || _items.Count == 0) return;
 
                 foreach (var it in _items.Values)
                 {
@@ -166,6 +198,31 @@ namespace IronNestVR
                     }
                     break;
                 }
+                case MSG_MARKER_ADD:
+                {
+                    if (len < 25) return;
+                    int netId = GetInt(a, ref o);
+                    int prefabIdx = GetInt(a, ref o);
+                    Vector2 origin = new Vector2(GetF(a, ref o), GetF(a, ref o));
+                    Vector2 tip = new Vector2(GetF(a, ref o), GetF(a, ref o));
+                    if (_markers.ContainsKey(netId)) return;   // already mirrored (dup / JIP re-send)
+                    SpawnMirror(netId, prefabIdx, origin, tip);
+                    break;
+                }
+                case MSG_MARKER_DEL:
+                {
+                    if (len < 5) return;
+                    int netId = GetInt(a, ref o);
+                    if (_markers.TryGetValue(netId, out var m))
+                    {
+                        try { var pm = _placer != null ? _placer.placedMarkers : null; if (pm != null && m.Go != null) pm.Remove(m.Go); } catch { }
+                        try { if (m.Go != null) UnityEngine.Object.Destroy(m.Go); } catch { }
+                        _byInstance.Remove(m.InstanceId);
+                        _markers.Remove(netId);
+                        Log.LogInfo($"[map] removed remote marker <- peer (id={netId})");
+                    }
+                    break;
+                }
             }
         }
 
@@ -221,23 +278,197 @@ namespace IronNestVR
             try
             {
                 EnsureRegistry();
-                if (_ref == null || _items.Count == 0) { Log.LogInfo("[map] JIP snapshot: no map board present — nothing to send"); return; }
                 int n = 0;
-                foreach (var it in _items.Values)
+                if (_ref != null)
+                    foreach (var it in _items.Values)
+                    {
+                        if (it.Token == null || it.T == null) continue;
+                        SendPlace(it, false);
+                        n++;
+                    }
+                int mk = 0;
+                foreach (var m in _markers.Values)
                 {
-                    if (it.Token == null || it.T == null) continue;
-                    SendPlace(it, false);
-                    n++;
+                    if (m.Ui == null || m.Go == null) continue;
+                    SendMarkerAdd(m);
+                    mk++;
                 }
-                Log.LogInfo($"[map] sent JIP snapshot -> peer ({n} tokens)");
+                if (n == 0 && mk == 0) Log.LogInfo("[map] JIP snapshot: nothing to send (no tokens or markers present)");
+                else Log.LogInfo($"[map] sent JIP snapshot -> peer ({n} tokens, {mk} markers)");
             }
             catch (Exception e) { Log.LogWarning("[map] snapshot: " + e.Message); }
+        }
+
+        // ---------------- markers: local detection + spawn/send ----------------
+
+        // Detect the LOCAL player creating or deleting a bearing/range marker by diffing the placer's
+        // placedMarkers list against what we already track. A GameObject we don't recognise = the local player
+        // just finalized a new marker (send ADD); a tracked marker that has left the list = it was deleted here
+        // (send DEL). Markers we MIRRORED from the peer are registered with their instanceId, so they're never
+        // mistaken for new local placements. Either player may create or delete; deletes propagate both ways.
+        private static void DetectLocalMarkers()
+        {
+            if (_placer == null) return;
+            Il2CppSystem.Collections.Generic.List<GameObject> placed = null;
+            try { placed = _placer.placedMarkers; } catch { return; }
+            if (placed == null) return;
+
+            // 1) New locally-finalized markers.
+            _seen.Clear();
+            int count;
+            try { count = placed.Count; } catch { return; }
+            for (int i = 0; i < count; i++)
+            {
+                GameObject go = null;
+                try { go = placed[i]; } catch { continue; }
+                if (go == null) continue;
+                int iid = go.GetInstanceID();
+                _seen.Add(iid);
+                if (_byInstance.ContainsKey(iid)) continue;   // already tracked (local or mirror)
+
+                MapMarkerLineUI ui = null;
+                try { ui = go.GetComponent<MapMarkerLineUI>(); } catch { }
+                if (ui == null) continue;
+                int netId = NextMarkerId();
+                int idx = ActivePrefabIndex();
+                var m = new Marker { NetId = netId, Go = go, Ui = ui, InstanceId = iid, PrefabIdx = idx, IsLocal = true };
+                _markers[netId] = m; _byInstance[iid] = netId;
+                SendMarkerAdd(m);
+                Log.LogInfo($"[map] local marker placed -> peer (id={netId} idx={idx} dist={SafeF(ui, true):0.0} ang={SafeF(ui, false):0.0})");
+            }
+
+            // 2) Deletions: any tracked marker whose GameObject left placedMarkers (or was destroyed).
+            _toRemove.Clear();
+            foreach (var kv in _markers)
+            {
+                var m = kv.Value;
+                if (m.Go == null || !_seen.Contains(m.InstanceId)) _toRemove.Add(kv.Key);
+            }
+            for (int i = 0; i < _toRemove.Count; i++)
+            {
+                int netId = _toRemove[i];
+                if (!_markers.TryGetValue(netId, out var m)) continue;
+                _byInstance.Remove(m.InstanceId);
+                _markers.Remove(netId);
+                SendMarkerDel(netId);
+                Log.LogInfo($"[map] local marker deleted -> peer (id={netId})");
+            }
+        }
+
+        // Peer → mirror a finalized marker: instantiate the same prefab, replay the geometry, finalize, and add
+        // it to placedMarkers so it's a first-class marker locally (hoverable/deletable, and that delete
+        // propagates back). Registered with its instanceId so our own detection won't re-broadcast it.
+        private static void SpawnMirror(int netId, int prefabIdx, Vector2 origin, Vector2 tip)
+        {
+            if (_placer == null) { Log.LogWarning($"[map] marker add (id={netId}) but no MapMarkerPlacer in scene"); return; }
+            try
+            {
+                GameObject prefab = null;
+                try { var ps = _placer.markerPrefabs; if (ps != null && prefabIdx >= 0 && prefabIdx < ps.Count) prefab = ps[prefabIdx]; } catch { }
+                if (prefab == null) { try { prefab = _placer.activeMarkerPrefab; } catch { } }
+                if (prefab == null) { Log.LogWarning($"[map] marker add (id={netId}): no prefab[{prefabIdx}]"); return; }
+                RectTransform mapRect = null;
+                try { mapRect = _placer.mapRect; } catch { }
+                if (mapRect == null) { Log.LogWarning($"[map] marker add (id={netId}): placer has no mapRect"); return; }
+
+                var inst = UnityEngine.Object.Instantiate(prefab).TryCast<GameObject>();
+                if (inst == null) { Log.LogWarning($"[map] marker add (id={netId}): instantiate failed"); return; }
+                try { inst.transform.SetParent(mapRect.transform, false); } catch { }
+                MapMarkerLineUI ui = null;
+                try { ui = inst.GetComponent<MapMarkerLineUI>(); } catch { }
+                if (ui == null) { Log.LogWarning($"[map] marker add (id={netId}): prefab has no MapMarkerLineUI"); try { UnityEngine.Object.Destroy(inst); } catch { } return; }
+
+                try { ui.Initialize(origin, mapRect); } catch (Exception e) { Log.LogWarning("[map] marker Initialize: " + e.Message); }
+                try { ui.UpdateLine(origin, tip, mapRect); } catch (Exception e) { Log.LogWarning("[map] marker UpdateLine: " + e.Message); }
+                try { ui.FinalizePlacement(); } catch (Exception e) { Log.LogWarning("[map] marker FinalizePlacement: " + e.Message); }
+                try { var pm = _placer.placedMarkers; if (pm != null) pm.Add(inst); } catch { }
+
+                int iid = inst.GetInstanceID();
+                _markers[netId] = new Marker { NetId = netId, Go = inst, Ui = ui, InstanceId = iid, PrefabIdx = prefabIdx, IsLocal = false };
+                _byInstance[iid] = netId;
+                Log.LogInfo($"[map] mirrored remote marker <- peer (id={netId} idx={prefabIdx} dist={SafeF(ui, true):0.0} ang={SafeF(ui, false):0.0})");
+            }
+            catch (Exception e) { Log.LogWarning("[map] spawn mirror: " + e.Message); }
+        }
+
+        private static void SendMarkerAdd(Marker m)
+        {
+            if (!EnsureBuf() || m.Ui == null) return;
+            Vector2 origin = Vector2.zero, tip = Vector2.zero;
+            try { origin = m.Ui.OriginLocal; var t = m.Ui.TipLocalPosition; tip = new Vector2(t.x, t.y); } catch { }
+            if (!Finite(origin.x) || !Finite(origin.y) || !Finite(tip.x) || !Finite(tip.y)) return;
+            int o = 0; _buf[o++] = MSG_MARKER_ADD; o = PutInt(o, m.NetId); o = PutInt(o, m.PrefabIdx);
+            o = PutF(o, origin.x); o = PutF(o, origin.y); o = PutF(o, tip.x); o = PutF(o, tip.y);
+            CoopP2P.Send(_buf, o, true);
+        }
+
+        private static void SendMarkerDel(int netId)
+        {
+            if (!EnsureBuf()) return;
+            int o = 0; _buf[o++] = MSG_MARKER_DEL; o = PutInt(o, netId);
+            CoopP2P.Send(_buf, o, true);
+        }
+
+        // The prefab a placed marker was drawn from isn't back-referenced on the instance, so we approximate it
+        // with the placer's CURRENT active prefab (the one just used to draw it). Mostly affects marker visual
+        // style; geometry comes from the endpoints.
+        private static int ActivePrefabIndex()
+        {
+            try
+            {
+                var ap = _placer.activeMarkerPrefab; var ps = _placer.markerPrefabs;
+                if (ap != null && ps != null) for (int i = 0; i < ps.Count; i++) if ((object)ps[i] == (object)ap) return i;
+            }
+            catch { }
+            return 0;
+        }
+
+        // Collision-free across the two players: FNV of (mySteamId : sequence). Avoid 0 (used as a "none" id).
+        private static int NextMarkerId()
+        {
+            int id = Fnv(CoopP2P.MyId.ToString() + ":" + (_markerSeq++));
+            if (id == 0) id = Fnv(CoopP2P.MyId.ToString() + ":" + (_markerSeq++) + "x");
+            return id;
+        }
+
+        private static float SafeF(MapMarkerLineUI ui, bool dist)
+        {
+            try { return dist ? ui.DistanceValue : ui.AngleValue; } catch { return 0f; }
+        }
+
+        private static void ClearMarkers(bool destroyMirrors)
+        {
+            if (destroyMirrors)
+                foreach (var m in _markers.Values)
+                {
+                    if (m.IsLocal || m.Go == null) continue;
+                    try { var pm = _placer != null ? _placer.placedMarkers : null; if (pm != null) pm.Remove(m.Go); } catch { }
+                    try { UnityEngine.Object.Destroy(m.Go); } catch { }
+                }
+            _markers.Clear(); _byInstance.Clear();
         }
 
         // ---------------- registry ----------------
 
         private static void EnsureRegistry()
         {
+            // Marker placer — resolved on its own light timer, independent of the token board (a scene can have
+            // the bearing-marker map without the 3D token board, e.g. the hub). On a placer change (new scene)
+            // drop the marker tracking (the old GameObjects died with the scene).
+            if (Time.unscaledTime >= _nextPlacerScan)
+            {
+                _nextPlacerScan = Time.unscaledTime + 2f;
+                try
+                {
+                    var pls = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapMarkerPlacer>(), FindObjectsSortMode.None);
+                    var p = (pls != null && pls.Length > 0) ? pls[0].TryCast<MapMarkerPlacer>() : null;
+                    int piid = p != null ? p.GetInstanceID() : -1;
+                    if (piid != _placerIid) { ClearMarkers(false); _placerIid = piid; if (p != null) Log.LogInfo($"[map] marker placer found ({(p.markerPrefabs != null ? p.markerPrefabs.Count : 0)} prefabs, host={CoopP2P.IsHost})"); }
+                    _placer = p;
+                }
+                catch { _placer = null; }
+            }
+
             Transform reference = null;
             try
             {
@@ -296,6 +527,7 @@ namespace IronNestVR
         private static void ClearOwnership()
         {
             foreach (var it in _items.Values) { it.LocalOwned = false; it.RemoteOwned = false; it.PrevDragging = false; it.HasRemotePos = false; ClearExternal(it); }
+            ClearMarkers(true);   // co-op ended → drop the peer's mirrored markers; locals re-detect on reconnect
         }
 
         // ---------------- diagnostics ----------------
@@ -304,7 +536,10 @@ namespace IronNestVR
         {
             int local = 0, remote = 0;
             foreach (var it in _items.Values) { if (it.LocalOwned) local++; if (it.RemoteOwned) remote++; }
-            return $"map: {_items.Count} tokens, {_slots.Count} slots, boardRef={_ref != null}, owned local={local} remote={remote}";
+            int mLocal = 0, mRemote = 0;
+            foreach (var m in _markers.Values) { if (m.IsLocal) mLocal++; else mRemote++; }
+            return $"map: {_items.Count} tokens, {_slots.Count} slots, boardRef={_ref != null}, owned local={local} remote={remote} | " +
+                   $"markers: placer={_placer != null}, {_markers.Count} tracked (local={mLocal} mirror={mRemote})";
         }
 
         public static void Dump()
@@ -315,6 +550,8 @@ namespace IronNestVR
                 if (it.LocalOwned) Log.LogInfo($"[map]   LOCAL-owned: '{it.T.name}'");
                 else if (it.RemoteOwned) Log.LogInfo($"[map]   remote-owned: '{it.T.name}' localPos={it.RemoteLocal}");
             }
+            foreach (var m in _markers.Values)
+                Log.LogInfo($"[map]   marker id={m.NetId} {(m.IsLocal ? "local" : "mirror")} idx={m.PrefabIdx} dist={SafeF(m.Ui, true):0.0} ang={SafeF(m.Ui, false):0.0}");
         }
 
         // ---------------- helpers ----------------
