@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using BepInEx.Logging;
 using Il2CppInterop.Runtime;
+using TMPro;
 using UnityEngine;
 
 namespace IronNestVR
@@ -27,11 +29,22 @@ namespace IronNestVR
             public Transform Model;       // offset/scale live here (child of Anchor)
             public Vector3 Intrinsic;     // model localScale as built
             public bool IsMesh;           // mesh vs primitive sphere (so we can upgrade later)
+            public List<FingerCurl.Joint> Joints;  // finger bones for streamed curl (mesh hands only)
         }
 
         private static GameObject _root, _head, _body;
         private static HandObj _l, _r;
         private static bool _built;
+
+        // Floating persona name tag above the head.
+        private static GameObject _nameRoot;
+        private static TextMeshPro _nameText;
+        private static string _shownName;
+
+        // Where the name tag should face. VR sets the head pose each frame (SetViewer); flatscreen falls back
+        // to Camera.main. Without this the tag would face the flat camera, which in VR isn't the player's eyes.
+        private static Vector3 _viewerPos;
+        private static bool _viewerValid;
 
         private static readonly Color HeadColor = new Color(0.30f, 0.70f, 1f);
         private static readonly Color BodyColor = new Color(0.18f, 0.42f, 0.70f);
@@ -52,6 +65,7 @@ namespace IronNestVR
 
                 _head.transform.SetPositionAndRotation(CoopP2P.HeadPos, CoopP2P.HeadRot);
                 PositionBody(CoopP2P.HeadPos, CoopP2P.HeadRot);
+                UpdateNameTag(CoopP2P.HeadPos);
 
                 bool hands = CoopP2P.HasHands;
                 if (_l.Anchor.activeSelf != hands) _l.Anchor.SetActive(hands);
@@ -76,6 +90,35 @@ namespace IronNestVR
             _body.transform.SetPositionAndRotation(headPos + Vector3.down * 0.45f, yawRot);
         }
 
+        // VR passes the head pose so the name tag faces the player's eyes; flatscreen leaves it invalid and we
+        // fall back to Camera.main. Called every frame from VrManager.
+        public static void SetViewer(Vector3 pos, bool valid) { _viewerPos = pos; _viewerValid = valid; }
+
+        private static Vector3 ViewerPos()
+        {
+            if (_viewerValid) return _viewerPos;
+            try { var c = Camera.main; if (c != null) return c.transform.position; } catch { }
+            return (_head != null) ? _head.transform.position + Vector3.back : Vector3.back;
+        }
+
+        // Position + billboard the name tag above the head, and keep its text in sync with the peer's persona.
+        private static void UpdateNameTag(Vector3 headPos)
+        {
+            if (_nameRoot == null) return;
+            bool show = Config.CoopNameTags && !string.IsNullOrEmpty(CoopP2P.PeerName);
+            if (_nameRoot.activeSelf != show) _nameRoot.SetActive(show);
+            if (!show) return;
+
+            if (_shownName != CoopP2P.PeerName)
+            {
+                _shownName = CoopP2P.PeerName;
+                if (_nameText != null) { _nameText.text = _shownName; _nameText.ForceMeshUpdate(false, false); }
+            }
+
+            Vector3 tagPos = headPos + Vector3.up * Config.NameTagHeight;
+            _nameRoot.transform.SetPositionAndRotation(tagPos, VrText.FaceViewer(tagPos, ViewerPos()));
+        }
+
         private static void PlaceHand(HandObj h, bool right, Vector3 pos, Quaternion rot)
         {
             if (h == null || h.Anchor == null) return;
@@ -89,6 +132,14 @@ namespace IronNestVR
                 h.Model.localScale = new Vector3(bs.x * s, bs.y * s, bs.z * s);
                 h.Model.localPosition = right ? Config.HandOffsetPosR : Config.HandOffsetPosL;
                 h.Model.localEulerAngles = right ? Config.HandOffsetEulR : Config.HandOffsetEulL;
+
+                // Curl the fingers from the peer's streamed amounts (mesh hands aren't mirrored, so no sign flip).
+                if (Config.CoopFingerCurlSync && CoopP2P.HasCurl && h.Joints != null)
+                {
+                    float idx = right ? CoopP2P.RCurlIndex : CoopP2P.LCurlIndex;
+                    float oth = right ? CoopP2P.RCurlOther : CoopP2P.LCurlOther;
+                    FingerCurl.Apply(h.Joints, idx, oth);
+                }
             }
         }
 
@@ -123,8 +174,30 @@ namespace IronNestVR
             _l = BuildHand(false);
             _r = BuildHand(true);
 
+            BuildNameTag();
+
             _built = true;
-            Log.LogInfo($"[avatar] built remote avatar (head + body + hands{(_l.IsMesh ? " [mesh]" : " [sphere]")})");
+            Log.LogInfo($"[avatar] built remote avatar (head + body + hands{(_l.IsMesh ? " [mesh]" : " [sphere]")} + name tag)");
+        }
+
+        // A small floating card above the head carrying the peer's Steam persona name. 3D TMP on layer 0, so it
+        // draws in both the VR eyes and the flat camera; billboarded toward the viewer each frame.
+        private static void BuildNameTag()
+        {
+            try
+            {
+                _nameRoot = new GameObject("CoopNameTag");
+                _nameRoot.transform.SetParent(_root.transform, false);
+                _nameRoot.layer = 0;
+                var bg = VrText.Panel(_nameRoot.transform, new Vector2(0.36f, 0.10f),
+                                      new Color(0.04f, 0.05f, 0.07f, 0.78f), 0);
+                bg.transform.localPosition = Vector3.zero;
+                _nameText = VrText.Make(_nameRoot.transform, "", new Vector2(0.33f, 0.075f),
+                                        new Color(0.90f, 0.95f, 1f, 1f), 0, true);
+                _nameText.transform.localPosition = new Vector3(0f, 0f, -0.006f); // toward viewer => in front of bg
+                _nameRoot.SetActive(false);
+            }
+            catch (Exception e) { Log.LogWarning("[avatar] name tag build: " + e.Message); }
         }
 
         private static HandObj BuildHand(bool right)
@@ -147,6 +220,7 @@ namespace IronNestVR
                 h.Intrinsic = model.transform.localScale;
                 h.Model = model.transform;
                 h.IsMesh = true;
+                h.Joints = FingerCurl.Collect(model);   // finger bones for the streamed curl
             }
             else
             {
@@ -155,6 +229,7 @@ namespace IronNestVR
                 h.Model = ball.transform;
                 h.Intrinsic = ball.transform.localScale;
                 h.IsMesh = false;
+                h.Joints = null;
             }
         }
 

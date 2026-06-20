@@ -46,10 +46,11 @@ namespace IronNestVR
             Log.LogInfo("VrManager active. Bringing up OpenXR (needs a headset + active OpenXR runtime).");
         }
 
-        // Flatscreen co-op lobby browser (crossplay counterpart to the in-VR menu page).
+        // Flatscreen co-op lobby browser (crossplay counterpart to the in-VR menu page) + the join toast.
         private void OnGUI()
         {
             try { LobbyGui.Draw(); } catch { }
+            try { Notify.DrawFlat(); } catch { }   // non-focus-pulling "X joined" toast (flatscreen)
         }
 
         // The game is an FPS that locks the OS cursor to centre for mouselook, so the flatscreen lobby
@@ -163,6 +164,7 @@ namespace IronNestVR
                 if (fcam != null)
                     SendLocalPose(fcam.transform.position, fcam.transform.rotation, false,
                                   Vector3.zero, Quaternion.identity, Vector3.zero, Quaternion.identity);
+                RemoteAvatar.SetViewer(Vector3.zero, false);   // flatscreen: name tags face Camera.main
             }
             RemoteAvatar.Update();
 
@@ -231,9 +233,11 @@ namespace IronNestVR
                     _grab.ReconcileScale(); // live clipboard size, even with the menu open
                     _hands.Tick(_xr.Input, _rig, active); // pose hand models (after manip sets overrides)
 
-                    // Co-op: stream our head + hand world poses to the peer (mirrored as fake-remote if F6).
+                    // Co-op: stream our head + hand world poses (and finger curl) to the peer (mirrored as
+                    // fake-remote if F6). The head pose also drives the remote name-tag billboard.
                     if (_rig.TryGetHeadPose(out var coHp, out var coHr))
                     {
+                        RemoteAvatar.SetViewer(coHp, true);   // name tags face the VR head, not Camera.main
                         var origin = _rig.OriginTransform;
                         Vector3 lp = coHp, rp = coHp; Quaternion lr = coHr, rr = coHr;
                         if (origin != null)
@@ -241,7 +245,14 @@ namespace IronNestVR
                             if (_xr.Input.GripValidL) { lp = PoseWorldPos(_xr.Input.GripPoseL, origin); lr = PoseWorldRot(_xr.Input.GripPoseL, origin); }
                             if (_xr.Input.GripValid)  { rp = PoseWorldPos(_xr.Input.GripPose, origin);  rr = PoseWorldRot(_xr.Input.GripPose, origin); }
                         }
-                        SendLocalPose(coHp, coHr, true, lp, lr, rp, rr);
+                        float lci = 0f, lco = 0f, rci = 0f, rco = 0f;
+                        bool curl = _hands != null;
+                        if (curl)
+                        {
+                            lci = _hands.LeftCurlIndex; lco = _hands.LeftCurlOther;
+                            rci = _hands.RightCurlIndex; rco = _hands.RightCurlOther;
+                        }
+                        SendLocalPose(coHp, coHr, true, lp, lr, rp, rr, curl, lci, lco, rci, rco);
                     }
                 }
                 _interactor.Apply(_xr.Input, _rig, dt, active, active && (_menu.IsOpen || _handManip.Active), _menu.IsOpen);
@@ -252,6 +263,7 @@ namespace IronNestVR
                 // HUD follow runs after the eye cameras have been posed this frame.
                 Dbg.Beat("hud");
                 _hud.Tick(_rig, active);
+                Notify.TickVr(_rig);   // world-space "X joined" toast in front of the head
                 Dbg.Beat("loopEnd");
 
                 if (shouldRender && _xr.ViewsValid && Time.unscaledTime >= _nextPoseLog)
@@ -351,6 +363,7 @@ namespace IronNestVR
             _hands = null;
             try { _menu?.Dispose(); } catch { }
             _menu = null;
+            try { Notify.DisposeVr(); } catch { }
             try { _rig?.Destroy(); } catch { }
             _rig = null;
             try { _xr?.Dispose(); } catch { }
@@ -429,13 +442,14 @@ namespace IronNestVR
         private static Quaternion PoseWorldRot(Posef p, Transform origin)
         { var lr = new Quaternion(-p.Orientation.X, -p.Orientation.Y, p.Orientation.Z, p.Orientation.W); return origin.rotation * lr; }
 
-        private void SendLocalPose(Vector3 hp, Quaternion hr, bool hands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)
+        private void SendLocalPose(Vector3 hp, Quaternion hr, bool hands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr,
+                                   bool curl = false, float lci = 0f, float lco = 0f, float rci = 0f, float rco = 0f)
         {
-            CoopP2P.SendPose(hp, hr, hands, lp, lr, rp, rr);
+            CoopP2P.SendPose(hp, hr, hands, lp, lr, rp, rr, curl, lci, lco, rci, rco);
             if (CoopP2P.SelfTest)   // mirror local pose 0.8 m ahead so the avatar is visible solo
             {
                 Vector3 off = hr * Vector3.forward * 0.8f;
-                CoopP2P.InjectRemote(hp + off, hr, hands, lp + off, lr, rp + off, rr);
+                CoopP2P.InjectRemote(hp + off, hr, hands, lp + off, lr, rp + off, rr, curl, lci, lco, rci, rco);
             }
         }
 

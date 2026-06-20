@@ -22,9 +22,14 @@ namespace IronNestVR
 
         private const int Channel = 0;
         private const byte MSG_POSE = 1;
+        // Pose flag-byte bits: hands present, and (implies hands) finger-curl present. Older builds sent the
+        // flag as a plain 0/1 bool — the curl bit is additive, so a peer that doesn't send curl just leaves it 0.
+        private const byte FLAG_HANDS = 1;
+        private const byte FLAG_CURL = 2;
         // Exact wire sizes so truncated packets are rejected instead of parsing stale buffer bytes.
-        private const int HeadPacketLen = 2 + 12 + 16;        // msg + flag + headPos(3f) + headRot(4f) = 30
-        private const int HandPacketLen = 2 + (12 + 16) * 3;  // + left + right = 86
+        private const int HeadPacketLen = 2 + 12 + 16;          // msg + flag + headPos(3f) + headRot(4f) = 30
+        private const int HandPacketLen = 2 + (12 + 16) * 3;    // + left + right hand = 86
+        private const int HandCurlPacketLen = HandPacketLen + 16; // + Lindex,Lother,Rindex,Rother (4f) = 102
 
         private static bool _inited;
         private static ulong _myId;
@@ -47,7 +52,14 @@ namespace IronNestVR
         public static Vector3 HeadPos; public static Quaternion HeadRot = Quaternion.identity;
         public static bool HasHands;
         public static Vector3 LPos, RPos; public static Quaternion LRot = Quaternion.identity, RRot = Quaternion.identity;
+        // Remote finger curl (0..1): index from the trigger, "other" from the grip. RemoteAvatar bends the hand
+        // mesh from these when HasCurl. Only set when the peer streams it (FLAG_CURL).
+        public static bool HasCurl;
+        public static float LCurlIndex, LCurlOther, RCurlIndex, RCurlOther;
         public static Vector3 LastSentHead;   // diag: the head world-pos we last transmitted
+
+        // The peer's Steam persona name (for the join toast + the avatar name tag); "" when no peer.
+        public static string PeerName = "";
 
         public static bool SelfTest;   // F6: mirror local pose as a fake remote, to verify avatar rendering solo
 
@@ -138,7 +150,7 @@ namespace IronNestVR
         {
             if (!SteamNet.InLobby)
             {
-                if (HasPeer) { CloseSession(Peer); HasPeer = false; Log.LogInfo("[p2p] not in lobby — peer cleared"); }
+                if (HasPeer) { CloseSession(Peer); HasPeer = false; PeerName = ""; Log.LogInfo("[p2p] not in lobby — peer cleared"); }
                 IsHost = false;
                 _snapAt = 0f;
                 if (!SelfTest) RemoteValid = false;
@@ -158,8 +170,10 @@ namespace IronNestVR
                         {
                             if (HasPeer && Peer.m_SteamID != m.m_SteamID) CloseSession(Peer);  // drop the old peer's session
                             Peer = m; HasPeer = true;
+                            try { PeerName = SteamFriends.GetFriendPersonaName(m); } catch { PeerName = ""; }
                             if (!SelfTest) RemoteValid = false;   // don't carry an old peer's avatar onto the new one
-                            Log.LogInfo($"[p2p] peer = {m.m_SteamID}");
+                            Log.LogInfo($"[p2p] peer = {m.m_SteamID} ('{PeerName}')");
+                            Notify.PeerJoined(PeerName, IsHost);   // non-blocking toast (flat + VR)
                             // Host pushes a full-world snapshot to the joiner once the session settles.
                             if (IsHost) { _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo($"[p2p] host: join-in-progress snapshot scheduled in {Config.CoopSnapshotDelaySec:0.0}s"); }
                             else _snapAt = 0f;
@@ -167,7 +181,7 @@ namespace IronNestVR
                         return;
                     }
                 }
-                if (HasPeer) { CloseSession(Peer); HasPeer = false; Log.LogInfo("[p2p] peer left lobby"); }
+                if (HasPeer) { Notify.PeerLeft(PeerName); CloseSession(Peer); HasPeer = false; PeerName = ""; Log.LogInfo("[p2p] peer left lobby"); }
                 _snapAt = 0f;
                 if (!SelfTest) RemoteValid = false;
             }
@@ -189,7 +203,8 @@ namespace IronNestVR
             try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
         }
 
-        public static void SendPose(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)
+        public static void SendPose(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr,
+                                    bool hasCurl = false, float lCurlIdx = 0f, float lCurlOth = 0f, float rCurlIdx = 0f, float rCurlOth = 0f)
         {
             LastSentHead = hp;   // record even if we don't send, so the diag shows what we WOULD transmit
             if (!_inited || !HasPeer) return;
@@ -203,11 +218,17 @@ namespace IronNestVR
             }
             try
             {
+                bool curl = hasHands && hasCurl && Config.CoopFingerCurlSync;
+                byte flag = 0;
+                if (hasHands) flag |= FLAG_HANDS;
+                if (curl) flag |= FLAG_CURL;
+
                 int o = 0;
                 _sendArr[o++] = MSG_POSE;
-                _sendArr[o++] = (byte)(hasHands ? 1 : 0);
+                _sendArr[o++] = flag;
                 o = PutV(o, hp); o = PutQ(o, hr);
                 if (hasHands) { o = PutV(o, lp); o = PutQ(o, lr); o = PutV(o, rp); o = PutQ(o, rr); }
+                if (curl) { o = PutF(o, lCurlIdx); o = PutF(o, lCurlOth); o = PutF(o, rCurlIdx); o = PutF(o, rCurlOth); }
                 if (SteamNetworking.SendP2PPacket(Peer, _sendArr, (uint)o, EP2PSend.k_EP2PSendUnreliableNoDelay, Channel)) _sent++;
             }
             catch (Exception e) { Log.LogWarning("[p2p] send: " + e.Message); }
@@ -230,9 +251,12 @@ namespace IronNestVR
         }
 
         // Fake-remote injection for the F6 solo render test.
-        public static void InjectRemote(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)
+        public static void InjectRemote(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr,
+                                        bool hasCurl = false, float lCurlIdx = 0f, float lCurlOth = 0f, float rCurlIdx = 0f, float rCurlOth = 0f)
         {
             HeadPos = hp; HeadRot = hr; HasHands = hasHands; LPos = lp; LRot = lr; RPos = rp; RRot = rr;
+            HasCurl = hasHands && hasCurl;
+            if (HasCurl) { LCurlIndex = lCurlIdx; LCurlOther = lCurlOth; RCurlIndex = rCurlIdx; RCurlOther = rCurlOth; }
             RemoteValid = true; _remoteAge = 0f;
         }
 
@@ -258,22 +282,34 @@ namespace IronNestVR
                     if (read < 2) continue;
 
                     byte flag = _recvArr[1];
-                    if (flag > 1) continue;                                  // unknown flag (sender only writes 0/1)
-                    bool hands = flag == 1;
-                    if (read < (uint)(hands ? HandPacketLen : HeadPacketLen)) continue;  // truncated — no stale-byte parse
+                    if ((flag & ~(FLAG_HANDS | FLAG_CURL)) != 0) continue;   // unknown flag bits
+                    bool hands = (flag & FLAG_HANDS) != 0;
+                    bool curl = (flag & FLAG_CURL) != 0;
+                    if (curl && !hands) continue;                            // curl implies hands
+                    int need = curl ? HandCurlPacketLen : (hands ? HandPacketLen : HeadPacketLen);
+                    if (read < (uint)need) continue;                        // truncated — no stale-byte parse
 
                     // Parse into locals, validate, THEN publish — so a bad packet never leaves torn pose state.
                     int o = 2;
                     Vector3 hp = GetV(ref o); Quaternion hr = GetQ(ref o);
                     Vector3 lp = Vector3.zero, rp = Vector3.zero; Quaternion lr = Quaternion.identity, rr = Quaternion.identity;
                     if (hands) { lp = GetV(ref o); lr = GetQ(ref o); rp = GetV(ref o); rr = GetQ(ref o); }
+                    float lci = 0f, lco = 0f, rci = 0f, rco = 0f;
+                    if (curl) { lci = GetF(ref o); lco = GetF(ref o); rci = GetF(ref o); rco = GetF(ref o); }
 
                     // NaN/Inf into a Unity transform poisons the hierarchy; a zero quaternion normalizes to NaN.
                     if (!Finite(hp) || !FiniteRot(hr)) continue;
                     if (hands && (!Finite(lp) || !Finite(rp) || !FiniteRot(lr) || !FiniteRot(rr))) continue;
+                    if (curl && (!Finite(lci) || !Finite(lco) || !Finite(rci) || !Finite(rco))) continue;
 
                     HeadPos = hp; HeadRot = hr; HasHands = hands;
                     if (hands) { LPos = lp; LRot = lr; RPos = rp; RRot = rr; }
+                    HasCurl = curl;
+                    if (curl)
+                    {
+                        LCurlIndex = Mathf.Clamp01(lci); LCurlOther = Mathf.Clamp01(lco);
+                        RCurlIndex = Mathf.Clamp01(rci); RCurlOther = Mathf.Clamp01(rco);
+                    }
                     RemoteValid = true; _remoteAge = 0f; _recvd++;
                 }
             }

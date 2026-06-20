@@ -75,6 +75,13 @@ namespace IronNestVR
         public bool Calibrating => _calib != Calib.None;
         public bool CalibratingRight => _calib == Calib.Right;
 
+        // Current smoothed finger-curl amounts (0..1), streamed to the peer so the remote avatar's hands curl
+        // too (index follows the trigger, "other" follows the grip). See CoopP2P / RemoteAvatar.
+        public float RightCurlIndex => _right.CurlIndex;
+        public float RightCurlOther => _right.CurlOther;
+        public float LeftCurlIndex => _left.CurlIndex;
+        public float LeftCurlOther => _left.CurlOther;
+
         public void ToggleCalibration(bool right)
         {
             Calib want = right ? Calib.Right : Calib.Left;

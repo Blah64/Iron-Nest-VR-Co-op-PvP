@@ -15,11 +15,14 @@ namespace IronNestVR
     ///     OnGUI and DETECT CLICKS ourselves via UnityEngine.InputSystem.Mouse, hit-testing the same rects.
     ///
     /// A single Layout() pass feeds both Draw (render) and HandleInput (click) so the rects always match.
-    /// Shown by default on flatscreen; VR disables it on init (VR uses the in-headset menu). F7 toggles.
+    /// HIDDEN by default: while shown on flatscreen it frees the cursor and freezes FPS look (so its
+    /// buttons are clickable), which would otherwise stop a non-VR player moving their camera the moment
+    /// the mod loads. Co-op is opt-in — F7 toggles the panel on/off. (VR never shows it; it uses the
+    /// in-headset menu page.) This keeps flatscreen-without-a-headset playing exactly like unmodded.
     /// </summary>
     internal static class LobbyGui
     {
-        public static bool Shown = true;          // flatscreen shows by default; VR disables on init
+        public static bool Shown = false;         // opt-in via F7; never auto-grabs the flatscreen camera
         public static bool FlatInteractive;       // set by VrManager = Shown && not in VR -> free cursor + take clicks
 
         private struct Btn { public Rect R; public string Label; public Action Act; }

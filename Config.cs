@@ -85,6 +85,25 @@ namespace IronNestVR
         // teleprinter locally on both, so syncing there would double-print). See CoopOrders.
         public static bool CoopOrdersSync = true;
 
+        // --- Co-op presence niceties (avatar polish) ---
+        // Pop a short, non-focus-pulling toast when a peer joins/leaves the lobby (so it's obvious someone
+        // arrived). Shown both on flatscreen (IMGUI box) and in VR (world-space card in front of the head).
+        public static bool CoopJoinNotify = true;
+        public static float NotifySeconds = 2.5f;     // how long the toast stays up
+        public static float NotifyDistance = 1.1f;    // VR: metres in front of the head
+        public static float NotifyHeight = 0.28f;     // VR: metres above eye level
+        public static float NotifyScale = 1f;         // VR: toast size multiplier
+
+        // Float the peer's Steam persona name above their avatar's head so you know who's who. Renders in
+        // both VR and flatscreen (layer-0 3D text), billboarded toward the viewer.
+        public static bool CoopNameTags = true;
+        public static float NameTagHeight = 0.34f;    // metres above the remote head
+
+        // Stream local finger-curl amounts (index from the trigger, other fingers from the grip) so the remote
+        // avatar's hands visibly close around dials/triggers instead of staying open. Uses the same curl rig
+        // and Config.FingerCurl* tunables as the local hands.
+        public static bool CoopFingerCurlSync = true;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it
