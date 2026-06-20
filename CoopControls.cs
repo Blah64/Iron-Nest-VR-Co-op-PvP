@@ -20,10 +20,14 @@ namespace IronNestVR
     ///   input, but the control's drag flag flips all the same). First to grab a FREE control owns it; if a
     ///   peer already owns it we don't claim (their stream overrides our local fiddling). Simultaneous grabs
     ///   are broken by host priority so exactly one side yields.
-    /// • We sync the RESULT, not the input: whoever operates a control streams the turret/gun physical state
-    ///   that control's GROUP drives (azimuth CurrentAngle+DesiredRotation; per-gun elevation; powder). The
-    ///   other machine snaps to it. Snapping the result is robust whether a dial is position- or
-    ///   speed-controlled, and pins the very visible rotating cockpit (Barbet) tightly.
+    /// • We sync the INTENT, not the input: whoever operates a control streams the turret/gun DESIRED aim
+    ///   that control's GROUP drives (azimuth DesiredRotation; per-gun DesiredElevationAngle; powder). BOTH
+    ///   machines run the turret sim locally and slew CurrentAngle/CurrentElevation toward the shared desired,
+    ///   so EITHER player can drive and the other follows — symmetric, no host authority. Rate-driven motion
+    ///   ("turn a wheel, release, the turret keeps moving") mirrors for free: it's just the local slew to the
+    ///   shared DesiredRotation. (Matches the reference mod's Turrets.cs; we sync CurrentAngle exactly ONCE, in
+    ///   the JIP snapshot, for a tight start — never in the live stream, which is what made the host fight and
+    ///   override the client when we streamed physical state continuously.)
     /// • Presence: each operated dial/lever also streams its visual value so you SEE the other player turning
     ///   it (the turret state alone wouldn't move a flavor dial or a valve).
     ///
@@ -176,17 +180,15 @@ namespace IronNestVR
                     if (c.RemoteOwned && now >= c.RemoteUntil) { c.RemoteOwned = false; RecomputeGroupRemote(c.Grp); }
                 }
 
+                // Stream the DESIRED aim only for groups WE are operating right now (symmetric — either side can
+                // drive). The peer applies our desired and its own turret sim slews toward it; after we release,
+                // the desired is fixed AND already delivered (the last stream frame + the reliable release carry
+                // it), so BOTH turrets slew to the same final aim locally — no host authority, no post-release
+                // freeze, and no CurrentAngle tug-of-war (the bug when the host streamed physical state
+                // continuously and overrode the client's input).
                 if (sendNow)
                     for (int g = 1; g < _grp.Length; g++)
-                    {
-                        if (groupOwnedLocal[g]) { SendGroupState((Group)g); continue; }
-                        // Host is authoritative for turret/gun PHYSICAL state: stream it CONTINUOUSLY, not only
-                        // while a control is held. Turret motion here is RATE-DRIVEN (open a hydraulic valve /
-                        // turn a wheel, release, and the turret keeps moving) — without this the peer only moved
-                        // while you were actively holding a control and then froze. Defer to the client while IT
-                        // owns the group (its stream wins until it releases).
-                        if (CoopP2P.IsHost && !(_grp[g].RemoteOwned && now < _grp[g].Until)) SendGroupState((Group)g);
-                    }
+                        if (groupOwnedLocal[g]) SendGroupState((Group)g);
 
                 for (int g = 0; g < _grp.Length; g++)
                     if (_grp[g].RemoteOwned && now >= _grp[g].Until) _grp[g].RemoteOwned = false;
@@ -291,11 +293,10 @@ namespace IronNestVR
         {
             var gs = _grp[(int)g];
             if (!gs.Has || now >= gs.Until) return;
-            if (LocallyOwnsGroup(g)) return;   // never fight our own live drag
-            // The CLIENT snaps to the host's authoritative turret/gun stream whenever it's fresh (so rate-driven
-            // motion mirrors continuously). The HOST applies the client's state only while the client explicitly
-            // owns the group (a grab) — otherwise the host is the authority and must not be overwritten.
-            if (CoopP2P.IsHost && !(gs.RemoteOwned && now < gs.Until)) return;
+            if (LocallyOwnsGroup(g)) return;   // never fight our own live drag (our input wins, symmetric)
+            // Apply the peer's DESIRED aim; our local turret sim slews toward it. Symmetric — no host/client
+            // distinction. Once neither side operates the group its stream goes stale (StaleSec) and we stop
+            // re-applying; by then both turrets have slewed to the shared desired.
             ApplyGroupValues(g, gs);
         }
 
@@ -309,14 +310,12 @@ namespace IronNestVR
                 switch (g)
                 {
                     case Group.Rotation:
-                        _turret.DesiredRotation = gs.V[0];
-                        _turret.CurrentAngle = gs.V[1];
-                        try { _turret.ApplyRotationToTransforms(); } catch { }
+                        _turret.DesiredRotation = gs.V[0];   // intent only — local sim slews CurrentAngle toward it
                         break;
                     case Group.Elevation:
                         _turret.DesiredElevation = gs.V[0];
-                        if (_gunL != null) { _gunL.DesiredElevationAngle = gs.V[1]; _gunL.CurrentElevation = gs.V[2]; }
-                        if (_gunR != null) { _gunR.DesiredElevationAngle = gs.V[3]; _gunR.CurrentElevation = gs.V[4]; }
+                        if (_gunL != null) _gunL.DesiredElevationAngle = gs.V[1];
+                        if (_gunR != null) _gunR.DesiredElevationAngle = gs.V[2];
                         break;
                     case Group.GunLeft:  ApplyGunState(_gunL, gs); break;
                     case Group.GunRight: ApplyGunState(_gunR, gs); break;
@@ -651,14 +650,12 @@ namespace IronNestVR
             switch (g)
             {
                 case Group.Rotation:
-                    o = PutFloat(o, _turret.DesiredRotation); o = PutFloat(o, _turret.CurrentAngle);
+                    o = PutFloat(o, _turret.DesiredRotation);   // desired aim only (intent sync)
                     break;
                 case Group.Elevation:
                     o = PutFloat(o, _turret.DesiredElevation);
                     o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
-                    o = PutFloat(o, _gunL != null ? _gunL.CurrentElevation : 0f);
                     o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
-                    o = PutFloat(o, _gunR != null ? _gunR.CurrentElevation : 0f);
                     break;
                 case Group.GunLeft:  o = PutGun(o, _gunL); break;
                 case Group.GunRight: o = PutGun(o, _gunR); break;
@@ -677,8 +674,8 @@ namespace IronNestVR
 
         private static int GroupFloatCount(Group g) => g switch
         {
-            Group.Rotation => 2,
-            Group.Elevation => 5,
+            Group.Rotation => 1,
+            Group.Elevation => 3,
             Group.GunLeft => 2,
             Group.GunRight => 2,
             _ => 0,

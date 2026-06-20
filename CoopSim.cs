@@ -64,17 +64,25 @@ namespace IronNestVR
             catch (Exception e) { Log.LogError("[sim] Harmony init failed: " + e); return; }
 
             // NARROW gate: suppress ONLY the enemy/target spawn node's action on a co-op client. The graph keeps
-            // running (transitions still fire), so the client's own gun/reload/ammo/objectives/teleprinter run
-            // locally; enemies are mirrored from the host via CoopEntities (host-authoritative spawns/RNG).
+            // running (transitions still fire), so the client's own gun/reload/ammo/objectives run locally;
+            // enemies are mirrored from the host via CoopEntities (host-authoritative spawns/RNG).
             _patched = TryPatch(typeof(SleepyNodes.State_SpawnMapEntity), "OnEnter");
             Log.LogInfo($"[sim] host-authoritative SPAWN gate (narrow): {_patched}/1 spawn-node method patched " +
                         "(client runs its own mission machinery; only spawns are host-authoritative; host + solo run normally)");
 
-            // NOTE: under the narrow gate the client's teleprinter node runs locally and prints its own orders,
-            // so we no longer capture+replay them (that would double-print). CoopOrders stays in the tree, dormant
-            // behind Config.CoopOrdersSync (default OFF). To re-enable order replication you must ALSO suppress the
-            // client's own teleprinter output WITHOUT stalling its graph (State_TeleprinterText.WaitUntilComplete) —
-            // a non-trivial follow-up, only worth it if the locally-resolved order text is observed to diverge.
+            // TELEPRINTER ORDERS are the ONE thing the client can't resolve locally: the gated spawn node is what
+            // stashes the target in a graph context variable, so a client that skips it prints a BLANK order (the
+            // 2026-06-20 "empty text prompt"). So the HOST captures every resolved Teleprinter.SubmitLines via a
+            // postfix and CoopOrders replays it on the client's matching printer. The client's own (empty) order
+            // node still runs — we DON'T gate it (gating State_TeleprinterText.OnEnter risks stalling the graph on
+            // its WaitUntilComplete); its empty submit is harmless next to the replayed text. Gated by CoopOrdersSync.
+            try
+            {
+                var mi = AccessTools.Method(typeof(Teleprinter), "SubmitLines");
+                if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopOrders), nameof(CoopOrders.OnSubmitLines))); Log.LogInfo("[sim] teleprinter-order capture patched (Teleprinter.SubmitLines)"); }
+                else Log.LogWarning("[sim] Teleprinter.SubmitLines not found — orders won't sync");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] teleprinter patch: " + e.Message); }
         }
 
         private static int TryPatch(Type t, string method)

@@ -30,9 +30,11 @@ namespace IronNestVR
     ///
     /// (C) BEARING/RANGE LINES (<c>MapMarkerLineUI</c>) — create/destroy lifecycle, no stable id, so each side
     /// assigns its own collision-free netId. Geometry is two endpoints in <c>mapRect</c>-LOCAL space (already
-    /// frame-stable). ADD is caught by hooking <c>FinalizePlacement</c> (reliable; replaces the old
-    /// placedMarkers poll that missed finalizes); the peer instantiates the same by-NAME prefab (name encodes
-    /// color) and replays Initialize/UpdateLine/FinalizePlacement under an echo guard. DELETE is caught by
+    /// frame-stable). ADD is caught TWO ways (whichever fires first wins; deduped by GO instanceId): a Harmony
+    /// hook on <c>FinalizePlacement</c> (instant) AND a <c>placedMarkers</c> poll for an untracked, settled line
+    /// (<c>!isDragging &amp;&amp; HasReachedMinimumDragDistance</c> — the gate the original poll lacked, which is why
+    /// it "missed finalizes") as a hook-independent backstop. The peer instantiates the same by-NAME prefab (name
+    /// encodes color) and replays Initialize/UpdateLine/FinalizePlacement under an echo guard. DELETE is caught by
     /// polling <c>placedMarkers</c> for a tracked marker that has left the list → MSG_MARKER_DEL; the peer
     /// destroys its mirror. Either side may add or delete; both propagate. Mission-spawned MapEntity targets
     /// are host-authoritative (Phase 4 / CoopEntities).
@@ -57,6 +59,7 @@ namespace IronNestVR
         private static readonly HashSet<int> _draggingLocal = new HashSet<int>();   // MapPiece3D ids the LOCAL player is dragging (live-streamed)
         private static float _nextPieceScan;
         private static float _nextDelScan;   // throttle for marker delete-detection poll
+        private static float _nextAddScan;   // throttle for marker ADD-detection poll (hook-independent backstop)
 
         private const float StaleSec = 2f;
 
@@ -165,8 +168,10 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[map] piece drag-end: " + e.Message); }
         }
 
-        // A bearing/range line was just finalized locally → broadcast it. Skips lines WE instantiated as mirrors
-        // (echo guard). Sends the ABSOLUTE target (origin+tip), matching the reference's apply path.
+        // A bearing/range line was just finalized locally → broadcast it. This Harmony hook captures it INSTANTLY
+        // if FinalizePlacement is the game's actual finalize entry; DetectMarkerAdds() polls placedMarkers as a
+        // hook-independent backstop (0.3s) in case it isn't. Both funnel through CaptureLocalMarker, which dedups
+        // by GO instanceId so whichever fires first wins and the other no-ops.
         public static void OnLineFinalized(MapMarkerLineUI __instance)
         {
             try
@@ -175,22 +180,66 @@ namespace IronNestVR
                 if (_applyingNetworkLine) return;   // this is our own mirror being placed — don't bounce it back
                 if (!Config.CoopMapSync || !SteamNet.InLobby || !CoopP2P.HasPeer || __instance == null) return;
                 var go = __instance.gameObject; if (go == null) return;
-                int iid = go.GetInstanceID();
-                if (_byInstance.ContainsKey(iid)) return;   // already tracked (shouldn't happen for a fresh local line)
-
-                Vector2 origin, target;
-                try { origin = __instance.OriginLocal; var t = __instance.TipLocalPosition; target = origin + new Vector2(t.x, t.y); }
-                catch { return; }
-                if (!Finite(origin.x) || !Finite(origin.y) || !Finite(target.x) || !Finite(target.y)) return;
-
-                int netId = NextMarkerId();
-                string pname = MarkerPrefabName(go);
-                var m = new Marker { NetId = netId, Go = go, Ui = __instance, InstanceId = iid, PrefabName = pname, IsLocal = true };
-                _markers[netId] = m; _byInstance[iid] = netId;
-                SendMarkerAdd(netId, pname, origin, target);
-                Log.LogInfo($"[map] local marker finalized -> peer (id={netId} prefab='{pname}' origin={origin} target={target})");
+                CaptureLocalMarker(go, __instance, "hook");
             }
             catch (Exception e) { Log.LogWarning("[map] line finalized: " + e.Message); }
+        }
+
+        // Shared local-marker capture (from the FinalizePlacement hook OR the placedMarkers poll). Dedups by GO
+        // instanceId, reads the two endpoints in mapRect-local space, assigns a collision-free netId, tracks it,
+        // and broadcasts the ADD. Returns true if it actually captured (was new). Confirmed stays false here so
+        // DetectMarkerDeletes only arms a delete once it has SEEN the marker in placedMarkers (finalize→list-add
+        // race guard).
+        private static bool CaptureLocalMarker(GameObject go, MapMarkerLineUI ui, string why)
+        {
+            if (go == null || ui == null) return false;
+            int iid; try { iid = go.GetInstanceID(); } catch { return false; }
+            if (_byInstance.ContainsKey(iid)) return false;   // already tracked (fresh local OR a peer mirror)
+            Vector2 origin, target;
+            try { origin = ui.OriginLocal; var t = ui.TipLocalPosition; target = origin + new Vector2(t.x, t.y); }
+            catch { return false; }
+            if (!Finite(origin.x) || !Finite(origin.y) || !Finite(target.x) || !Finite(target.y)) return false;
+
+            int netId = NextMarkerId();
+            string pname = MarkerPrefabName(go);
+            _markers[netId] = new Marker { NetId = netId, Go = go, Ui = ui, InstanceId = iid, PrefabName = pname, IsLocal = true };
+            _byInstance[iid] = netId;
+            SendMarkerAdd(netId, pname, origin, target);
+            Log.LogInfo($"[map] local marker captured ({why}) -> peer (id={netId} prefab='{pname}' origin={origin} target={target})");
+            return true;
+        }
+
+        // Hook-independent ADD backstop: poll the placer's placedMarkers for a finalized line we aren't tracking
+        // yet, and capture it. Gated on !isDragging (not mid-drag) + HasReachedMinimumDragDistance (a real line,
+        // not a degenerate zero-length one) — this is what the ORIGINAL placedMarkers poll lacked, which is why it
+        // "missed finalizes" and was replaced by the hook. A finalized line stays in placedMarkers until deleted,
+        // so this cannot miss it; it just lands up to 0.3s later than the hook. Peer-mirrored lines are registered
+        // in _byInstance by SpawnMirror, so they're never re-broadcast.
+        private static void DetectMarkerAdds()
+        {
+            if (_placer == null || _applyingNetworkLine) return;
+            if (Time.unscaledTime < _nextAddScan) return;
+            _nextAddScan = Time.unscaledTime + 0.3f;
+            try
+            {
+                Il2CppSystem.Collections.Generic.List<GameObject> pm = null;
+                try { pm = _placer.placedMarkers; } catch { }
+                if (pm == null) return;
+                for (int i = 0; i < pm.Count; i++)
+                {
+                    var go = pm[i]; if (go == null) continue;
+                    int iid; try { iid = go.GetInstanceID(); } catch { continue; }
+                    if (_byInstance.ContainsKey(iid)) continue;   // already local or mirror
+                    MapMarkerLineUI ui = null; try { ui = go.GetComponent<MapMarkerLineUI>(); } catch { }
+                    if (ui == null) continue;
+                    bool dragging = false; try { dragging = ui.isDragging; } catch { }
+                    if (dragging) continue;                       // still being drawn — wait for the drop
+                    bool valid = false; try { valid = ui.HasReachedMinimumDragDistance; } catch { }
+                    if (!valid) continue;                         // degenerate/too-short — not a real placed line
+                    CaptureLocalMarker(go, ui, "poll");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[map] detect adds: " + e.Message); }
         }
 
         // ---------------- per-frame ----------------
@@ -220,6 +269,7 @@ namespace IronNestVR
                         SendPieceMove(id, tr.position, tr.rotation, false);
                     }
 
+                DetectMarkerAdds();      // capture a locally-drawn bearing/range line (backstops the finalize hook)
                 DetectMarkerDeletes();   // propagate a locally-deleted bearing/range line to the peer
 
                 if (_items.Count == 0) return;
@@ -539,6 +589,10 @@ namespace IronNestVR
         // FinalizePlacement from bouncing back through the finalize hook.
         private static void SpawnMirror(int netId, string prefabName, Vector2 origin, Vector2 target)
         {
+            if (_placer == null)   // a received ADD can beat the 2s placer scan — resolve it on demand
+            {
+                try { var pls = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapMarkerPlacer>(), FindObjectsSortMode.None); _placer = (pls != null && pls.Length > 0) ? pls[0].TryCast<MapMarkerPlacer>() : null; if (_placer != null) _placerIid = _placer.GetInstanceID(); } catch { }
+            }
             if (_placer == null) { Log.LogWarning($"[map] marker add (id={netId}) but no MapMarkerPlacer in scene"); return; }
             try
             {

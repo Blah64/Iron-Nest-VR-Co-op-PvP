@@ -9,19 +9,17 @@ namespace IronNestVR
     /// <summary>
     /// Phase 4 co-op (increment 4d): replicate the TELEPRINTER "typing machine" ORDERS.
     ///
-    /// DORMANT under the NARROW gate (2026-06-20, Config.CoopOrdersSync default OFF). This was written for the
-    /// FULL-gate model where the client ran no mission sim, so its teleprinter stayed blank and the host's
-    /// resolved order text had to be shipped over. Under the narrow gate the client runs its OWN teleprinter
-    /// node locally and prints its own orders (entities are replicated, so {grid}/{bearing} resolve to the same
-    /// values), so capturing+replaying the host's would DOUBLE-print. Kept intact + flag-gated so it can be
-    /// revived if locally-resolved order text is ever seen to diverge — note that reviving it also needs a
-    /// stall-safe way to suppress the client's own teleprinter output (State_TeleprinterText.WaitUntilComplete).
-    /// See CoopSim for the gate rationale. The original design notes follow.
+    /// ACTIVE even under the NARROW gate (Config.CoopOrdersSync = true). The narrow gate only suppresses the
+    /// client's enemy SPAWN node — but tested 2026-06-20 the client's order text still came out EMPTY, because
+    /// the gated <c>State_SpawnMapEntity</c> is what stashes the target in a graph context variable that the
+    /// order node later resolves {grid}/{bearing} against. A client that skips the spawn has no target → blank
+    /// order. So the resolved text MUST come from the host. The client's own (empty) teleprinter node still runs;
+    /// we deliberately DON'T gate it (gating <c>State_TeleprinterText.OnEnter</c> could stall the graph on its
+    /// <c>WaitUntilComplete</c>) — its empty submit is harmless beside the replayed real text.
     ///
     /// Mission orders are emitted host-side by the SleepyNodes graph node <c>State_TeleprinterText</c>, which
     /// resolves {bearing}/{grid} tokens against live MapEntity/RNG state and calls <c>Teleprinter.SubmitLines</c>.
-    /// On a FULLY-gated co-op CLIENT the mission graph was gated off (4a), so its teleprinter would stay blank —
-    /// and the client must NOT re-resolve the tokens (RNG/state-sensitive). So we replicate the RESOLVED text.
+    /// We replicate the host's RESOLVED text (the client cannot re-resolve it — no target context, RNG-sensitive).
     ///
     /// CAPTURE: a Harmony POSTFIX on <c>Teleprinter.SubmitLines</c> (the single funnel for all teleprinter text)
     /// reads the returned <c>PrintJob</c> {sourceId, lines} + the printer's <c>TeleprinterType</c> and, on the

@@ -80,13 +80,15 @@ namespace IronNestVR
         // mission leaves the client in the hub and entity sync has nothing to mirror into. See CoopScene.
         public static bool CoopSceneSync = true;
 
-        // Phase 4 co-op (4d): replicate the TELEPRINTER "typing machine" orders. OFF under the NARROW gate
-        // (2026-06-20): the client now runs its OWN teleprinter node locally and prints its own orders (entities
-        // are replicated, so {grid}/{bearing} tokens resolve to the same values), so capturing+replaying the
-        // host's would DOUBLE-print. Kept as a config so it's re-enablable IF locally-resolved order text is ever
-        // observed to diverge — but re-enabling also requires suppressing the client's own teleprinter output
-        // WITHOUT stalling its graph (State_TeleprinterText.WaitUntilComplete). See CoopSim / CoopOrders.
-        public static bool CoopOrdersSync = false;
+        // Phase 4 co-op (4d): replicate the TELEPRINTER "typing machine" orders. ON even under the narrow gate.
+        // Tested 2026-06-20: the client's order text came out EMPTY — the gated spawn node (State_SpawnMapEntity)
+        // is what stores the target in a graph context variable, so a client that skips it has no target to
+        // resolve {grid}/{bearing} against and prints a blank order. So the resolved text must come from the host:
+        // the host captures every Teleprinter.SubmitLines and the client replays it on its matching printer. We do
+        // NOT gate the client's own (empty) teleprinter node — gating its OnEnter could stall the graph on
+        // State_TeleprinterText.WaitUntilComplete; its empty local submit is harmless next to the replayed text.
+        // Scoped to an active mission. See CoopOrders / CoopSim.
+        public static bool CoopOrdersSync = true;
 
         // --- Co-op LOCAL TEST transport (same-machine, no second Steam account/PC) ---
         // TEST AID ONLY. When on, the Ctrl+F1/F2/F3 keys can stand up a localhost TCP link between two game
