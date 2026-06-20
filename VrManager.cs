@@ -74,8 +74,9 @@ namespace IronNestVR
 
             // Phase 3: apply the peer's control visuals + snap turret/gun state here, AFTER the game's Update
             // (so our snap wins the frame); re-applies the turret transform immediately so the visible
-            // rotating cockpit matches.
+            // rotating cockpit matches. Map token positions are applied here too (after the game's drag logic).
             CoopControls.LateApply();
+            CoopMap.LateApply();
         }
 
         private static void SetFpsLook(bool enabled)
@@ -130,6 +131,8 @@ namespace IronNestVR
             if (KeyDown(UnityEngine.InputSystem.Key.F6)) { CoopP2P.SelfTest = !CoopP2P.SelfTest; Log.LogInfo("[p2p] self-test " + (CoopP2P.SelfTest ? "ON" : "OFF")); }
             CoopP2P.Tick(Time.unscaledDeltaTime);
             CoopControls.Tick(Time.unscaledDeltaTime);   // Phase 3: detect local control drags + transmit
+            CoopClipboard.Tick(Time.unscaledDeltaTime);  // Phase 3: replicate HUD clipboard contents
+            CoopMap.Tick(Time.unscaledDeltaTime);        // Phase 3: replicate tactical-map token placements
             if (!_xrReady)
             {
                 var fcam = Camera.main;

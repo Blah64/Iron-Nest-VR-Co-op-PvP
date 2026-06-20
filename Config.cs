@@ -37,6 +37,16 @@ namespace IronNestVR
         // handler so the switch animation + effect (reload, fire) play on the peer too. Skips manuals + menus.
         public static bool CoopClickSync = true;
 
+        // Phase 3 co-op: replicate HUD clipboard contents (per-section text + active tool) between the two
+        // members via state-based diff keyed by NotepadSection.UnityTag. Captures player notes AND
+        // mission-graph briefing text. Pose (raised/focused/hidden) stays per-player and is NOT synced.
+        public static bool CoopClipboardSync = true;
+
+        // Phase 3 co-op: replicate tactical-map item placements (DraggableItem tokens) with transient
+        // per-item ownership, in MapPiece3D-board-local space (Barbet-relative, so turret rotation/sway and
+        // per-player board pan don't desync them). Dynamic markers + mission entities are separate/later.
+        public static bool CoopMapSync = true;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it

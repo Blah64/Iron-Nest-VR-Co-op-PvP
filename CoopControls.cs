@@ -385,6 +385,11 @@ namespace IronNestVR
                     _echoUntil[side == 0 ? FireKeyL : FireKeyR] = now + 0.3f;
                     break;
                 }
+                default:
+                    // Other co-op subsystems share the same P2P channel; forward by type.
+                    if (type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL) CoopClipboard.OnPacket(type, a, len);
+                    else CoopMap.OnPacket(type, a, len);
+                    break;
             }
         }
 
