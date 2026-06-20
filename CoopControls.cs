@@ -178,7 +178,15 @@ namespace IronNestVR
 
                 if (sendNow)
                     for (int g = 1; g < _grp.Length; g++)
-                        if (groupOwnedLocal[g]) SendGroupState((Group)g);
+                    {
+                        if (groupOwnedLocal[g]) { SendGroupState((Group)g); continue; }
+                        // Host is authoritative for turret/gun PHYSICAL state: stream it CONTINUOUSLY, not only
+                        // while a control is held. Turret motion here is RATE-DRIVEN (open a hydraulic valve /
+                        // turn a wheel, release, and the turret keeps moving) — without this the peer only moved
+                        // while you were actively holding a control and then froze. Defer to the client while IT
+                        // owns the group (its stream wins until it releases).
+                        if (CoopP2P.IsHost && !(_grp[g].RemoteOwned && now < _grp[g].Until)) SendGroupState((Group)g);
+                    }
 
                 for (int g = 0; g < _grp.Length; g++)
                     if (_grp[g].RemoteOwned && now >= _grp[g].Until) _grp[g].RemoteOwned = false;
@@ -282,8 +290,12 @@ namespace IronNestVR
         private static void ApplyGroup(Group g, float now)
         {
             var gs = _grp[(int)g];
-            if (!gs.RemoteOwned || now >= gs.Until || !gs.Has) return;
-            if (LocallyOwnsGroup(g)) return;   // a tug-of-war shouldn't fight our own live drag
+            if (!gs.Has || now >= gs.Until) return;
+            if (LocallyOwnsGroup(g)) return;   // never fight our own live drag
+            // The CLIENT snaps to the host's authoritative turret/gun stream whenever it's fresh (so rate-driven
+            // motion mirrors continuously). The HOST applies the client's state only while the client explicitly
+            // owns the group (a grab) — otherwise the host is the authority and must not be overwritten.
+            if (CoopP2P.IsHost && !(gs.RemoteOwned && now < gs.Until)) return;
             ApplyGroupValues(g, gs);
         }
 

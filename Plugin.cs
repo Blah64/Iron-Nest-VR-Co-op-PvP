@@ -29,6 +29,22 @@ namespace IronNestVR
             // Restore persisted VR settings (menu tunables + hand calibration) before the rig comes up.
             IronNestVR.Config.Load();
 
+            // Startup banner for the same-machine co-op test link, so a tester's log self-proves THIS build has
+            // the loopback transport and whether it's enabled (otherwise nothing prints until a key is pressed).
+            Log.LogInfo($"[loop] same-machine co-op test transport: {(IronNestVR.Config.CoopLoopback ? "ENABLED" : "DISABLED")} " +
+                        $"— Ctrl+F2 connect (press in BOTH windows) · Ctrl+F3 stop · port {IronNestVR.Config.CoopLoopbackPort}");
+
+            // Same-machine co-op testing means only ONE window can be focused at a time; the unfocused
+            // instance must keep its player loop (and CoopP2P.Tick) running or its half of the sync dies. Unity
+            // pauses an unfocused standalone window when runInBackground is false (the game's default), so force
+            // it ON from launch while the test transport is enabled. (A shipping/parity build sets
+            // Config.CoopLoopback=false to restore unmodded alt-tab pausing for no-headset players.)
+            if (IronNestVR.Config.CoopLoopback)
+            {
+                try { Application.runInBackground = true; Log.LogInfo("[loop] runInBackground forced ON at startup (unfocused instance keeps ticking)"); }
+                catch { }
+            }
+
             // Phase 4 co-op: install the host-authoritative sim-gate (Harmony). Safe pre-scene: the patched
             // mission-graph methods only run during a mission, and the gate is inert until a client joins.
             CoopSim.ApplyPatches();

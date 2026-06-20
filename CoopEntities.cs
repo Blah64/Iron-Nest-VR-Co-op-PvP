@@ -11,8 +11,9 @@ namespace IronNestVR
     /// <summary>
     /// Phase 4 co-op (increment 4b): replicate the host's mission ENTITIES (enemies / targets) to the client.
     ///
-    /// Pairs with <see cref="CoopSim"/> (4a): the client's mission graph is gated OFF, so it spawns nothing
-    /// locally and instead MIRRORS the host's world. Enemies are data records (<c>MapEntity</c>), each mirrored
+    /// Pairs with <see cref="CoopSim"/> (4a): the client's enemy/target SPAWN node is gated OFF (narrow gate),
+    /// so it authors no enemies locally and instead MIRRORS the host's. (The rest of the client's mission sim
+    /// runs normally now.) Enemies are data records (<c>MapEntity</c>), each mirrored
     /// in-scene by an <c>EntityLocation</c> MonoBehaviour. There is NO entity registry/factory in the demo, so:
     ///   • the HOST enumerates <c>FindObjectsByType&lt;EntityLocation&gt;()</c> → <c>.Entity</c>, diffs by a
     ///     stable hash of the MapEntity's string <c>ID</c>, and broadcasts SPAWN (full record) / UPDATE

@@ -22,9 +22,9 @@ namespace IronNestVR
     ///     broadcasts MISSION_START (with the OperationID); →BrowsingMap / →MainMenu broadcast GO_TO_PHASE.
     ///   • CLIENT applies them: GO_TO_PHASE → <c>EnterBrowsingMap()</c> / <c>ReturnToMap()</c> / <c>LoadMainMenu()</c>
     ///     / <c>EndOperationAndReturnToMenu()</c> (picked by where it currently is). MISSION_START → start the
-    ///     OperationLoadRelay whose <c>operation.OperationID</c> matches the host's. The 4a sim-gate keeps the
-    ///     client's MissionGraph from bootstrapping, so it loads the scene but spawns nothing — the host's
-    ///     entities arrive via <see cref="CoopEntities"/>.
+    ///     OperationLoadRelay whose <c>operation.OperationID</c> matches the host's. The client's mission graph
+    ///     bootstraps and runs normally now; the 4a NARROW gate only suppresses its enemy SPAWN node, so it
+    ///     authors no enemies of its own — the host's entities arrive via <see cref="CoopEntities"/>.
     ///   • Once the client reaches MissionActive it sends MISSION_READY; the host then re-sends the entity
     ///     snapshot — covering spawns the host streamed before the client's scene finished loading.
     ///

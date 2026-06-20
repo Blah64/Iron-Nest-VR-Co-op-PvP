@@ -37,6 +37,8 @@ namespace IronNestVR
         private static Il2CppStructArray<byte> _sendArr;   // persistent, sized for max packet
         private static Il2CppStructArray<byte> _recvArr;
         private static readonly byte[] _f4 = new byte[4];
+        private static byte[] _loopScratch;                // managed copy of an outbound packet for the loopback wire
+        private static bool _wasLoopback;                  // so we can clear peer state when loopback ends
 
         public static CSteamID Peer;
         public static bool HasPeer;
@@ -126,12 +128,65 @@ namespace IronNestVR
 
         public static void Tick(float dt)
         {
+            // Same-machine TEST mode: route everything over the localhost link instead of Steam (see
+            // LoopbackTransport). Mutually exclusive with the Steam path — we never touch SteamAPI here, so
+            // the second instance doesn't even need Steam initialised.
+            if (LoopbackTransport.Active) { _wasLoopback = true; TickLoopback(dt); return; }
+            if (_wasLoopback)   // loopback was just stopped — drop the synthetic peer so subsystems clear
+            {
+                _wasLoopback = false;
+                HasPeer = false; IsHost = false; PeerName = ""; _snapAt = 0f;
+                if (!SelfTest) RemoteValid = false;
+                Log.LogInfo("[p2p] loopback ended — peer cleared");
+            }
+
             if (!SteamNet.Ready) return;
             Init();
             UpdatePeer();
             Receive();
             if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
             if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
+        }
+
+        // Loopback (same-machine test) counterpart of the Steam Init+UpdatePeer+Receive trio. Derives peer +
+        // role from the TCP link, gives the two sides synthetic deterministic ids (host=1, client=2) so the
+        // host-priority ownership tie-break works without real SteamIDs, then drains the link through the SAME
+        // DispatchPacket path the Steam receive uses. The join-in-progress snapshot rides along for free.
+        private static void TickLoopback(float dt)
+        {
+            EnsureArrays();
+            bool was = HasPeer;
+            IsHost = LoopbackTransport.IsHost;
+            HasPeer = LoopbackTransport.Connected;
+            _myId = IsHost ? 1UL : 2UL;
+
+            if (HasPeer && !was)
+            {
+                PeerName = IsHost ? "Loopback client" : "Loopback host";
+                Log.LogInfo($"[p2p] loopback link up — role={(IsHost ? "HOST" : "client")}");
+                Notify.PeerJoined(PeerName, IsHost);
+                if (IsHost) { _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo("[p2p] host: loopback join snapshot scheduled"); }
+                else _snapAt = 0f;
+            }
+            else if (!HasPeer && was)
+            {
+                Notify.PeerLeft(PeerName); PeerName = ""; _snapAt = 0f;
+                if (!SelfTest) RemoteValid = false;
+                Log.LogInfo("[p2p] loopback link down");
+            }
+
+            ReceiveLoopback();
+            if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
+            if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
+        }
+
+        // Allocate the persistent Il2Cpp packet buffers (+ the managed loopback scratch). Init() does this for
+        // the Steam path; loopback skips Init() entirely (no SteamAPI), so it allocates here instead.
+        private static void EnsureArrays()
+        {
+            if (_sendArr == null) _sendArr = new Il2CppStructArray<byte>(128);
+            if (_recvArr == null) _recvArr = new Il2CppStructArray<byte>(1200);
+            if (_loopScratch == null) _loopScratch = new byte[1200];
         }
 
         // One-line status for the co-op diagnostics hub. Position diag: myCam = where THIS player actually is
@@ -207,7 +262,8 @@ namespace IronNestVR
                                     bool hasCurl = false, float lCurlIdx = 0f, float lCurlOth = 0f, float rCurlIdx = 0f, float rCurlOth = 0f)
         {
             LastSentHead = hp;   // record even if we don't send, so the diag shows what we WOULD transmit
-            if (!_inited || !HasPeer) return;
+            if (!HasPeer) return;
+            if (!LoopbackTransport.Active && !_inited) return;   // Steam path needs Init(); loopback doesn't
             // Rate cap: skip this frame's send if we're ahead of the target Hz. Framerate below the cap always
             // passes (now >= _nextSend), so a slow peer keeps sending every frame.
             float now = Time.unscaledTime;
@@ -229,7 +285,8 @@ namespace IronNestVR
                 o = PutV(o, hp); o = PutQ(o, hr);
                 if (hasHands) { o = PutV(o, lp); o = PutQ(o, lr); o = PutV(o, rp); o = PutQ(o, rr); }
                 if (curl) { o = PutF(o, lCurlIdx); o = PutF(o, lCurlOth); o = PutF(o, rCurlIdx); o = PutF(o, rCurlOth); }
-                if (SteamNetworking.SendP2PPacket(Peer, _sendArr, (uint)o, EP2PSend.k_EP2PSendUnreliableNoDelay, Channel)) _sent++;
+                if (LoopbackTransport.Active) { if (LoopSend(_sendArr, o)) _sent++; }
+                else if (SteamNetworking.SendP2PPacket(Peer, _sendArr, (uint)o, EP2PSend.k_EP2PSendUnreliableNoDelay, Channel)) _sent++;
             }
             catch (Exception e) { Log.LogWarning("[p2p] send: " + e.Message); }
         }
@@ -240,6 +297,8 @@ namespace IronNestVR
         // and peer; safe because every packet is type-tagged and Receive() dispatches on the first byte.
         public static bool Send(Il2CppStructArray<byte> buf, int len, bool reliable)
         {
+            // Loopback maps both reliability classes to TCP (ordered + reliable) — fine for a local test.
+            if (LoopbackTransport.Active) { if (LoopSend(buf, len)) { _sent++; return true; } return false; }
             if (!_inited || !HasPeer) return false;
             try
             {
@@ -248,6 +307,16 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[p2p] send2: " + e.Message); }
             return false;
+        }
+
+        // Copy an Il2Cpp packet buffer into the managed scratch and hand it to the localhost link. Keeps the
+        // subsystems' Il2Cpp send buffers untouched (they don't know about the transport).
+        private static bool LoopSend(Il2CppStructArray<byte> buf, int len)
+        {
+            if (!LoopbackTransport.Connected) return false;
+            if (_loopScratch == null || _loopScratch.Length < len) _loopScratch = new byte[Math.Max(1200, len)];
+            for (int i = 0; i < len; i++) _loopScratch[i] = buf[i];
+            return LoopbackTransport.Send(_loopScratch, len);
         }
 
         // Fake-remote injection for the F6 solo render test.
@@ -270,50 +339,76 @@ namespace IronNestVR
                     if (!SteamNetworking.ReadP2PPacket(_recvArr, (uint)_recvArr.Length, out uint read, out CSteamID from, Channel)) break;
                     // Only the current lobby peer may drive our state — drop anything else (spoof / stale peer).
                     if (!HasPeer || from.m_SteamID != Peer.m_SteamID) continue;
-                    if (read < 1) continue;
-
-                    // Non-pose packets are Phase 3 control-sync — dispatch by type byte and move on.
-                    if (_recvArr[0] != MSG_POSE)
-                    {
-                        try { CoopControls.OnPacket(_recvArr[0], _recvArr, (int)read); } catch (Exception ce) { Log.LogWarning("[ctrl] recv: " + ce.Message); }
-                        _recvd++;
-                        continue;
-                    }
-                    if (read < 2) continue;
-
-                    byte flag = _recvArr[1];
-                    if ((flag & ~(FLAG_HANDS | FLAG_CURL)) != 0) continue;   // unknown flag bits
-                    bool hands = (flag & FLAG_HANDS) != 0;
-                    bool curl = (flag & FLAG_CURL) != 0;
-                    if (curl && !hands) continue;                            // curl implies hands
-                    int need = curl ? HandCurlPacketLen : (hands ? HandPacketLen : HeadPacketLen);
-                    if (read < (uint)need) continue;                        // truncated — no stale-byte parse
-
-                    // Parse into locals, validate, THEN publish — so a bad packet never leaves torn pose state.
-                    int o = 2;
-                    Vector3 hp = GetV(ref o); Quaternion hr = GetQ(ref o);
-                    Vector3 lp = Vector3.zero, rp = Vector3.zero; Quaternion lr = Quaternion.identity, rr = Quaternion.identity;
-                    if (hands) { lp = GetV(ref o); lr = GetQ(ref o); rp = GetV(ref o); rr = GetQ(ref o); }
-                    float lci = 0f, lco = 0f, rci = 0f, rco = 0f;
-                    if (curl) { lci = GetF(ref o); lco = GetF(ref o); rci = GetF(ref o); rco = GetF(ref o); }
-
-                    // NaN/Inf into a Unity transform poisons the hierarchy; a zero quaternion normalizes to NaN.
-                    if (!Finite(hp) || !FiniteRot(hr)) continue;
-                    if (hands && (!Finite(lp) || !Finite(rp) || !FiniteRot(lr) || !FiniteRot(rr))) continue;
-                    if (curl && (!Finite(lci) || !Finite(lco) || !Finite(rci) || !Finite(rco))) continue;
-
-                    HeadPos = hp; HeadRot = hr; HasHands = hands;
-                    if (hands) { LPos = lp; LRot = lr; RPos = rp; RRot = rr; }
-                    HasCurl = curl;
-                    if (curl)
-                    {
-                        LCurlIndex = Mathf.Clamp01(lci); LCurlOther = Mathf.Clamp01(lco);
-                        RCurlIndex = Mathf.Clamp01(rci); RCurlOther = Mathf.Clamp01(rco);
-                    }
-                    RemoteValid = true; _remoteAge = 0f; _recvd++;
+                    DispatchPacket(read);
                 }
             }
             catch (Exception e) { Log.LogWarning("[p2p] recv: " + e.Message); }
+        }
+
+        // Drain the localhost test link into the SAME parse path as Steam: copy each length-framed packet into
+        // the persistent Il2Cpp recv array, then dispatch identically. Only the wire differs from Receive().
+        private static void ReceiveLoopback()
+        {
+            try
+            {
+                int guard = 0;
+                while (guard++ < 128 && LoopbackTransport.TryReceive(out var frame))
+                {
+                    int read = frame.Length;
+                    if (read < 1 || read > _recvArr.Length) continue;
+                    for (int i = 0; i < read; i++) _recvArr[i] = frame[i];
+                    DispatchPacket((uint)read);
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[p2p] recv-loop: " + e.Message); }
+        }
+
+        // Parse one packet already sitting in _recvArr (length = read). Transport-agnostic — shared by the
+        // Steam and loopback receive paths. Pose packets populate the remote-avatar fields; every other type
+        // byte fans out to the co-op subsystems via CoopControls.OnPacket (exactly as the Steam path always did).
+        private static void DispatchPacket(uint read)
+        {
+            if (read < 1) return;
+
+            // Non-pose packets are Phase 3+ subsystem traffic — dispatch by type byte and move on.
+            if (_recvArr[0] != MSG_POSE)
+            {
+                try { CoopControls.OnPacket(_recvArr[0], _recvArr, (int)read); } catch (Exception ce) { Log.LogWarning("[ctrl] recv: " + ce.Message); }
+                _recvd++;
+                return;
+            }
+            if (read < 2) return;
+
+            byte flag = _recvArr[1];
+            if ((flag & ~(FLAG_HANDS | FLAG_CURL)) != 0) return;   // unknown flag bits
+            bool hands = (flag & FLAG_HANDS) != 0;
+            bool curl = (flag & FLAG_CURL) != 0;
+            if (curl && !hands) return;                            // curl implies hands
+            int need = curl ? HandCurlPacketLen : (hands ? HandPacketLen : HeadPacketLen);
+            if (read < (uint)need) return;                         // truncated — no stale-byte parse
+
+            // Parse into locals, validate, THEN publish — so a bad packet never leaves torn pose state.
+            int o = 2;
+            Vector3 hp = GetV(ref o); Quaternion hr = GetQ(ref o);
+            Vector3 lp = Vector3.zero, rp = Vector3.zero; Quaternion lr = Quaternion.identity, rr = Quaternion.identity;
+            if (hands) { lp = GetV(ref o); lr = GetQ(ref o); rp = GetV(ref o); rr = GetQ(ref o); }
+            float lci = 0f, lco = 0f, rci = 0f, rco = 0f;
+            if (curl) { lci = GetF(ref o); lco = GetF(ref o); rci = GetF(ref o); rco = GetF(ref o); }
+
+            // NaN/Inf into a Unity transform poisons the hierarchy; a zero quaternion normalizes to NaN.
+            if (!Finite(hp) || !FiniteRot(hr)) return;
+            if (hands && (!Finite(lp) || !Finite(rp) || !FiniteRot(lr) || !FiniteRot(rr))) return;
+            if (curl && (!Finite(lci) || !Finite(lco) || !Finite(rci) || !Finite(rco))) return;
+
+            HeadPos = hp; HeadRot = hr; HasHands = hands;
+            if (hands) { LPos = lp; LRot = lr; RPos = rp; RRot = rr; }
+            HasCurl = curl;
+            if (curl)
+            {
+                LCurlIndex = Mathf.Clamp01(lci); LCurlOther = Mathf.Clamp01(lco);
+                RCurlIndex = Mathf.Clamp01(rci); RCurlOther = Mathf.Clamp01(rco);
+            }
+            RemoteValid = true; _remoteAge = 0f; _recvd++;
         }
 
         // --- (de)serialization: write into the persistent Il2Cpp send array, read from the recv array ---

@@ -46,7 +46,16 @@ namespace IronNestVR
         private static CallResult<LobbyMatchList_t> _crList;
 
         public static CSteamID CurrentLobby;
-        public static bool InLobby;
+
+        // A loopback test link counts as "in a session" so every co-op subsystem (which gates on
+        // SteamNet.InLobby && CoopP2P.HasPeer) activates without a Steam lobby. The backing field stays the
+        // real Steam-lobby state; loopback only ORs in on read. See LoopbackTransport.
+        private static bool _inLobby;
+        public static bool InLobby
+        {
+            get => _inLobby || LoopbackTransport.Connected;
+            set => _inLobby = value;
+        }
 
         public struct LobbyEntry { public CSteamID Id; public string Name; public int Members; public int Max; }
         public static readonly List<LobbyEntry> Lobbies = new List<LobbyEntry>();
@@ -178,7 +187,7 @@ namespace IronNestVR
             catch (Exception e) { Log.LogError("[net] Leave: " + e); }
         }
 
-        public static bool Ready => _inited;
+        public static bool Ready => _inited || LoopbackTransport.Connected;
 
         // One-line status for the VR menu / flatscreen GUI.
         public static string StatusLine()

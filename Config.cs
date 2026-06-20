@@ -60,11 +60,12 @@ namespace IronNestVR
         // settling without a noticeable "pop-in" wait for the joiner.
         public static float CoopSnapshotDelaySec = 1.5f;
 
-        // Phase 4 co-op: host-authoritative simulation. The HOST runs the mission node-graph (enemy spawns,
-        // damage, objectives, score); a co-op CLIENT's copy is GATED OFF (Harmony-suppressed MissionGraph /
-        // MissionPassiveGraph Run+Update) so it never double-spawns — it mirrors the host's world instead.
-        // Active ONLY for a client connected to a peer; solo play and the host always run the sim. The gated
-        // methods only execute during a mission, so this never touches the validated hub co-op. See CoopSim.
+        // Phase 4 co-op: host-authoritative SPAWNS (NARROW gate). Both players run their own mission machinery
+        // (gun, reload/ammo, objectives, score, teleprinter) locally; the ONLY thing gated on a co-op CLIENT is
+        // the enemy/target SPAWN node action (Harmony-suppressed State_SpawnMapEntity.OnEnter) so it never
+        // double-spawns with its own RNG — enemies are mirrored from the host via CoopEntities instead. Active
+        // ONLY for a client connected to a peer; solo play and the host always spawn normally. The spawn node
+        // only runs during a mission, so this never touches the validated hub co-op. See CoopSim.
         public static bool CoopSimAuthority = true;
 
         // Phase 4 co-op (4b): replicate the host's mission ENTITIES (enemies/targets) to the client. The host
@@ -79,11 +80,23 @@ namespace IronNestVR
         // mission leaves the client in the hub and entity sync has nothing to mirror into. See CoopScene.
         public static bool CoopSceneSync = true;
 
-        // Phase 4 co-op (4d): replicate the TELEPRINTER "typing machine" orders. The host captures every
-        // Teleprinter.SubmitLines (resolved order text) and the client replays it on its matching printer, so
-        // the gated client's teleprinter types the same orders. Scoped to an active mission (hub runs its own
-        // teleprinter locally on both, so syncing there would double-print). See CoopOrders.
-        public static bool CoopOrdersSync = true;
+        // Phase 4 co-op (4d): replicate the TELEPRINTER "typing machine" orders. OFF under the NARROW gate
+        // (2026-06-20): the client now runs its OWN teleprinter node locally and prints its own orders (entities
+        // are replicated, so {grid}/{bearing} tokens resolve to the same values), so capturing+replaying the
+        // host's would DOUBLE-print. Kept as a config so it's re-enablable IF locally-resolved order text is ever
+        // observed to diverge — but re-enabling also requires suppressing the client's own teleprinter output
+        // WITHOUT stalling its graph (State_TeleprinterText.WaitUntilComplete). See CoopSim / CoopOrders.
+        public static bool CoopOrdersSync = false;
+
+        // --- Co-op LOCAL TEST transport (same-machine, no second Steam account/PC) ---
+        // TEST AID ONLY. When on, the Ctrl+F1/F2/F3 keys can stand up a localhost TCP link between two game
+        // instances on ONE machine, bypassing Steam entirely so the whole co-op stack (avatars, control /
+        // click / fire sync, clipboard / map / entity / scene) can be exercised without a second Steam account
+        // — the recurring 2-player test blocker. Steam P2P stays the real shipping transport; nothing here
+        // opens a socket unless the operator presses the key. Set false to keep a shipping build inert.
+        //   Ctrl+F1 = host (instance A)   Ctrl+F2 = join 127.0.0.1 (instance B)   Ctrl+F3 = stop
+        public static bool CoopLoopback = true;
+        public static int CoopLoopbackPort = 56561;
 
         // --- Co-op presence niceties (avatar polish) ---
         // Pop a short, non-focus-pulling toast when a peer joins/leaves the lobby (so it's obvious someone

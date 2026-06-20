@@ -36,6 +36,7 @@ namespace IronNestVR
         private string _lastError;
         private float _nextErrLog;
         private float _nextPoseLog;
+        private float _loopDiagNext;   // same-machine loopback test: per-second focus/runInBackground/timeScale log
 
         // Phase 1 scene probe (still handy).
         private float _nextScan;
@@ -78,6 +79,13 @@ namespace IronNestVR
             // rotating cockpit matches. Map token positions are applied here too (after the game's drag logic).
             CoopControls.LateApply();
             CoopMap.LateApply();
+
+            // Same-machine test: the game pauses its SCALED-time sim/animations on an UNFOCUSED window
+            // (Time.timeScale → 0) even though the player loop keeps running (runInBackground). Our net layer
+            // uses unscaled time so it survives, but the background instance's turret motion + animations freeze.
+            // Force timeScale back to 1 on a live test link (in LateUpdate, after the game's Update, so we win
+            // the frame). Gated on the test flag so normal play is untouched.
+            try { if (Config.CoopLoopback && LoopbackTransport.Active && Time.timeScale != 1f) Time.timeScale = 1f; } catch { }
         }
 
         private static void SetFpsLook(bool enabled)
@@ -152,6 +160,19 @@ namespace IronNestVR
             // avatar update run in BOTH modes; the VR head+hand send happens in the frame loop below, the
             // flatscreen camera-pose send happens here. F6 toggles the solo render self-test.
             if (KeyDown(UnityEngine.InputSystem.Key.F6)) { CoopP2P.SelfTest = !CoopP2P.SelfTest; Log.LogInfo("[p2p] self-test " + (CoopP2P.SelfTest ? "ON" : "OFF")); }
+            LoopbackTransport.PollKeys();   // same-machine co-op test link: Ctrl+F2 connect (both windows) / Ctrl+F3 stop
+            // Re-assert every frame while the test transport is enabled, in case the game resets it on focus
+            // change — a single un-set would freeze the unfocused instance and silently kill its half of sync.
+            try { if (Config.CoopLoopback && !Application.runInBackground) Application.runInBackground = true; } catch { }
+            // Per-second state line so a same-machine test PROVES what the background window is doing: if these
+            // keep printing while a window is unfocused, the player loop is alive (runInBackground works); a
+            // timeScale of 0 there means the game paused its scaled-time sim/animations (which we force back to
+            // 1 in LateUpdate). A GAP in these lines instead = the loop really is paused (runInBackground issue).
+            if (LoopbackTransport.Active && Time.unscaledTime >= _loopDiagNext)
+            {
+                _loopDiagNext = Time.unscaledTime + 1f;
+                try { Log.LogInfo($"[loop] state focused={Application.isFocused} runInBackground={Application.runInBackground} timeScale={Time.timeScale:0.##} connected={LoopbackTransport.Connected}"); } catch { }
+            }
             CoopP2P.Tick(Time.unscaledDeltaTime);
             CoopControls.Tick(Time.unscaledDeltaTime);   // Phase 3: detect local control drags + transmit
             CoopClipboard.Tick(Time.unscaledDeltaTime);  // Phase 3: replicate HUD clipboard contents

@@ -75,8 +75,6 @@ namespace IronNestVR
 
         private static readonly Dictionary<int, Item> _items = new Dictionary<int, Item>();
         private static readonly Dictionary<int, ItemSlot> _slots = new Dictionary<int, ItemSlot>();
-        private static Transform _ref;       // MapPiece3D board (the shared coordinate frame)
-        private static int _refIid = -1;
         private static float _nextScan, _nextSend;
 
         private static Il2CppStructArray<byte> _buf;
@@ -139,6 +137,7 @@ namespace IronNestVR
         {
             try
             {
+                Log.LogInfo($"[map] HOOK piece BeginDrag fired (sync={Config.CoopMapSync} inLobby={SteamNet.InLobby} peer={CoopP2P.HasPeer})");
                 if (!Config.CoopMapSync || !SteamNet.InLobby || !CoopP2P.HasPeer || __instance == null) return;
                 var tr = __instance.transform; if (tr == null) return;
                 int id = Fnv(PathOf(tr));
@@ -154,6 +153,7 @@ namespace IronNestVR
         {
             try
             {
+                Log.LogInfo($"[map] HOOK piece EndDrag fired (sync={Config.CoopMapSync} inLobby={SteamNet.InLobby} peer={CoopP2P.HasPeer})");
                 if (!Config.CoopMapSync || !SteamNet.InLobby || !CoopP2P.HasPeer || __instance == null) return;
                 var tr = __instance.transform; if (tr == null) return;
                 int id = Fnv(PathOf(tr));
@@ -171,6 +171,7 @@ namespace IronNestVR
         {
             try
             {
+                Log.LogInfo($"[map] HOOK line FinalizePlacement fired (applying={_applyingNetworkLine} sync={Config.CoopMapSync} inLobby={SteamNet.InLobby} peer={CoopP2P.HasPeer})");
                 if (_applyingNetworkLine) return;   // this is our own mirror being placed — don't bounce it back
                 if (!Config.CoopMapSync || !SteamNet.InLobby || !CoopP2P.HasPeer || __instance == null) return;
                 var go = __instance.gameObject; if (go == null) return;
@@ -206,7 +207,7 @@ namespace IronNestVR
                 bool sendNow = Config.CoopSendHz <= 0f || now >= _nextSend;
                 if (sendNow && Config.CoopSendHz > 0f) _nextSend = now + 1f / Config.CoopSendHz;
 
-                ScanPieces(false);   // keep the MapPiece3D registry fresh so we can apply remote piece moves
+                ScanPieces(false);   // keep the MapPiece3D registry fresh (fire-mission map; separate from tokens)
 
                 // Live-stream the fire-mission pieces the local player is dragging (unreliable; the reliable
                 // drop-end packet is the authoritative final). Independent of the DraggableItem token board, so
@@ -221,7 +222,7 @@ namespace IronNestVR
 
                 DetectMarkerDeletes();   // propagate a locally-deleted bearing/range line to the peer
 
-                if (_ref == null || _items.Count == 0) return;
+                if (_items.Count == 0) return;
 
                 foreach (var it in _items.Values)
                 {
@@ -251,15 +252,15 @@ namespace IronNestVR
         public static void LateApply()
         {
             if (!Config.CoopMapSync) return;
-            if (!SteamNet.InLobby || !CoopP2P.HasPeer || _ref == null) return;
+            if (!SteamNet.InLobby || !CoopP2P.HasPeer) return;
             float now = Time.unscaledTime;
             foreach (var it in _items.Values)
             {
-                if (it.LocalOwned || !it.RemoteOwned || now >= it.RemoteUntil || !it.HasRemotePos || it.Token == null) continue;
+                if (it.LocalOwned || !it.RemoteOwned || now >= it.RemoteUntil || !it.HasRemotePos || it.Token == null || it.T == null) continue;
                 try
                 {
                     if (!it.Token._externallyControlled) it.Token._externallyControlled = true;
-                    it.T.position = _ref.TransformPoint(it.RemoteLocal);
+                    it.T.localPosition = it.RemoteLocal;   // parent-relative (the token's own frame) — no global ref
                 }
                 catch { }
             }
@@ -299,11 +300,11 @@ namespace IronNestVR
                     int id = GetInt(a, ref o);
                     Vector3 p = GetV(a, ref o);
                     int slotId = GetInt(a, ref o);
-                    if (_items.TryGetValue(id, out var it) && it.Token != null)
+                    if (_items.TryGetValue(id, out var it) && it.Token != null && it.T != null)
                     {
                         try
                         {
-                            if (Finite(p) && _ref != null) it.T.position = _ref.TransformPoint(p);
+                            if (Finite(p)) it.T.localPosition = p;   // parent-relative
                             if (slotId != 0 && _slots.TryGetValue(slotId, out var slot) && slot != null)
                                 slot.PlaceItem(it.Token);        // make a slot placement stick
                         }
@@ -363,9 +364,9 @@ namespace IronNestVR
 
         private static void SendPos(Item it)
         {
-            if (!EnsureBuf() || _ref == null) return;
+            if (!EnsureBuf() || it.T == null) return;
             Vector3 local;
-            try { local = _ref.InverseTransformPoint(it.T.position); } catch { return; }
+            try { local = it.T.localPosition; } catch { return; }
             if (!Finite(local)) return;
             int o = 0; _buf[o++] = MSG_POS; o = PutInt(o, it.NetId); o = PutV(o, local);
             CoopP2P.Send(_buf, o, false);
@@ -373,9 +374,9 @@ namespace IronNestVR
 
         private static void SendPlace(Item it, bool log = true)
         {
-            if (!EnsureBuf() || _ref == null) return;
+            if (!EnsureBuf() || it.T == null) return;
             Vector3 local;
-            try { local = _ref.InverseTransformPoint(it.T.position); } catch { return; }
+            try { local = it.T.localPosition; } catch { return; }
             int slotId = 0;
             try
             {
@@ -405,13 +406,12 @@ namespace IronNestVR
             {
                 EnsureRegistry();
                 int n = 0;
-                if (_ref != null)
-                    foreach (var it in _items.Values)
-                    {
-                        if (it.Token == null || it.T == null) continue;
-                        SendPlace(it, false);
-                        n++;
-                    }
+                foreach (var it in _items.Values)
+                {
+                    if (it.Token == null || it.T == null) continue;
+                    SendPlace(it, false);
+                    n++;
+                }
                 int mk = 0;
                 foreach (var m in _markers.Values)
                 {
@@ -691,22 +691,13 @@ namespace IronNestVR
                 catch { _placer = null; }
             }
 
-            Transform reference = null;
-            try
-            {
-                var boards = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapPiece3D>(), FindObjectsSortMode.None);
-                if (boards != null && boards.Length > 0) { var b = boards[0].TryCast<MapPiece3D>(); if (b != null) reference = b.transform; }
-            }
-            catch { }
-            if (reference == null) { if (_items.Count > 0) { _items.Clear(); _slots.Clear(); _ref = null; _refIid = -1; } return; }
-
-            int iid = reference.GetInstanceID();
-            bool rescan = _refIid != iid || _items.Count == 0 || Time.unscaledTime >= _nextScan;
-            _ref = reference;
+            // Tokens are synced by their OWN LOCAL transform (relative to their own parent), so NO global
+            // reference frame is needed — a token's parent is the same scene object on both machines and rides
+            // whatever rotates/sways, so localPosition is directly comparable cross-machine. Just scan for the
+            // tokens and register them whenever connected (the old MapPiece3D "board" requirement is gone).
+            bool rescan = _items.Count == 0 || Time.unscaledTime >= _nextScan;
             if (!rescan) return;
             _nextScan = Time.unscaledTime + 3f;
-            if (_refIid != iid) { _items.Clear(); _slots.Clear(); }
-            _refIid = iid;
 
             int addedItems = 0, addedSlots = 0;
             try
@@ -717,7 +708,14 @@ namespace IronNestVR
                     var d = arr[i].TryCast<DraggableItem>(); if (d == null) continue;
                     var tr = d.transform; if (tr == null) continue;
                     int id = Fnv(PathOf(tr));
-                    if (_items.ContainsKey(id)) continue;
+                    if (_items.TryGetValue(id, out var ex))
+                    {
+                        // Same path id, but a scene reload gives it a NEW GameObject — re-bind a dead entry so
+                        // the token registers against the live object (else it'd stay pointed at the destroyed one).
+                        if (ex.Token == null || ex.T == null)
+                        { ex.Token = d; ex.T = tr; ex.LocalOwned = false; ex.RemoteOwned = false; ex.HasRemotePos = false; ex.PrevDragging = false; addedItems++; }
+                        continue;
+                    }
                     _items[id] = new Item { NetId = id, Token = d, T = tr };
                     addedItems++;
                 }
@@ -731,8 +729,8 @@ namespace IronNestVR
                     var s = arr[i].TryCast<ItemSlot>(); if (s == null) continue;
                     var tr = s.transform; if (tr == null) continue;
                     int id = Fnv(PathOf(tr));
-                    if (_slots.ContainsKey(id)) continue;
-                    _slots[id] = s;
+                    if (_slots.TryGetValue(id, out var ex) && ex != null) continue;
+                    _slots[id] = s;   // (re)bind — replaces a dead slot from a previous scene
                     addedSlots++;
                 }
             }
@@ -761,7 +759,7 @@ namespace IronNestVR
             foreach (var it in _items.Values) { if (it.LocalOwned) local++; if (it.RemoteOwned) remote++; }
             int mLocal = 0, mRemote = 0;
             foreach (var m in _markers.Values) { if (m.IsLocal) mLocal++; else mRemote++; }
-            return $"map: {_items.Count} tokens, {_slots.Count} slots, {_pieces.Count} pieces, boardRef={_ref != null}, owned local={local} remote={remote} | " +
+            return $"map: {_items.Count} tokens, {_slots.Count} slots, {_pieces.Count} pieces, owned local={local} remote={remote} | " +
                    $"markers: placer={_placer != null}, {_markers.Count} tracked (local={mLocal} mirror={mRemote})";
         }
 
