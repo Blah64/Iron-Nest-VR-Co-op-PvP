@@ -36,7 +36,7 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        public const byte MSG_MISSION_START = 19;  // [t][scene str][missionId str]  reliable  host->client
+        public const byte MSG_MISSION_START = 19;  // [t][scene str][missionId str][operationId str]  reliable  host->client
         public const byte MSG_MISSION_END = 20;    // [t][targetPhase i32]           reliable  host->client
         public const byte MSG_MISSION_READY = 21;  // [t]                            reliable  client->host
 
@@ -49,7 +49,7 @@ namespace IronNestVR
         private static float _pendingStartUntil;   // 0 = no pending start; else deadline (unscaledTime)
         private static float _nextStartTry;        // next retry time
         private static bool _startInvoked;         // StartAssignedOperation already called → wait for the load
-        private static string _pendingScene, _pendingMission;
+        private static string _pendingScene, _pendingMission, _pendingOperation;
 
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
@@ -93,7 +93,7 @@ namespace IronNestVR
                         {
                             float now = Time.unscaledTime;
                             if (now >= _pendingStartUntil) { _pendingStartUntil = 0f; _startInvoked = false; Log.LogWarning($"[scene] gave up waiting for OperationLoadRelay — client did not load host mission '{_pendingMission}'"); }
-                            else if (!_startInvoked && now >= _nextStartTry) { _nextStartTry = now + 1f; if (StartClientMission()) _startInvoked = true; }
+                            else if (!_startInvoked && now >= _nextStartTry) { _nextStartTry = now + 1f; if (StartClientMission(_pendingOperation)) _startInvoked = true; }
                         }
                     }
                     _lastPhase = phase;
@@ -125,13 +125,14 @@ namespace IronNestVR
                     if (CoopP2P.IsHost) return;   // host drives; never follows
                     string scene = GetStr(a, ref o, len);
                     string missionId = GetStr(a, ref o, len);
-                    Log.LogInfo($"[scene] MISSION_START <- peer (scene='{scene}' mission='{missionId}')");
+                    string operationId = GetStr(a, ref o, len) ?? "";
+                    Log.LogInfo($"[scene] MISSION_START <- peer (scene='{scene}' mission='{missionId}' op='{operationId}')");
                     if (CurrentPhase() == (int)MissionManager.GamePhase.MissionActive) { Log.LogInfo("[scene] already in a mission — ignoring start"); return; }
                     // Arm a bounded retry: try now, and keep trying in Tick until the relay exists or we time out.
-                    _pendingScene = scene; _pendingMission = missionId;
+                    _pendingScene = scene; _pendingMission = missionId; _pendingOperation = operationId;
                     _pendingStartUntil = Time.unscaledTime + 12f;
                     _nextStartTry = Time.unscaledTime + 1f;
-                    _startInvoked = StartClientMission();
+                    _startInvoked = StartClientMission(operationId);
                     if (!_startInvoked) Log.LogInfo("[scene] no OperationLoadRelay yet — will retry until the scene is ready");
                     break;
                 }
@@ -160,21 +161,40 @@ namespace IronNestVR
         // Drive the client into the mission the same way a player click does — via the scene's OperationLoadRelay
         // (it holds the OperationGraph asset; the client's copy is the same asset, same build). The 4a sim-gate
         // then suppresses the client's graph bootstrap so it loads the scene without spawning.
-        // Returns true if it invoked StartAssignedOperation (the scene's relay was available); false if no relay
-        // exists yet (caller retries). NOTE (REVIEW finding 3a, deferred): we still use relays[0]. The demo's
-        // mission-launch scene has a single operation relay, so index 0 is correct there — but if the count ever
-        // logs > 1 in a real test, this should match the relay by the replicated missionId/scene instead.
-        private static bool StartClientMission()
+        // Drive the client into the SAME mission the host picked. Each briefing's Play button is wired to its own
+        // OperationLoadRelay (relay.operation = an OperationGraph with a stable OperationID), so there are several
+        // relays in the map scene — one per mission. We must start the relay whose operation matches the host's
+        // (REVIEW finding 3a): blindly using relays[0] loads a wrong/default operation. The host sends its
+        // CurrentOperation.OperationID in MISSION_START; we match on it here.
+        //
+        // Returns true if it invoked StartAssignedOperation; false if no relay is available yet (caller retries).
+        private static bool StartClientMission(string operationId)
         {
             try
             {
                 var relays = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<OperationLoadRelay>(), FindObjectsSortMode.None);
-                if (relays != null && relays.Length > 0)
+                if (relays == null || relays.Length == 0) return false;
+
+                OperationLoadRelay match = null, first = null;
+                for (int i = 0; i < relays.Length; i++)
                 {
-                    var r = relays[0].TryCast<OperationLoadRelay>();
-                    if (r != null) { r.StartAssignedOperation(); Log.LogInfo($"[scene] client starting operation via OperationLoadRelay (host-commanded; {relays.Length} relay(s) in scene)"); return true; }
+                    var r = relays[i].TryCast<OperationLoadRelay>();
+                    if (r == null) continue;
+                    if (first == null) first = r;
+                    if (!string.IsNullOrEmpty(operationId))
+                    {
+                        try { var op = r.operation; if (op != null && op.OperationID == operationId) { match = r; break; } } catch { }
+                    }
                 }
-                return false;
+
+                var chosen = match ?? first;
+                if (chosen == null) return false;
+                if (match == null && !string.IsNullOrEmpty(operationId))
+                    Log.LogWarning($"[scene] NO relay matches op='{operationId}' among {relays.Length} relay(s) — falling back to first (may load the wrong mission)");
+
+                chosen.StartAssignedOperation();
+                Log.LogInfo($"[scene] client starting operation '{(match != null ? operationId : "<first/fallback>")}' via OperationLoadRelay (host-commanded; {relays.Length} relay(s) in scene)");
+                return true;
             }
             catch (Exception e) { Log.LogWarning("[scene] start client mission: " + e.Message); return false; }
         }
@@ -196,11 +216,21 @@ namespace IronNestVR
         private static void SendMissionStart()
         {
             if (!EnsureBuf()) return;
-            string scene = "", mid = "";
-            try { var mm = MissionManager.Instance; if (mm != null) { scene = mm.CurrentMissionSceneName ?? ""; var m = mm.CurrentMission; if (m != null) mid = m.MissionID ?? ""; } } catch { }
-            int o = 0; _buf[o++] = MSG_MISSION_START; o = PutStr(o, scene); o = PutStr(o, mid);
+            string scene = "", mid = "", oid = "";
+            try
+            {
+                var mm = MissionManager.Instance;
+                if (mm != null)
+                {
+                    scene = mm.CurrentMissionSceneName ?? "";
+                    var m = mm.CurrentMission; if (m != null) mid = m.MissionID ?? "";
+                    var op = mm.CurrentOperation; if (op != null) oid = op.OperationID ?? "";
+                }
+            }
+            catch { }
+            int o = 0; _buf[o++] = MSG_MISSION_START; o = PutStr(o, scene); o = PutStr(o, mid); o = PutStr(o, oid);
             CoopP2P.Send(_buf, o, true);
-            Log.LogInfo($"[scene] MISSION_START -> peer (scene='{scene}' mission='{mid}')");
+            Log.LogInfo($"[scene] MISSION_START -> peer (scene='{scene}' mission='{mid}' op='{oid}')");
         }
 
         private static void SendMissionEnd(int targetPhase)

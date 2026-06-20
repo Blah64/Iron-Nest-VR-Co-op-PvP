@@ -209,6 +209,17 @@ namespace IronNestVR
         // pins it to screen-centre, so the ray == controller forward (no offset, render-scale-independent).
         public static bool MenuForceCenter = true;
 
+        // --- Tactical map (bearing/range lines + hover sector grid) ---
+        // The map's line-drawing (MapMarkerPlacer) and the hover sector grid
+        // (GridSquareHighlighterWithSubsector) both project the virtual cursor's SCREEN position (which we
+        // pin to centre while engaged) through a camera onto the world-space map canvas. Out of the box
+        // that camera is the flat Main Camera, so lines + grid land where the HEAD gazes, not where the
+        // controller points. When on, we repoint those systems' cameras down our pointer cam (the same fix
+        // we already apply to dials/levers/tooltips), force the placer's marker hover on, and wire the
+        // right-hand delete button to the placer's secondary (delete-hovered-marker) action. Off = leave the
+        // game's flat cameras alone.
+        public static bool MapVrEnabled = true;
+
         // --- Interaction diagnostics ---
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).
         public static bool LogInteractGeometry = true;

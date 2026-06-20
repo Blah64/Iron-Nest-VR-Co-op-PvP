@@ -78,7 +78,11 @@ namespace IronNestVR
         // advance / bootstrap), so the client's mission graph never executes.
         public static bool GatePrefix()
         {
-            if (!ShouldGate()) return true;   // run original (solo or host)
+            // CRITICAL: this prefix runs on EVERY mission-graph tick for host AND client. It must NEVER throw —
+            // a throw here would propagate into the game's mission state machine and break loading for everyone.
+            // Any error → behave as "don't gate" (run the original), the safe default.
+            try { if (!ShouldGate()) return true; }   // run original (solo or host, or on any error)
+            catch { return true; }
             float t = Time.unscaledTime;
             if (t >= _nextGateLog) { _nextGateLog = t + 1f; Log.LogInfo("[sim] client sim-gate ACTIVE — suppressing local mission-graph execution (host is authoritative)"); }
             return false;                     // skip original (client)

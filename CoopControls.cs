@@ -760,8 +760,12 @@ namespace IronNestVR
         private static bool IsMenuish(string path)
         {
             string p = path.ToLowerInvariant();
+            // Skip menu/mission-select AND the mission-LAUNCH buttons (Play/Deploy/Start Operation): the mission
+            // lifecycle is host-authoritative via CoopScene (host's OperationID → client loads the matching relay).
+            // Replicating the launch click would fire a second, conflicting start on the client. See CoopScene.
             return p.Contains("menu") || p.Contains("campaign") || p.Contains("mission select")
-                || p.Contains("missionselect") || p.Contains("settings") || p.Contains("operating manual");
+                || p.Contains("missionselect") || p.Contains("settings") || p.Contains("operating manual")
+                || p.Contains("play button") || p.Contains("deploy") || p.Contains("start operation") || p.Contains("launch operation");
         }
 
         private static bool HasInParent<T>(Transform t) where T : Component

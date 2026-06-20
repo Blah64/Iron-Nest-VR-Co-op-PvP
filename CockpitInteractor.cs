@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BepInEx.Logging;
 using Il2CppInterop.Runtime;
 using Silk.NET.OpenXR;
@@ -37,11 +38,22 @@ namespace IronNestVR
 
         private bool _triggerWasHeld;
         private bool _interactWasHeld;
+        private bool _mapDeleteWasHeld;
         private Interactable _pressTarget;
         private bool _inMission;
         private float _nextDiscover;
         private float _nextRepoint;
         private float _nextGeoLog;
+
+        // Tactical map: cached MapMarkerPlacers (line drawing + marker hover/delete) and the originals of
+        // every camera/flag we override, keyed by GetInstanceID so disengage restores them exactly (a scene
+        // reload makes new instances with fresh ids; old entries' refs go null and are skipped on restore).
+        private readonly Dictionary<int, MapMarkerPlacer> _placers = new Dictionary<int, MapMarkerPlacer>();
+        private readonly Dictionary<int, Camera> _origPlacerCam = new Dictionary<int, Camera>();
+        private readonly Dictionary<int, bool> _origPlacerHover = new Dictionary<int, bool>();
+        private readonly Dictionary<int, Canvas> _mapCanvases = new Dictionary<int, Canvas>();
+        private readonly Dictionary<int, Camera> _origCanvasCam = new Dictionary<int, Camera>();
+        private int _mapObjCount = -1;
 
         /// <param name="active">true only when the session is focused and input is ready.</param>
         /// <param name="suppressClick">true while the VR settings menu owns the trigger: keep the
@@ -85,6 +97,7 @@ namespace IronNestVR
                 {
                     _nextRepoint = Time.unscaledTime + 0.5f;
                     RepointInteractionCameras(_cam);
+                    RepointMapCameras(_cam);
                 }
 
                 // Menus flip the cursor manager to FreeMouse (cursor follows the OS mouse, off-centre),
@@ -122,6 +135,7 @@ namespace IronNestVR
                 {
                     HandleClick(input);
                     HandleInteract(input);
+                    HandleMapDelete(input);
                 }
 
                 GeometryLog(wp, wr);
@@ -170,6 +184,7 @@ namespace IronNestVR
             _mgr.raycastCamera = _cam;
             _mgr.maxRayDistance = Mathf.Max(_origMaxDist, Config.LaserMaxDistance);
             RepointInteractionCameras(_cam);
+            RepointMapCameras(_cam);
             _engaged = true;
             Log.LogInfo($"[interact] ENGAGED (origCam={(_origCam != null ? _origCam.name : "null")}, origMode={_origMode}).");
         }
@@ -213,6 +228,118 @@ namespace IronNestVR
                 var h = arr[i].TryCast<HoverTooltip>();
                 if (h != null) { h.raycastCamera = cam; }
             }
+        }
+
+        // Point the tactical-map systems' cameras down our controller, the same fix as the dials/levers.
+        // The map line placer (MapMarkerPlacer) and the hover sector grid (GridSquareHighlighterWithSubsector)
+        // both project the centre-pinned virtual cursor's SCREEN position through a camera onto the world-
+        // space map canvas; out of the box that's the flat Main Camera, so lines + grid land where the head
+        // gazes, not where the laser points. We retarget the placer's own raycast camera + the world-space
+        // map/grid canvases' event cameras to our pointer cam, force the placer's marker hover on (so the
+        // laser highlights a line for deletion), and pin their cursor to centre. Originals are captured per
+        // instance id and restored on disengage. Re-run on a throttle so a scene change is picked up.
+        private void RepointMapCameras(Camera cam)
+        {
+            if (!Config.MapVrEnabled) return;
+            int found = 0;
+            try
+            {
+                var placers = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapMarkerPlacer>(), FindObjectsSortMode.None);
+                if (placers != null)
+                    for (int i = 0; i < placers.Length; i++)
+                    {
+                        var p = placers[i].TryCast<MapMarkerPlacer>();
+                        if (p == null) continue;
+                        int id = p.GetInstanceID();
+                        _placers[id] = p;
+                        found++;
+                        try { if (!_origPlacerCam.ContainsKey(id)) _origPlacerCam[id] = p.mainCamera; if (p.mainCamera != cam) p.mainCamera = cam; } catch { }
+                        try { if (!_origPlacerHover.ContainsKey(id)) _origPlacerHover[id] = p.enableHover; if (!p.enableHover) p.enableHover = true; } catch { }
+                        try { PinCursor(p.virtualCursor); } catch { }
+                        try { RepointCanvas(p.mapCanvas, cam); } catch { }
+                    }
+
+                var grids = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<GridSquareHighlighterWithSubsector>(), FindObjectsSortMode.None);
+                if (grids != null)
+                    for (int i = 0; i < grids.Length; i++)
+                    {
+                        var g = grids[i].TryCast<GridSquareHighlighterWithSubsector>();
+                        if (g == null) continue;
+                        found++;
+                        try { PinCursor(g.virtualCursor); } catch { }
+                        try { RepointCanvas(g.worldSpaceCanvas, cam); } catch { }
+                    }
+            }
+            catch (Exception e) { Log.LogWarning("[map] repoint: " + e.Message); }
+
+            if (found != _mapObjCount)
+            {
+                _mapObjCount = found;
+                Log.LogInfo($"[map] VR map repoint: {_placers.Count} placer(s), {_mapCanvases.Count} canvas(es) on controller cam.");
+            }
+        }
+
+        // Only world-space canvases are safe to re-aim: their event camera affects input projection, not
+        // rendering. (Screen-space-camera canvases — e.g. the menus — render THROUGH worldCamera, so
+        // reassigning it there breaks them; the renderMode guard keeps us off those.)
+        private void RepointCanvas(Canvas c, Camera cam)
+        {
+            if (c == null || c.renderMode != RenderMode.WorldSpace) return;
+            int id = c.GetInstanceID();
+            if (!_origCanvasCam.ContainsKey(id)) _origCanvasCam[id] = c.worldCamera;
+            _mapCanvases[id] = c;
+            if (c.worldCamera != cam) c.worldCamera = cam;
+        }
+
+        private static void PinCursor(VirtualCursor vc)
+        {
+            if (vc != null && !vc.lockToCenterWhenFPSLocked) vc.lockToCenterWhenFPSLocked = true;
+        }
+
+        // Right B button -> delete the line marker under the laser. Calls the placer's own secondary-click
+        // handler (the same entry a real right-click reaches) rather than synthesizing a global right mouse,
+        // so it can only ever delete a hovered marker — no risk of tripping other secondary-bound actions.
+        private void HandleMapDelete(VrInput input)
+        {
+            if (!Config.MapVrEnabled) return;
+            bool held = input.MapDeleteHeld;
+            if (held && !_mapDeleteWasHeld)
+            {
+                bool anyHover = false;
+                foreach (var kv in _placers)
+                {
+                    var p = kv.Value;
+                    if (p == null) continue;
+                    try { if (p.hoveredHitTarget != null) anyHover = true; } catch { }
+                    try { p.HandleSecondaryPressed(); } catch (Exception e) { Log.LogWarning("[map] delete: " + e.Message); }
+                }
+                if (anyHover) input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
+                Log.LogInfo($"[map] delete pressed (hovering={anyHover}, placers={_placers.Count})");
+            }
+            _mapDeleteWasHeld = held;
+        }
+
+        // Restore every map camera/flag we overrode to its captured original, then forget them. Stale refs
+        // from a destroyed scene throw on access and are skipped.
+        private void RestoreMapCameras()
+        {
+            foreach (var kv in _placers)
+            {
+                var p = kv.Value;
+                if (p == null) continue;
+                try { if (_origPlacerCam.TryGetValue(kv.Key, out var c)) p.mainCamera = c; } catch { }
+                try { if (_origPlacerHover.TryGetValue(kv.Key, out var h)) p.enableHover = h; } catch { }
+            }
+            foreach (var kv in _mapCanvases)
+            {
+                var c = kv.Value;
+                if (c == null) continue;
+                try { if (_origCanvasCam.TryGetValue(kv.Key, out var cam)) c.worldCamera = cam; } catch { }
+            }
+            _placers.Clear(); _origPlacerCam.Clear(); _origPlacerHover.Clear();
+            _mapCanvases.Clear(); _origCanvasCam.Clear();
+            _mapDeleteWasHeld = false;
+            _mapObjCount = -1;
         }
 
         private void HandleClick(VrInput input)
@@ -261,6 +388,7 @@ namespace IronNestVR
             if (_pressTarget != null) ReleasePress();
             _triggerWasHeld = false;
             _interactWasHeld = false;
+            _mapDeleteWasHeld = false;
         }
 
         // Fallback click path (only used if input synthesis is unavailable).
@@ -290,6 +418,7 @@ namespace IronNestVR
             try
             {
                 EndAllInput();
+                RestoreMapCameras();
                 var restoreCam = _origCam != null ? _origCam : Camera.main;
                 if (_mgr != null)
                 {
