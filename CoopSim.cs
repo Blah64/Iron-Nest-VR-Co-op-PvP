@@ -7,26 +7,29 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op FOUNDATION: host-authoritative simulation gating.
+    /// Phase 4 co-op FOUNDATION: host-authoritative CONTENT gating.
     ///
-    /// The whole game sim is a SleepyNodes node-graph state machine. If BOTH players run it, the client
-    /// double-spawns enemies (and RNG-located spawns land in different places → desync). So the HOST runs the
-    /// mission graph (spawns, damage, objectives, score) and is the single source of truth; the CLIENT's copy
-    /// is GATED OFF here and instead mirrors the host's world via <see cref="CoopEntities"/> (next increment).
+    /// The mission sim is a SleepyNodes node-graph state machine. The host is authoritative for the content we
+    /// replicate (enemy/target spawns, teleprinter orders). If the client ALSO generated that content it would
+    /// double-spawn / double-print with its own RNG → desync.
     ///
-    /// HOW: a Harmony prefix on the per-mission graph drivers returns false (skip original) when this instance
-    /// is a co-op CLIENT. We gate the GRAPH methods — <c>MissionGraph</c> / <c>MissionPassiveGraph</c>
-    /// <c>Run</c> (bootstrap) + <c>Update</c> (per-frame advance) — NOT <c>MissionManager.Update</c>. That's
-    /// deliberate: those graph methods only ever execute while a mission is actually running, so gating them
-    /// can NEVER affect the hub / map / menu (where no MissionGraph is active) — the already-validated hub
-    /// co-op is untouched. MissionManager.Update, by contrast, also runs in the hub and could break it.
+    /// EARLIER APPROACH (replaced): gate the whole <c>MissionGraph</c>/<c>MissionPassiveGraph</c> Run+Update on
+    /// the client. That froze the client's mission into a husk — the fire-mission canvas / scene structure never
+    /// bootstrapped, so a mirrored entity had no live map to live in (the first 2-player mission test: client
+    /// reached the scene but the 9 host entities had nowhere to clone into). The working reference co-op mod
+    /// (github.com/not-so-sure/iron-nest-coop) gates only the SPAWN NODE, leaving the rest of the mission alive.
+    ///
+    /// CURRENT APPROACH (per project direction — full gate, cleaner for a future PvP mode): a Harmony prefix
+    /// returns false (skip original) on a co-op CLIENT for the whole per-mission graph — <c>MissionGraph</c> /
+    /// <c>MissionPassiveGraph</c> <c>Run</c>+<c>Update</c>. The client is a PURE VIEWER: it runs none of the
+    /// mission sim and instead MIRRORS everything the host produces (entities via <see cref="CoopEntities"/>,
+    /// orders via <see cref="CoopOrders"/>, map objects/lines via <see cref="CoopMap"/>). Anything the client
+    /// must SHOW therefore has to be replicated + spawned client-side from host data — if something doesn't
+    /// appear, the replication for it is missing, not the gate. Those graph methods only run during a mission,
+    /// so the hub/map/menu are untouched.
     ///
     /// Gating is active ONLY for a co-op CLIENT in a lobby (never solo, never the host). There is no in-engine
     /// authority/paused flag (verified by decompile), so a Harmony patch is the only lever.
-    ///
-    /// SCOPE NOTE: this covers the mission sim where enemy spawns/damage live (State_SpawnMapEntity etc. run as
-    /// MissionGraph nodes). If a later test shows spawns leaking from ObjectiveGraph/OperationGraph, add those
-    /// graph types to <see cref="ApplyPatches"/>. The host side and entity replication are separate increments.
     /// </summary>
     internal static class CoopSim
     {
@@ -49,10 +52,10 @@ namespace IronNestVR
             _patched += TryPatch(typeof(SleepyNodes.MissionGraph), "Update");
             _patched += TryPatch(typeof(SleepyNodes.MissionPassiveGraph), "Run");
             _patched += TryPatch(typeof(SleepyNodes.MissionPassiveGraph), "Update");
-            Log.LogInfo($"[sim] host-authoritative sim-gate: {_patched}/4 mission-graph methods patched (client suppresses these; host + solo run normally)");
+            Log.LogInfo($"[sim] host-authoritative sim-gate: {_patched}/4 mission-graph methods patched (client = pure viewer; host + solo run normally)");
 
-            // Phase 4d: capture teleprinter ORDERS host-side via a postfix on the submit funnel (the client's
-            // graph is gated, so it can't produce them locally). Separate from the gate prefixes above.
+            // Capture teleprinter ORDERS host-side via a postfix on the submit funnel; the client's graph is fully
+            // gated, so it never prints locally — CoopOrders replays the host's resolved text.
             try
             {
                 var mi = AccessTools.Method(typeof(Teleprinter), "SubmitLines");
@@ -74,22 +77,22 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning($"[sim] patch {t.Name}.{method} failed: " + e.Message); return 0; }
         }
 
-        // Harmony prefix shared by all gated graph methods. Returning false skips the original (the node
-        // advance / bootstrap), so the client's mission graph never executes.
+        // Harmony prefix shared by the gated graph methods. Returning false skips the original, so a co-op client
+        // never runs the mission sim locally (it mirrors the host instead).
         public static bool GatePrefix()
         {
             // CRITICAL: this prefix runs on EVERY mission-graph tick for host AND client. It must NEVER throw —
-            // a throw here would propagate into the game's mission state machine and break loading for everyone.
+            // a throw here would propagate into the game's mission state machine and break the mission for everyone.
             // Any error → behave as "don't gate" (run the original), the safe default.
             try { if (!ShouldGate()) return true; }   // run original (solo or host, or on any error)
             catch { return true; }
             float t = Time.unscaledTime;
-            if (t >= _nextGateLog) { _nextGateLog = t + 1f; Log.LogInfo("[sim] client sim-gate ACTIVE — suppressing local mission-graph execution (host is authoritative)"); }
+            if (t >= _nextGateLog) { _nextGateLog = t + 1f; Log.LogInfo("[sim] client sim-gate ACTIVE — client is a pure viewer (host is authoritative)"); }
             return false;                     // skip original (client)
         }
 
-        // Gate the sim only for a co-op CLIENT actually connected to a peer. Solo play and the host are never
-        // gated. (No mission-phase check is needed: the patched methods only run during a mission anyway.)
+        // Gate only for a co-op CLIENT actually connected to a peer. Solo play and the host are never gated.
+        // (No mission-phase check needed: the patched nodes only run during a mission anyway.)
         public static bool ShouldGate()
         {
             if (!Config.CoopSimAuthority) return false;

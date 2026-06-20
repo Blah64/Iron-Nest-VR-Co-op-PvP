@@ -100,7 +100,7 @@ namespace IronNestVR
                         {
                             float now = Time.unscaledTime;
                             if (now >= _pendingStartUntil) { _pendingStartUntil = 0f; _startInvoked = false; Log.LogWarning($"[scene] gave up waiting for OperationLoadRelay — client did not load host mission '{_pendingMission}'"); }
-                            else if (!_startInvoked && now >= _nextStartTry) { _nextStartTry = now + 1f; if (StartClientMission(_pendingOperation)) _startInvoked = true; }
+                            else if (!_startInvoked && now >= _nextStartTry) { _nextStartTry = now + 1f; if (StartClientMission(_pendingOperation, _pendingMission)) _startInvoked = true; }
                         }
                     }
                     _lastPhase = phase;
@@ -152,8 +152,8 @@ namespace IronNestVR
                     _pendingScene = scene; _pendingMission = missionId; _pendingOperation = operationId;
                     _pendingStartUntil = Time.unscaledTime + 12f;
                     _nextStartTry = Time.unscaledTime + 1f;
-                    _startInvoked = StartClientMission(operationId);
-                    if (!_startInvoked) Log.LogInfo("[scene] no OperationLoadRelay yet — will retry until the scene is ready");
+                    _startInvoked = StartClientMission(operationId, missionId);
+                    if (!_startInvoked) Log.LogInfo("[scene] operation/mission graphs not loaded yet — will retry until the map scene is ready");
                     break;
                 }
                 case MSG_MISSION_END:   // generalized: "go to this non-mission phase" from ANY current phase
@@ -177,45 +177,67 @@ namespace IronNestVR
 
         // ---------------- client drive ----------------
 
-        // Drive the client into the mission the same way a player click does — via the scene's OperationLoadRelay
-        // (it holds the OperationGraph asset; the client's copy is the same asset, same build). The 4a sim-gate
-        // then suppresses the client's graph bootstrap so it loads the scene without spawning.
-        // Drive the client into the SAME mission the host picked. Each briefing's Play button is wired to its own
-        // OperationLoadRelay (relay.operation = an OperationGraph with a stable OperationID), so there are several
-        // relays in the map scene — one per mission. We must start the relay whose operation matches the host's
-        // (REVIEW finding 3a): blindly using relays[0] loads a wrong/default operation. The host sends its
-        // CurrentOperation.OperationID in MISSION_START; we match on it here.
+        // Drive the client into the SAME mission the host picked, by RESOLVING THE GRAPH ASSETS and calling
+        // MissionManager.StartOperation directly — NOT via OperationLoadRelay.
         //
-        // Returns true if it invoked StartAssignedOperation; false if no relay is available yet (caller retries).
-        private static bool StartClientMission(string operationId)
+        // Why not the relay: each briefing's Play button is wired to its own OperationLoadRelay, but that relay
+        // lives on the briefing panel and is INACTIVE until the player opens that briefing. The client never opens
+        // a briefing (host-authoritative), so FindObjectsByType (active-only) finds no relay — the exact failure
+        // the live test hit (client in BrowsingMap, "no OperationLoadRelay … gave up"). And StartAssignedOperation
+        // starts a coroutine, which can't run on an inactive GameObject anyway.
+        //
+        // OperationGraph/MissionGraph are ScriptableObjects (StateGraph→NodeGraph→ScriptableObject), so we look
+        // them up by their stable OperationID/MissionID via Resources.FindObjectsOfTypeAll (which includes inactive
+        // + asset objects) and call MissionManager.StartOperation(op, mission) — the same entry the relay reaches.
+        //
+        // Returns true if it invoked StartOperation; false if the graph assets aren't loaded yet (caller retries
+        // while the BrowsingMap scene is still spinning up).
+        private static bool StartClientMission(string operationId, string missionId)
         {
             try
             {
-                var relays = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<OperationLoadRelay>(), FindObjectsSortMode.None);
-                if (relays == null || relays.Length == 0) return false;
+                var mm = MissionManager.Instance; if (mm == null) return false;
+                var op = FindOperationById(operationId);
+                var mission = FindMissionById(missionId);
+                if (op == null || mission == null) return false;   // assets not loaded yet — retry
 
-                OperationLoadRelay match = null, first = null;
-                for (int i = 0; i < relays.Length; i++)
-                {
-                    var r = relays[i].TryCast<OperationLoadRelay>();
-                    if (r == null) continue;
-                    if (first == null) first = r;
-                    if (!string.IsNullOrEmpty(operationId))
-                    {
-                        try { var op = r.operation; if (op != null && op.OperationID == operationId) { match = r; break; } } catch { }
-                    }
-                }
-
-                var chosen = match ?? first;
-                if (chosen == null) return false;
-                if (match == null && !string.IsNullOrEmpty(operationId))
-                    Log.LogWarning($"[scene] NO relay matches op='{operationId}' among {relays.Length} relay(s) — falling back to first (may load the wrong mission)");
-
-                chosen.StartAssignedOperation();
-                Log.LogInfo($"[scene] client starting operation '{(match != null ? operationId : "<first/fallback>")}' via OperationLoadRelay (host-commanded; {relays.Length} relay(s) in scene)");
+                mm.StartOperation(op, mission);
+                Log.LogInfo($"[scene] client StartOperation(op='{operationId}', mission='{missionId}') (host-commanded)");
                 return true;
             }
             catch (Exception e) { Log.LogWarning("[scene] start client mission: " + e.Message); return false; }
+        }
+
+        private static SleepyNodes.OperationGraph FindOperationById(string operationId)
+        {
+            if (string.IsNullOrEmpty(operationId)) return null;
+            try
+            {
+                var arr = Resources.FindObjectsOfTypeAll(Il2CppType.Of<SleepyNodes.OperationGraph>());
+                if (arr != null) for (int i = 0; i < arr.Length; i++)
+                {
+                    var op = arr[i].TryCast<SleepyNodes.OperationGraph>(); if (op == null) continue;
+                    try { if (op.OperationID == operationId) return op; } catch { }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[scene] find op: " + e.Message); }
+            return null;
+        }
+
+        private static SleepyNodes.MissionGraph FindMissionById(string missionId)
+        {
+            if (string.IsNullOrEmpty(missionId)) return null;
+            try
+            {
+                var arr = Resources.FindObjectsOfTypeAll(Il2CppType.Of<SleepyNodes.MissionGraph>());
+                if (arr != null) for (int i = 0; i < arr.Length; i++)
+                {
+                    var m = arr[i].TryCast<SleepyNodes.MissionGraph>(); if (m == null) continue;
+                    try { if (m.MissionID == missionId) return m; } catch { }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[scene] find mission: " + e.Message); }
+            return null;
         }
 
         // Drive the client to a non-mission target phase, picking the right MissionManager call for where it

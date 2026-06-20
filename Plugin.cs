@@ -32,6 +32,7 @@ namespace IronNestVR
             // Phase 4 co-op: install the host-authoritative sim-gate (Harmony). Safe pre-scene: the patched
             // mission-graph methods only run during a mission, and the gate is inert until a client joins.
             CoopSim.ApplyPatches();
+            CoopMap.Init();   // Harmony hooks for fire-mission map pieces (MapPiece3D drag) + bearing/range lines (MapMarkerLineUI finalize)
 
             // Make our MonoBehaviour type callable from the IL2CPP runtime.
             ClassInjector.RegisterTypeInIl2Cpp<VrManager>();

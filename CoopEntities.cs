@@ -71,6 +71,12 @@ namespace IronNestVR
         private static readonly List<int> _toRemove = new List<int>();
         private static readonly HashSet<int> _seen = new HashSet<int>();
 
+        // Spawns that arrived before a clone template was available (a gated client just entered the mission scene
+        // and hasn't found anything to clone yet). The host diff-sends each entity exactly ONCE, so a dropped SPAWN
+        // never comes back on its own — we queue them and ClientTick replays them the moment a template appears.
+        private sealed class PendingSpawn { public int Key; public string ID, Name, Icon; public int Role, State, Hp, MaxHp, Armour, Stars, Scale; public Vector3 Pos; }
+        private static readonly List<PendingSpawn> _pendingSpawns = new List<PendingSpawn>();
+
         // Client clone template (a disabled EntityLocation copy kept across scene loads, since a gated client
         // may enter a mission scene with no EntityLocation of its own to clone).
         private static GameObject _template;
@@ -167,7 +173,7 @@ namespace IronNestVR
             // Drop cloned mirrors when we leave the mission (host stops sending; the scene tore down anyway).
             if (!InMission())
             {
-                if (_mirrors.Count > 0) { ClearMirrors(); Log.LogInfo("[ent] left mission — cleared mirrored entities"); }
+                if (_mirrors.Count > 0 || _pendingSpawns.Count > 0) { ClearMirrors(); _pendingSpawns.Clear(); Log.LogInfo("[ent] left mission — cleared mirrored entities"); }
                 return;
             }
             // Opportunistically cache a clone template from any EntityLocation we can see (kept across scenes).
@@ -176,6 +182,22 @@ namespace IronNestVR
                 _nextTemplateTry = Time.unscaledTime + 2f;
                 TryCacheTemplate();
             }
+            // Once a template exists, replay any spawns that arrived before it (else the first host burst is lost).
+            if (_template != null && _pendingSpawns.Count > 0) DrainPendingSpawns();
+        }
+
+        private static void DrainPendingSpawns()
+        {
+            var pend = _pendingSpawns.ToArray();
+            _pendingSpawns.Clear();
+            int n = 0;
+            foreach (var p in pend)
+            {
+                if (_mirrors.ContainsKey(p.Key)) continue;
+                AdoptOrClone(p.Key, p.ID, p.Name, p.Icon, p.Role, p.Pos, p.State, p.Hp, p.MaxHp, p.Armour, p.Stars, p.Scale);
+                n++;
+            }
+            if (n > 0) Log.LogInfo($"[ent] replayed {n} queued spawn(s) now that a clone template is available");
         }
 
         // ---------------- receive (client) ----------------
@@ -260,7 +282,13 @@ namespace IronNestVR
             // Otherwise clone the cached template.
             var tmpl = _template;
             if (tmpl == null) { TryCacheTemplate(); tmpl = _template; }
-            if (tmpl == null) { Log.LogWarning($"[ent] cannot mirror '{id}': no EntityLocation template available yet (need a scene with one to clone)"); return; }
+            if (tmpl == null)
+            {
+                if (!PendingContains(key))
+                    _pendingSpawns.Add(new PendingSpawn { Key = key, ID = id, Name = name, Icon = icon, Role = role, Pos = pos, State = state, Hp = hp, MaxHp = maxHp, Armour = armour, Stars = stars, Scale = scale });
+                Log.LogInfo($"[ent] no clone template yet — queued '{id}' ({_pendingSpawns.Count} pending; replays when a source appears)");
+                return;
+            }
 
             GameObject go = null;
             try { go = UnityEngine.Object.Instantiate(tmpl).TryCast<GameObject>(); } catch (Exception ex) { Log.LogWarning("[ent] instantiate: " + ex.Message); }
@@ -409,24 +437,39 @@ namespace IronNestVR
         {
             try
             {
-                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<EntityLocation>(), FindObjectsSortMode.None);
+                // Resources.FindObjectsOfTypeAll (NOT FindObjectsByType) so we also see INACTIVE EntityLocations and
+                // PREFAB assets. A gated client's mission scene spawns no active entities of its own, so the only
+                // clone source is the spawn prefab / an inactive template — which the active-only scan always missed
+                // (the "cannot mirror … no template" failure in the first 2-player mission test).
+                var arr = Resources.FindObjectsOfTypeAll(Il2CppType.Of<EntityLocation>());
                 if (arr == null) return;
+                GameObject best = null;
                 for (int i = 0; i < arr.Length; i++)
                 {
                     var loc = arr[i].TryCast<EntityLocation>(); if (loc == null) continue;
                     var go = loc.gameObject; if (go == null) continue;
                     if (IsMirrorGo(go)) continue;                       // don't clone one of our own clones
-                    var tmpl = UnityEngine.Object.Instantiate(go).TryCast<GameObject>();
-                    if (tmpl == null) continue;
-                    try { tmpl.SetActive(false); } catch { }
-                    try { tmpl.name = "CoopEntityTemplate"; } catch { }
-                    UnityEngine.Object.DontDestroyOnLoad(tmpl);
-                    _template = tmpl;
-                    Log.LogInfo($"[ent] cached entity template from '{go.name}' (kept across scenes)");
-                    return;
+                    string nm = null; try { nm = go.name; } catch { }
+                    if (nm != null && nm.Contains("CoopEntityTemplate")) continue;   // skip our own cached template
+                    best = go;
+                    if (nm == null || nm.IndexOf("(Clone)", StringComparison.Ordinal) < 0) break;   // prefer a prefab/source over a live clone
                 }
+                if (best == null) return;
+                var tmpl = UnityEngine.Object.Instantiate(best).TryCast<GameObject>();
+                if (tmpl == null) return;
+                try { tmpl.SetActive(false); } catch { }
+                try { tmpl.name = "CoopEntityTemplate"; } catch { }
+                UnityEngine.Object.DontDestroyOnLoad(tmpl);
+                _template = tmpl;
+                Log.LogInfo($"[ent] cached entity template from '{best.name}' (Resources scan; kept across scenes)");
             }
             catch (Exception e) { Log.LogWarning("[ent] cache template: " + e.Message); }
+        }
+
+        private static bool PendingContains(int key)
+        {
+            for (int i = 0; i < _pendingSpawns.Count; i++) if (_pendingSpawns[i].Key == key) return true;
+            return false;
         }
 
         // Parent for a cloned mirror: the canvas the game places EntityLocations under. Prefer an existing
@@ -492,6 +535,7 @@ namespace IronNestVR
         {
             _sent.Clear();
             ClearMirrors();
+            _pendingSpawns.Clear();
         }
 
         // ---------------- diagnostics ----------------
@@ -500,7 +544,7 @@ namespace IronNestVR
         {
             int clones = 0, adopted = 0;
             foreach (var m in _mirrors.Values) { if (m.IsClone) clones++; else adopted++; }
-            return $"ent: inMission={InMission()} | host-sent={_sent.Count} | client-mirrors={_mirrors.Count} (clone={clones} adopt={adopted}) template={_template != null}";
+            return $"ent: inMission={InMission()} | host-sent={_sent.Count} | client-mirrors={_mirrors.Count} (clone={clones} adopt={adopted}) template={_template != null} pending={_pendingSpawns.Count}";
         }
 
         public static void Dump()
