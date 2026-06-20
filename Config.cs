@@ -67,6 +67,18 @@ namespace IronNestVR
         // methods only execute during a mission, so this never touches the validated hub co-op. See CoopSim.
         public static bool CoopSimAuthority = true;
 
+        // Phase 4 co-op (4b): replicate the host's mission ENTITIES (enemies/targets) to the client. The host
+        // diffs FindObjectsByType<EntityLocation>() and broadcasts spawn/move/state/despawn; the client mirrors
+        // them (adopts a same-ID scene entity or clones a cached EntityLocation template). Scoped to an active
+        // mission (GamePhase.MissionActive) so the hub is untouched. Needs CoopSimAuthority on (gated client).
+        public static bool CoopEntitySync = true;
+
+        // Phase 4 co-op (4b keystone): replicate the mission/scene transition so both players are co-located.
+        // The HOST broadcasts its own phase changes (→MissionActive / back out); the CLIENT follows by driving
+        // its own OperationLoadRelay.StartAssignedOperation() / ReturnToMap(). Without this, the host starting a
+        // mission leaves the client in the hub and entity sync has nothing to mirror into. See CoopScene.
+        public static bool CoopSceneSync = true;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it

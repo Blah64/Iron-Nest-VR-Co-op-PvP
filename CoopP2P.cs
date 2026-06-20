@@ -185,6 +185,8 @@ namespace IronNestVR
             try { CoopControls.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ctrl: " + e.Message); }
             try { CoopClipboard.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot clip: " + e.Message); }
             try { CoopMap.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot map: " + e.Message); }
+            try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
+            try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
         }
 
         public static void SendPose(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)

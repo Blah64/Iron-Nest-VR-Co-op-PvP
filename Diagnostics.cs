@@ -33,7 +33,7 @@ namespace IronNestVR
                 if (!_banner)
                 {
                     _banner = true;
-                    Log.LogInfo("[coop] === IronNest VR co-op build — sync: controls(drag+click) + gun-fire + clipboard + map(tokens+markers) + join-in-progress + sim-gate(P4) ===");
+                    Log.LogInfo("[coop] === IronNest VR co-op build — sync: controls(drag+click) + gun-fire + clipboard + map(tokens+markers) + join-in-progress + sim-gate + entities + scene-transition(P4) ===");
                     Log.LogInfo("[coop] keys: F4 full co-op dump | F6 avatar self-test | F7 flat lobby | F8 recenter | F9-12 lobby create/refresh/join/leave");
                 }
 
@@ -58,6 +58,8 @@ namespace IronNestVR
                 Log.LogInfo("[coop] " + CoopMap.Status());
                 Log.LogInfo("[coop] " + CoopClipboard.Status());
                 Log.LogInfo("[coop] " + CoopSim.Status());
+                Log.LogInfo("[coop] " + CoopEntities.Status());
+                Log.LogInfo("[coop] " + CoopScene.Status());
             }
             catch (Exception e) { Log.LogWarning("[coop-diag] " + e.Message); }
         }
@@ -72,6 +74,7 @@ namespace IronNestVR
                 CoopControls.Dump();
                 CoopMap.Dump();
                 CoopClipboard.Dump();
+                CoopEntities.Dump();
                 Log.LogInfo("[coop] ===== end dump =====");
             }
             catch (Exception e) { Log.LogWarning("[coop-diag] dump: " + e.Message); }

@@ -133,6 +133,8 @@ namespace IronNestVR
             CoopControls.Tick(Time.unscaledDeltaTime);   // Phase 3: detect local control drags + transmit
             CoopClipboard.Tick(Time.unscaledDeltaTime);  // Phase 3: replicate HUD clipboard contents
             CoopMap.Tick(Time.unscaledDeltaTime);        // Phase 3: replicate tactical-map token placements
+            CoopEntities.Tick(Time.unscaledDeltaTime);   // Phase 4: replicate host mission entities to the client
+            CoopScene.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate mission/scene transitions (host drives)
             if (!_xrReady)
             {
                 var fcam = Camera.main;

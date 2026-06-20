@@ -467,6 +467,8 @@ namespace IronNestVR
                 default:
                     // Other co-op subsystems share the same P2P channel; forward by type.
                     if (type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL) CoopClipboard.OnPacket(type, a, len);
+                    else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN) CoopEntities.OnPacket(type, a, len);
+                    else if (type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY) CoopScene.OnPacket(type, a, len);
                     else CoopMap.OnPacket(type, a, len);
                     break;
             }
