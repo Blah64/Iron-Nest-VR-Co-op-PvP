@@ -71,6 +71,11 @@ namespace IronNestVR
                 SetFpsLook(true);   // hand control back to the game
                 _lookFrozen = false;
             }
+
+            // Phase 3: apply the peer's control visuals + snap turret/gun state here, AFTER the game's Update
+            // (so our snap wins the frame); re-applies the turret transform immediately so the visible
+            // rotating cockpit matches.
+            CoopControls.LateApply();
         }
 
         private static void SetFpsLook(bool enabled)
@@ -124,6 +129,7 @@ namespace IronNestVR
             // flatscreen camera-pose send happens here. F6 toggles the solo render self-test.
             if (KeyDown(UnityEngine.InputSystem.Key.F6)) { CoopP2P.SelfTest = !CoopP2P.SelfTest; Log.LogInfo("[p2p] self-test " + (CoopP2P.SelfTest ? "ON" : "OFF")); }
             CoopP2P.Tick(Time.unscaledDeltaTime);
+            CoopControls.Tick(Time.unscaledDeltaTime);   // Phase 3: detect local control drags + transmit
             if (!_xrReady)
             {
                 var fcam = Camera.main;

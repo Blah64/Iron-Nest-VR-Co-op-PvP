@@ -97,9 +97,17 @@ namespace IronNestVR
             if (t == null) return;
 
             var dial = FindUp<DialInteractable>(t);
-            if (dial != null) { EngageDial(dial, hit.point, input, origin, hands); return; }
+            if (dial != null)
+            {
+                if (CoopControls.IsRemotelyOwned(dial)) { input.Haptic(Config.DetentHapticAmplitude, 0.02f); return; }  // peer is using it
+                EngageDial(dial, hit.point, input, origin, hands); return;
+            }
             var lever = FindUp<LinearSliderInteractable>(t);
-            if (lever != null) { EngageLever(lever, hit.point, input, origin, hands); return; }
+            if (lever != null)
+            {
+                if (CoopControls.IsRemotelyOwned(lever)) { input.Haptic(Config.DetentHapticAmplitude, 0.02f); return; }
+                EngageLever(lever, hit.point, input, origin, hands); return;
+            }
 
             // Click switch/button (LookAtTarget). Skip manuals (PickUpZoomTarget) — those are reposition
             // grabs owned by GrabManager, and their LookAtTarget click is the read-zoom we don't want here.
@@ -222,6 +230,7 @@ namespace IronNestVR
                     sw.OnClickDown();
                     sw.OnClickUp();
                 }
+                CoopControls.LocalClick(sw);   // replicate the click to the co-op peer
                 Log.LogInfo($"[manip] switch '{sw.name}' activated.");
             }
             catch (Exception e) { Log.LogWarning("[manip] switch activate: " + e.Message); }

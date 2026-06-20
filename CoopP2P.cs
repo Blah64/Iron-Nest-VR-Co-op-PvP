@@ -36,6 +36,11 @@ namespace IronNestVR
         public static CSteamID Peer;
         public static bool HasPeer;
 
+        // Role: the lobby owner is the host. Used as the ownership tie-breaker in Phase 3 (control sync) and
+        // for sim-gating in Phase 4. Recomputed each tick while in a lobby; false when solo / not in a lobby.
+        public static bool IsHost;
+        public static ulong MyId => _myId;
+
         // Latest remote pose (world space).
         public static bool RemoteValid;
         private static float _remoteAge;
@@ -130,12 +135,14 @@ namespace IronNestVR
             if (!SteamNet.InLobby)
             {
                 if (HasPeer) { CloseSession(Peer); HasPeer = false; Log.LogInfo("[p2p] not in lobby — peer cleared"); }
+                IsHost = false;
                 if (!SelfTest) RemoteValid = false;
                 return;
             }
             try
             {
                 var lobby = SteamNet.CurrentLobby;
+                try { IsHost = SteamMatchmaking.GetLobbyOwner(lobby).m_SteamID == _myId; } catch { }
                 int n = SteamMatchmaking.GetNumLobbyMembers(lobby);
                 for (int i = 0; i < n; i++)
                 {
@@ -182,6 +189,22 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[p2p] send: " + e.Message); }
         }
 
+        // Generic send for non-pose channels (Phase 3 control sync). The caller owns its buffer + framing
+        // (first byte = message type, distinct from MSG_POSE). Reliable for state-transition events
+        // (grab/release), unreliable-no-delay for the continuous value/state stream. Shares the pose channel
+        // and peer; safe because every packet is type-tagged and Receive() dispatches on the first byte.
+        public static bool Send(Il2CppStructArray<byte> buf, int len, bool reliable)
+        {
+            if (!_inited || !HasPeer) return false;
+            try
+            {
+                var mode = reliable ? EP2PSend.k_EP2PSendReliable : EP2PSend.k_EP2PSendUnreliableNoDelay;
+                if (SteamNetworking.SendP2PPacket(Peer, buf, (uint)len, mode, Channel)) { _sent++; return true; }
+            }
+            catch (Exception e) { Log.LogWarning("[p2p] send2: " + e.Message); }
+            return false;
+        }
+
         // Fake-remote injection for the F6 solo render test.
         public static void InjectRemote(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr)
         {
@@ -197,9 +220,18 @@ namespace IronNestVR
                 while (SteamNetworking.IsP2PPacketAvailable(out _, Channel) && guard++ < 64)
                 {
                     if (!SteamNetworking.ReadP2PPacket(_recvArr, (uint)_recvArr.Length, out uint read, out CSteamID from, Channel)) break;
-                    // Only the current lobby peer may drive our avatar — drop anything else (spoof / stale peer).
+                    // Only the current lobby peer may drive our state — drop anything else (spoof / stale peer).
                     if (!HasPeer || from.m_SteamID != Peer.m_SteamID) continue;
-                    if (read < 2 || _recvArr[0] != MSG_POSE) continue;
+                    if (read < 1) continue;
+
+                    // Non-pose packets are Phase 3 control-sync — dispatch by type byte and move on.
+                    if (_recvArr[0] != MSG_POSE)
+                    {
+                        try { CoopControls.OnPacket(_recvArr[0], _recvArr, (int)read); } catch (Exception ce) { Log.LogWarning("[ctrl] recv: " + ce.Message); }
+                        _recvd++;
+                        continue;
+                    }
+                    if (read < 2) continue;
 
                     byte flag = _recvArr[1];
                     if (flag > 1) continue;                                  // unknown flag (sender only writes 0/1)

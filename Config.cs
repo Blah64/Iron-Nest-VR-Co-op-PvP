@@ -27,6 +27,16 @@ namespace IronNestVR
         // throttled further. Set <= 0 to disable the cap (send every frame).
         public static float CoopSendHz = 30f;
 
+        // Phase 3 co-op: replicate cockpit-control operation + turret/gun physical state between the two
+        // lobby members (transient per-control ownership). Off = avatars-only (Phase 2). Reuses CoopSendHz
+        // for the value/state stream rate.
+        public static bool CoopControlSync = true;
+
+        // Phase 3 co-op: replicate click-activated controls (LookAtTarget — reload rammers, powder dispenser,
+        // power lever, lighting, fire button) and gun discharge as events, replayed via the game's own click
+        // handler so the switch animation + effect (reload, fire) play on the peer too. Skips manuals + menus.
+        public static bool CoopClickSync = true;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it
