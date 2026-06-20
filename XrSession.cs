@@ -43,6 +43,13 @@ namespace IronNestVR
         private long _swapchainFormat;
         private GraphicsFormat _gfxFormat = GraphicsFormat.R8G8B8A8_UNorm;
 
+        private int _lastRcWarnTick;
+        // Finite swapchain wait. The old long.MaxValue could freeze the whole game (the wait runs on
+        // the main thread) if the compositor ever stalled handing an image back — e.g. while the
+        // session is Synchronized-but-not-Visible. 1s per wait, retried a few times, then bail.
+        private const long WaitTimeoutNs = 1_000_000_000; // 1s
+        private const int WaitMaxTries = 4;               // ~4s total before abandoning the frame
+
         public bool Running => _running;
         public bool ExitRequested => _exitRequested;
         public bool IsFocused => _state == SessionState.Focused;
@@ -271,12 +278,15 @@ namespace IronNestVR
             if (tr) Dbg.Step("WaitFrame >>");
             var fwi = new FrameWaitInfo { Type = StructureType.TypeFrameWaitInfo };
             var fs = new FrameState { Type = StructureType.TypeFrameState };
-            if (_xr.WaitFrame(_session, &fwi, &fs) != Result.Success) return false;
+            var wfr = _xr.WaitFrame(_session, &fwi, &fs);
+            if (wfr != Result.Success) { WarnRc("xrWaitFrame", wfr); return false; }
             if (tr) Dbg.Step("WaitFrame <<");
             PredictedDisplayTime = fs.PredictedDisplayTime;
 
             var fbi = new FrameBeginInfo { Type = StructureType.TypeFrameBeginInfo };
-            _xr.BeginFrame(_session, &fbi);
+            var bfr = _xr.BeginFrame(_session, &fbi);
+            // XR_FRAME_DISCARDED is a benign success-category result (e.g. a re-begun frame); don't warn.
+            if (bfr != Result.Success && bfr != Result.FrameDiscarded) WarnRc("xrBeginFrame", bfr);
             if (tr) Dbg.Step("BeginFrame <<");
             _inFrame = true;
 
@@ -324,7 +334,8 @@ namespace IronNestVR
                 LayerCount = layerCount,
                 Layers = layers
             };
-            _xr.EndFrame(_session, &fei);
+            var efr = _xr.EndFrame(_session, &fei);
+            if (efr != Result.Success) WarnRc("xrEndFrame", efr);
         }
 
         // -------- swapchains + stereo submission (Phase 2.5 / 3) --------
@@ -410,12 +421,25 @@ namespace IronNestVR
             var ai = new SwapchainImageAcquireInfo { Type = StructureType.TypeSwapchainImageAcquireInfo };
             uint idx = 0;
             if (tr) Dbg.Step($"  acq{eye}: AcquireSwapchainImage");
-            if (_xr.AcquireSwapchainImage(_swapchains[eye], &ai, ref idx) != Result.Success) return IntPtr.Zero;
-            if (tr) Dbg.Step($"  acq{eye}: idx={idx} WaitSwapchainImage(timeout=inf)");
-            var wi = new SwapchainImageWaitInfo { Type = StructureType.TypeSwapchainImageWaitInfo, Timeout = long.MaxValue };
-            var wr = _xr.WaitSwapchainImage(_swapchains[eye], &wi);
+            var ar = _xr.AcquireSwapchainImage(_swapchains[eye], &ai, ref idx);
+            if (ar != Result.Success) { WarnRc($"xrAcquireSwapchainImage(eye{eye})", ar); return IntPtr.Zero; }
+
+            // Finite, retryable wait. xrWaitSwapchainImage may legitimately return XR_TIMEOUT_EXPIRED; the
+            // spec allows waiting again on the same still-acquired image. We bound the retries instead of
+            // blocking forever. On a genuine give-up the image stays acquired-but-unwaited — the spec
+            // forbids releasing it without a successful wait, so RenderAndSubmit skips the release (its
+            // sc==Zero guard); that only happens if the runtime is already wedged, and it's logged loudly.
+            var wi = new SwapchainImageWaitInfo { Type = StructureType.TypeSwapchainImageWaitInfo, Timeout = WaitTimeoutNs };
+            Result wr = Result.TimeoutExpired;
+            for (int t = 0; t < WaitMaxTries; t++)
+            {
+                if (tr) Dbg.Step($"  acq{eye}: idx={idx} WaitSwapchainImage(try {t}, 1s)");
+                wr = _xr.WaitSwapchainImage(_swapchains[eye], &wi);
+                if (wr != Result.TimeoutExpired) break;
+                Dbg.Beat($"eye{eye} wait TIMEOUT (try {t})");
+            }
             if (tr) Dbg.Step($"  acq{eye}: wait result={wr}");
-            if (wr != Result.Success) return IntPtr.Zero;
+            if (wr != Result.Success) { WarnRc($"xrWaitSwapchainImage(eye{eye})", wr); return IntPtr.Zero; }
             return _imageTex[eye][idx];
         }
 
@@ -436,7 +460,8 @@ namespace IronNestVR
             if (!_swapchainsReady && !CreateSwapchains(out var e)) { Log.LogError("Swapchain init failed: " + e); EndFrame(); return; }
             if (!rig.EnsureCameras(EyeWidth, EyeHeight, _gfxFormat)) { EndFrame(); return; }
 
-            bool tr = _submitFrames++ < 30;
+            int f = _submitFrames++;
+            bool tr = f < 30;
             rig.UpdateOrigin();
             for (int eye = 0; eye < 2; eye++)
             {
@@ -444,11 +469,15 @@ namespace IronNestVR
                 IntPtr sc = AcquireEye(eye);
                 if (tr) Dbg.Step($"submit eye{eye}: sc=0x{sc:X}; RenderEye");
                 IntPtr rt = rig.RenderEye(eye, Views[eye]);
+                // Crash-proof breadcrumb immediately before the native GPU copy (the prime AV suspect):
+                // if the process vanishes here, the heartbeat file's last line names this exact step.
+                Dbg.Beat($"f{f} eye{eye} CopyTexture sc={(sc != IntPtr.Zero ? 1 : 0)} rt={(rt != IntPtr.Zero ? 1 : 0)}");
                 if (tr) Dbg.Step($"submit eye{eye}: rt=0x{rt:X}; CopyTexture");
                 if (sc != IntPtr.Zero && rt != IntPtr.Zero) bridge.CopyTexture((void*)sc, (void*)rt);
                 if (tr) Dbg.Step($"submit eye{eye}: ReleaseEye");
                 if (sc != IntPtr.Zero) ReleaseEye(eye);
             }
+            Dbg.Beat($"f{f} SubmitProjection");
             if (tr) Dbg.Step("submit: SubmitProjection");
             SubmitProjection();
             if (tr) Dbg.Step("submit: frame done");
@@ -489,6 +518,17 @@ namespace IronNestVR
         }
 
         // -------- helpers --------
+
+        // Report an unexpected OpenXR result. Always drops a crash-proof breadcrumb (the heartbeat
+        // survives a native crash, so a bad result right before death is visible), and throttles the
+        // BepInEx warning so a wedged session can't spam the log. Useful around focus changes, where a
+        // stale session can start returning errors the old code silently ignored.
+        private void WarnRc(string call, Result r)
+        {
+            Dbg.Beat($"{call} -> {r}");
+            int now = Environment.TickCount;
+            if (now - _lastRcWarnTick > 2000) { _lastRcWarnTick = now; Log.LogWarning($"[xr] {call} returned {r}"); }
+        }
 
         private static ulong MakeVersion(ulong major, ulong minor, ulong patch)
             => (major << 48) | (minor << 32) | patch;

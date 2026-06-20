@@ -39,8 +39,12 @@ namespace IronNestVR
         private static ManualLogSource Log => Plugin.Logger;
 
         public const byte MSG_SPAWN = 16;    // [t][key i32][id str][name str][icon str][role i32][pos 3f][state i32][hp i32][maxHp i32][armour i32][stars i32][scale i32]  reliable
-        public const byte MSG_UPDATE = 17;   // [t][key i32][pos 3f][state i32][hp i32]   reliable on state/hp change, else unreliable stream
+        public const byte MSG_UPDATE = 17;   // [t][key i32][pos 3f][state i32][hp i32]   RELIABLE — only on discrete state/hp change
         public const byte MSG_DESPAWN = 18;  // [t][key i32]                              reliable
+        public const byte MSG_MOVE = 23;     // [t][key i32][pos 3f]                      UNRELIABLE — position-only stream
+        // REVIEW-fix (P1): movement is a SEPARATE position-only packet so a reordered/stale unreliable move can
+        // never carry old state/hp and roll back a newer reliable damage/death. Discrete state/hp travels ONLY
+        // on the reliable+ordered MSG_UPDATE; MSG_MOVE touches position alone (self-correcting next frame).
 
         private sealed class SentState
         {
@@ -139,8 +143,8 @@ namespace IronNestVR
                 {
                     bool discrete = s.State != state || s.Health != hp;
                     bool moved = (s.Pos - pos).sqrMagnitude > MoveEpsilonSq;
-                    if (discrete) { SendUpdate(key, pos, state, hp, true); s.State = state; s.Health = hp; s.Pos = pos; if (discrete) Log.LogInfo($"[ent] '{s.ID}' state/hp -> peer (state={state} hp={hp})"); }
-                    else if (moved) { SendUpdate(key, pos, state, hp, false); s.Pos = pos; }
+                    if (discrete) { SendUpdate(key, pos, state, hp); s.State = state; s.Health = hp; s.Pos = pos; Log.LogInfo($"[ent] '{s.ID}' state/hp -> peer (state={state} hp={hp})"); }
+                    else if (moved) { SendMove(key, pos); s.Pos = pos; }
                 }
             }
 
@@ -215,6 +219,14 @@ namespace IronNestVR
                     if (_mirrors.TryGetValue(key, out var m)) ApplyUpdate(m, pos, state, hp);
                     break;
                 }
+                case MSG_MOVE:
+                {
+                    if (len < 1 + 4 + 12) return;
+                    int key = GetInt(a, ref o);
+                    Vector3 pos = GetV(a, ref o);
+                    if (_mirrors.TryGetValue(key, out var m)) ApplyMove(m, pos);   // position only — never touches state/hp
+                    break;
+                }
                 case MSG_DESPAWN:
                 {
                     if (len < 5) return;
@@ -277,6 +289,22 @@ namespace IronNestVR
 
             _mirrors[key] = new Mirror { Key = key, ID = id, Go = go, Loc = loc, Entity = e, IsClone = true, LastState = state };
             Log.LogInfo($"[ent] cloned remote entity '{id}' <- peer (role={role} hp={hp}/{maxHp} parent={(parent != null ? parent.name : "<none>")})");
+        }
+
+        // Position-only apply for the unreliable MSG_MOVE stream. Deliberately does NOT read or write state/hp,
+        // so a late/reordered move can only nudge position (corrected by the next move), never revert authoritative
+        // damage/death that arrived on the reliable MSG_UPDATE channel.
+        private static void ApplyMove(Mirror m, Vector3 pos)
+        {
+            if (m.Loc == null && m.Entity == null) return;
+            try
+            {
+                var e = m.Entity; if (e == null && m.Loc != null) { try { e = m.Loc.Entity; m.Entity = e; } catch { } }
+                if (e != null) { try { e.Position = pos; } catch { } }
+                try { if (m.Loc != null) m.Loc.LocalPosition = new Vector2(pos.x, pos.y); } catch { }
+                try { if (m.Loc != null) m.Loc.RecalculateAndRegister(false); } catch { }
+            }
+            catch (Exception ex) { Log.LogWarning("[ent] applyMove: " + ex.Message); }
         }
 
         private static void ApplyUpdate(Mirror m, Vector3 pos, int state, int hp)
@@ -352,11 +380,20 @@ namespace IronNestVR
             Log.LogInfo($"[ent] spawn '{id}' -> peer (role={role} hp={hp}/{maxHp} state={state})");
         }
 
-        private static void SendUpdate(int key, Vector3 pos, int state, int hp, bool reliable)
+        // Discrete state/hp change — ALWAYS reliable (and Steam-ordered), so it can't be overtaken by a stale move.
+        private static void SendUpdate(int key, Vector3 pos, int state, int hp)
         {
             if (!EnsureBuf()) return;
             int o = 0; _buf[o++] = MSG_UPDATE; o = PutInt(o, key); o = PutV(o, pos); o = PutInt(o, state); o = PutInt(o, hp);
-            CoopP2P.Send(_buf, o, reliable);
+            CoopP2P.Send(_buf, o, true);
+        }
+
+        // High-rate position stream — unreliable, position only (no state/hp), per REVIEW-fix P1.
+        private static void SendMove(int key, Vector3 pos)
+        {
+            if (!EnsureBuf()) return;
+            int o = 0; _buf[o++] = MSG_MOVE; o = PutInt(o, key); o = PutV(o, pos);
+            CoopP2P.Send(_buf, o, false);
         }
 
         private static void SendDespawn(int key)

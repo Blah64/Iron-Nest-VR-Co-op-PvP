@@ -112,6 +112,9 @@ namespace IronNestVR
         // Reusable send buffer (control packets are tiny: 1+4+4 max). Lazily created on the Unity thread.
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
+        // Scratch for strict group-packet parsing: read into here, validate every float finite, then publish to
+        // gs.V only if the whole frame is intact (REVIEW-fix P2 — no partial/non-finite turret state).
+        private static readonly float[] _tmpGroup = new float[5];
 
         private static int _grabs, _releases;
 
@@ -281,6 +284,14 @@ namespace IronNestVR
             var gs = _grp[(int)g];
             if (!gs.RemoteOwned || now >= gs.Until || !gs.Has) return;
             if (LocallyOwnsGroup(g)) return;   // a tug-of-war shouldn't fight our own live drag
+            ApplyGroupValues(g, gs);
+        }
+
+        // Push a group's stored floats onto the turret/guns. Caller decides WHEN (the live stream gates on remote
+        // ownership; the reliable release applies once regardless — REVIEW-fix P2). Always skips a group we own
+        // locally; that check is the caller's (ApplyGroup gates it; the release path checks before calling).
+        private static void ApplyGroupValues(Group g, GroupState gs)
+        {
             try
             {
                 switch (g)
@@ -404,6 +415,30 @@ namespace IronNestVR
                 {
                     if (len < 5) return;
                     int id = GetInt(a, ref o);
+                    // Optional settled group state rides this reliable packet (REVIEW-fix P1). Apply it ONCE,
+                    // before clearing ownership, so the dial lands on the final value even if the live unreliable
+                    // stream's last frame was lost. Strict-framed + finite-checked like MSG_GROUP.
+                    if (o < len)
+                    {
+                        Group g = (Group)a[o++];
+                        int gi = (int)g;
+                        if (gi > 0 && gi < _grp.Length)
+                        {
+                            int n = GroupFloatCount(g);
+                            if (len == o + 4 * n)
+                            {
+                                bool ok = true;
+                                for (int i = 0; i < n; i++) { float f = GetFloat(a, ref o); if (!Finite(f)) { ok = false; break; } _tmpGroup[i] = f; }
+                                if (ok)
+                                {
+                                    var gs = _grp[gi];
+                                    for (int i = 0; i < n; i++) gs.V[i] = _tmpGroup[i];
+                                    gs.Has = true; gs.Until = now + StaleSec;
+                                    if (_turret != null && !LocallyOwnsGroup(g)) ApplyGroupValues(g, gs);   // settle authoritative
+                                }
+                            }
+                        }
+                    }
                     if (_byId.TryGetValue(id, out var c)) { c.RemoteOwned = false; RecomputeGroupRemote(c.Grp); Log.LogInfo($"[ctrl] remote released '{c.T.name}' <- peer"); }
                     _pendingGrab.Remove(id);
                     break;
@@ -424,12 +459,10 @@ namespace IronNestVR
                     int gi = (int)g;
                     if (gi <= 0 || gi >= _grp.Length) return;
                     int n = GroupFloatCount(g);
-                    var gs = _grp[gi];
-                    for (int i = 0; i < n; i++)
-                    {
-                        if (o + 4 > len) break;
-                        gs.V[i] = GetFloat(a, ref o);
-                    }
+                    if (len != o + 4 * n) return;                 // strict framing: exactly n floats, no more/less
+                    for (int i = 0; i < n; i++) { float f = GetFloat(a, ref o); if (!Finite(f)) return; _tmpGroup[i] = f; }
+                    var gs = _grp[gi];                            // whole frame valid → publish atomically
+                    for (int i = 0; i < n; i++) gs.V[i] = _tmpGroup[i];
                     gs.Has = true; gs.Until = now + StaleSec;
                     break;
                 }
@@ -467,8 +500,9 @@ namespace IronNestVR
                 default:
                     // Other co-op subsystems share the same P2P channel; forward by type.
                     if (type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL) CoopClipboard.OnPacket(type, a, len);
-                    else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN) CoopEntities.OnPacket(type, a, len);
+                    else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN || type == CoopEntities.MSG_MOVE) CoopEntities.OnPacket(type, a, len);
                     else if (type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY) CoopScene.OnPacket(type, a, len);
+                    else if (type == CoopOrders.MSG_ORDER) CoopOrders.OnPacket(type, a, len);
                     else CoopMap.OnPacket(type, a, len);
                     break;
             }
@@ -552,12 +586,18 @@ namespace IronNestVR
         private static void SendRelease(Ctrl c)
         {
             if (!EnsureBuf()) return;
-            // Push the settled group state first so the peer holds the right value after we let go, then the
-            // reliable release.
-            if (c.Grp != Group.Other) SendGroupState(c.Grp);
+            // REVIEW-fix (P1): carry the SETTLED group state INSIDE the reliable release, instead of a separate
+            // unreliable group packet that could be lost or arrive after the release (which clears RemoteOwned and
+            // would freeze the dial at its last streamed value). Now release + final value land together, ordered.
             int o = 0; _buf[o++] = MSG_RELEASE; o = PutInt(o, c.NetId);
+            int grpPos = o; _buf[o++] = (byte)c.Grp;
+            if (c.Grp != Group.Other && _turret != null)
+            {
+                try { o = WriteGroupFloats(o, c.Grp); }
+                catch { _buf[grpPos] = (byte)Group.Other; o = grpPos + 1; }   // couldn't settle — send a plain release
+            }
             CoopP2P.Send(_buf, o, true);
-            Log.LogInfo($"[ctrl] released '{c.T.name}' -> peer");
+            Log.LogInfo($"[ctrl] released '{c.T.name}' -> peer (settled grp={c.Grp})");
         }
 
         private static void SendClick(int netId)
@@ -586,29 +626,32 @@ namespace IronNestVR
 
         private static void SendGroupState(Group g)
         {
-            if (_turret == null || !EnsureBuf()) return;
+            if (_turret == null || g == Group.Other || !EnsureBuf()) return;
             int o = 0; _buf[o++] = MSG_GROUP; _buf[o++] = (byte)g;
-            try
-            {
-                switch (g)
-                {
-                    case Group.Rotation:
-                        o = PutFloat(o, _turret.DesiredRotation); o = PutFloat(o, _turret.CurrentAngle);
-                        break;
-                    case Group.Elevation:
-                        o = PutFloat(o, _turret.DesiredElevation);
-                        o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
-                        o = PutFloat(o, _gunL != null ? _gunL.CurrentElevation : 0f);
-                        o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
-                        o = PutFloat(o, _gunR != null ? _gunR.CurrentElevation : 0f);
-                        break;
-                    case Group.GunLeft:  o = PutGun(o, _gunL); break;
-                    case Group.GunRight: o = PutGun(o, _gunR); break;
-                    default: return;
-                }
-            }
-            catch { return; }
+            try { o = WriteGroupFloats(o, g); } catch { return; }
             CoopP2P.Send(_buf, o, false);
+        }
+
+        // Serialize a group's GroupFloatCount floats at offset o. Shared by the live MSG_GROUP stream and the
+        // settled-state payload folded into the reliable MSG_RELEASE (REVIEW-fix P1).
+        private static int WriteGroupFloats(int o, Group g)
+        {
+            switch (g)
+            {
+                case Group.Rotation:
+                    o = PutFloat(o, _turret.DesiredRotation); o = PutFloat(o, _turret.CurrentAngle);
+                    break;
+                case Group.Elevation:
+                    o = PutFloat(o, _turret.DesiredElevation);
+                    o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
+                    o = PutFloat(o, _gunL != null ? _gunL.CurrentElevation : 0f);
+                    o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
+                    o = PutFloat(o, _gunR != null ? _gunR.CurrentElevation : 0f);
+                    break;
+                case Group.GunLeft:  o = PutGun(o, _gunL); break;
+                case Group.GunRight: o = PutGun(o, _gunR); break;
+            }
+            return o;
         }
 
         private static int PutGun(int o, GunController gun)

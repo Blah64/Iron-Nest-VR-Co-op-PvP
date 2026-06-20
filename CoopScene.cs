@@ -43,6 +43,14 @@ namespace IronNestVR
         private static int _lastPhase = -1;        // host: detect our own phase transitions
         private static bool _readySent;            // client: send READY once per mission entry
 
+        // Client: a received MISSION_START is retried until the scene's OperationLoadRelay is actually available
+        // (REVIEW-fix P1 — the relay may not exist on the receive frame during a scene/hub transition). We keep
+        // trying for a bounded window rather than dropping the command on the first miss.
+        private static float _pendingStartUntil;   // 0 = no pending start; else deadline (unscaledTime)
+        private static float _nextStartTry;        // next retry time
+        private static bool _startInvoked;         // StartAssignedOperation already called → wait for the load
+        private static string _pendingScene, _pendingMission;
+
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
         private static readonly byte[] _scratch = new byte[256];
@@ -52,7 +60,7 @@ namespace IronNestVR
         public static void Tick(float dt)
         {
             if (!Config.CoopSceneSync) return;
-            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { _lastPhase = -1; _readySent = false; return; }
+            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { _lastPhase = -1; _readySent = false; _pendingStartUntil = 0f; _startInvoked = false; return; }
             try
             {
                 int phase = CurrentPhase();
@@ -72,8 +80,22 @@ namespace IronNestVR
                 {
                     // Client: announce readiness once we've actually entered the mission scene.
                     bool inMission = phase == (int)MissionManager.GamePhase.MissionActive;
-                    if (inMission && !_readySent) { SendMissionReady(); _readySent = true; }
-                    if (!inMission) _readySent = false;
+                    if (inMission)
+                    {
+                        if (_pendingStartUntil > 0f) { _pendingStartUntil = 0f; _startInvoked = false; Log.LogInfo("[scene] client reached mission scene (host-commanded start complete)"); }
+                        if (!_readySent) { SendMissionReady(); _readySent = true; }
+                    }
+                    else
+                    {
+                        _readySent = false;
+                        // Retry the host-commanded load until the relay shows up or we time out.
+                        if (_pendingStartUntil > 0f)
+                        {
+                            float now = Time.unscaledTime;
+                            if (now >= _pendingStartUntil) { _pendingStartUntil = 0f; _startInvoked = false; Log.LogWarning($"[scene] gave up waiting for OperationLoadRelay — client did not load host mission '{_pendingMission}'"); }
+                            else if (!_startInvoked && now >= _nextStartTry) { _nextStartTry = now + 1f; if (StartClientMission()) _startInvoked = true; }
+                        }
+                    }
                     _lastPhase = phase;
                 }
             }
@@ -105,7 +127,12 @@ namespace IronNestVR
                     string missionId = GetStr(a, ref o, len);
                     Log.LogInfo($"[scene] MISSION_START <- peer (scene='{scene}' mission='{missionId}')");
                     if (CurrentPhase() == (int)MissionManager.GamePhase.MissionActive) { Log.LogInfo("[scene] already in a mission — ignoring start"); return; }
-                    StartClientMission();
+                    // Arm a bounded retry: try now, and keep trying in Tick until the relay exists or we time out.
+                    _pendingScene = scene; _pendingMission = missionId;
+                    _pendingStartUntil = Time.unscaledTime + 12f;
+                    _nextStartTry = Time.unscaledTime + 1f;
+                    _startInvoked = StartClientMission();
+                    if (!_startInvoked) Log.LogInfo("[scene] no OperationLoadRelay yet — will retry until the scene is ready");
                     break;
                 }
                 case MSG_MISSION_END:
@@ -133,7 +160,11 @@ namespace IronNestVR
         // Drive the client into the mission the same way a player click does — via the scene's OperationLoadRelay
         // (it holds the OperationGraph asset; the client's copy is the same asset, same build). The 4a sim-gate
         // then suppresses the client's graph bootstrap so it loads the scene without spawning.
-        private static void StartClientMission()
+        // Returns true if it invoked StartAssignedOperation (the scene's relay was available); false if no relay
+        // exists yet (caller retries). NOTE (REVIEW finding 3a, deferred): we still use relays[0]. The demo's
+        // mission-launch scene has a single operation relay, so index 0 is correct there — but if the count ever
+        // logs > 1 in a real test, this should match the relay by the replicated missionId/scene instead.
+        private static bool StartClientMission()
         {
             try
             {
@@ -141,11 +172,11 @@ namespace IronNestVR
                 if (relays != null && relays.Length > 0)
                 {
                     var r = relays[0].TryCast<OperationLoadRelay>();
-                    if (r != null) { r.StartAssignedOperation(); Log.LogInfo("[scene] client starting operation via OperationLoadRelay (host-commanded)"); return; }
+                    if (r != null) { r.StartAssignedOperation(); Log.LogInfo($"[scene] client starting operation via OperationLoadRelay (host-commanded; {relays.Length} relay(s) in scene)"); return true; }
                 }
-                Log.LogWarning("[scene] MISSION_START but no OperationLoadRelay in scene to drive the client load — client stays in hub");
+                return false;
             }
-            catch (Exception e) { Log.LogWarning("[scene] start client mission: " + e.Message); }
+            catch (Exception e) { Log.LogWarning("[scene] start client mission: " + e.Message); return false; }
         }
 
         private static void EndClientMission(int targetPhase)
@@ -194,7 +225,8 @@ namespace IronNestVR
         {
             string phase = "n/a";
             try { var mm = MissionManager.Instance; if (mm != null) phase = mm.CurrentPhase.ToString(); } catch { }
-            return $"scene: phase={phase} role={(CoopP2P.IsHost ? "HOST(drives)" : (CoopP2P.HasPeer ? "client(follows)" : "solo"))} readySent={_readySent}";
+            string pend = _pendingStartUntil > 0f ? $" pendingStart='{_pendingMission}'(invoked={_startInvoked})" : "";
+            return $"scene: phase={phase} role={(CoopP2P.IsHost ? "HOST(drives)" : (CoopP2P.HasPeer ? "client(follows)" : "solo"))} readySent={_readySent}{pend}";
         }
 
         // ---------------- helpers ----------------

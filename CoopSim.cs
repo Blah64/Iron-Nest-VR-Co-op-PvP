@@ -50,6 +50,16 @@ namespace IronNestVR
             _patched += TryPatch(typeof(SleepyNodes.MissionPassiveGraph), "Run");
             _patched += TryPatch(typeof(SleepyNodes.MissionPassiveGraph), "Update");
             Log.LogInfo($"[sim] host-authoritative sim-gate: {_patched}/4 mission-graph methods patched (client suppresses these; host + solo run normally)");
+
+            // Phase 4d: capture teleprinter ORDERS host-side via a postfix on the submit funnel (the client's
+            // graph is gated, so it can't produce them locally). Separate from the gate prefixes above.
+            try
+            {
+                var mi = AccessTools.Method(typeof(Teleprinter), "SubmitLines");
+                if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopOrders), nameof(CoopOrders.OnSubmitLines))); Log.LogInfo("[sim] teleprinter-order capture patched (Teleprinter.SubmitLines)"); }
+                else Log.LogWarning("[sim] Teleprinter.SubmitLines not found — orders won't sync");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] teleprinter patch: " + e.Message); }
         }
 
         private static int TryPatch(Type t, string method)

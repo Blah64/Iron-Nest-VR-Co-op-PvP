@@ -79,6 +79,12 @@ namespace IronNestVR
         // mission leaves the client in the hub and entity sync has nothing to mirror into. See CoopScene.
         public static bool CoopSceneSync = true;
 
+        // Phase 4 co-op (4d): replicate the TELEPRINTER "typing machine" orders. The host captures every
+        // Teleprinter.SubmitLines (resolved order text) and the client replays it on its matching printer, so
+        // the gated client's teleprinter types the same orders. Scoped to an active mission (hub runs its own
+        // teleprinter locally on both, so syncing there would double-print). See CoopOrders.
+        public static bool CoopOrdersSync = true;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it

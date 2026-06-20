@@ -117,8 +117,30 @@ namespace IronNestVR
             }
         }
 
+        private bool _loggedEnv;
+        // One-time environment banner so a tester's log self-proves the two things that decide the D3D
+        // race hypothesis — the launch options actually applied, and the real graphics threading mode —
+        // plus GPU/VRAM and where the crash-proof trace files are written. Logged from the first Update
+        // (Unity's graphics device is fully up by then).
+        private void LogEnvironmentOnce()
+        {
+            if (_loggedEnv) return;
+            _loggedEnv = true;
+            try
+            {
+                Log.LogInfo("[env] cmdline: " + Environment.CommandLine);
+                Log.LogInfo($"[env] gpu='{SystemInfo.graphicsDeviceName}' vendor='{SystemInfo.graphicsDeviceVendor}' " +
+                            $"api={SystemInfo.graphicsDeviceType} ver='{SystemInfo.graphicsDeviceVersion}' vram={SystemInfo.graphicsMemorySize}MB");
+                Log.LogInfo($"[env] threadingMode={SystemInfo.renderingThreadingMode} gfxMultiThreaded={SystemInfo.graphicsMultiThreaded} " +
+                            $"sysRAM={SystemInfo.systemMemorySize}MB cpu='{SystemInfo.processorType}' x{SystemInfo.processorCount}");
+                Log.LogInfo("[env] trace+heartbeat dir: " + Dbg.Directory);
+            }
+            catch (Exception e) { Log.LogWarning("[env] dump failed: " + e.Message); }
+        }
+
         private void Update()
         {
+            LogEnvironmentOnce();
             PerfTick();
             ScanSceneOnce();
             Diagnostics.Tick();
@@ -159,6 +181,7 @@ namespace IronNestVR
             // --- VR frame loop (canonical OpenXR order) ---
             try
             {
+                Dbg.Beat("poll");
                 _xr.PollEvents();
                 if (_xr.ExitRequested) { Log.LogWarning("OpenXR requested exit; tearing down VR."); TeardownVr(); return; }
 
@@ -173,6 +196,7 @@ namespace IronNestVR
                 }
 
                 bool shouldRender = _xr.BeginFrameLocateViews();
+                Dbg.Beat($"begin shouldRender={shouldRender} focused={_xr.IsFocused}");
 
                 // Controller input + cockpit interaction. Pose locate needs the frame's predicted
                 // display time (set by BeginFrameLocateViews) and a focused session. The interactor is
@@ -223,10 +247,12 @@ namespace IronNestVR
                 _interactor.Apply(_xr.Input, _rig, dt, active, active && (_menu.IsOpen || _handManip.Active), _menu.IsOpen);
 
                 if (shouldRender) _xr.RenderAndSubmit(_rig, _bridge);
-                else _xr.EndFrame();
+                else { Dbg.Beat("endFrame(noRender)"); _xr.EndFrame(); }
 
                 // HUD follow runs after the eye cameras have been posed this frame.
+                Dbg.Beat("hud");
                 _hud.Tick(_rig, active);
+                Dbg.Beat("loopEnd");
 
                 if (shouldRender && _xr.ViewsValid && Time.unscaledTime >= _nextPoseLog)
                 {
@@ -236,6 +262,7 @@ namespace IronNestVR
             }
             catch (Exception e)
             {
+                Dbg.Beat("FRAME LOOP EXCEPTION: " + e.Message);
                 Log.LogError("VR frame loop error: " + e);
                 TeardownVr();
             }
