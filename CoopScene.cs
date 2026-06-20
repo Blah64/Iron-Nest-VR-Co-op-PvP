@@ -13,20 +13,24 @@ namespace IronNestVR
     /// but nothing got them there: when the host starts a mission, the client stayed in the hub. This closes
     /// that gap, host-authoritatively.
     ///
-    /// HOW (phase-driven, not button-driven — robust to which control started it):
-    ///   • HOST watches its own <c>MissionManager.CurrentPhase</c>. On →MissionActive it broadcasts
-    ///     MISSION_START; on MissionActive→(BrowsingMap/MainMenu) it broadcasts MISSION_END.
-    ///   • CLIENT applies them: MISSION_START → drive its own <c>OperationLoadRelay.StartAssignedOperation()</c>
-    ///     (the same path a player-click takes), which loads the SAME mission scene. The 4a sim-gate keeps the
+    /// HOW (phase-driven, not button-driven — robust to which control started it). The game has THREE phases —
+    /// MainMenu → BrowsingMap (the operations map, where the per-mission OperationLoadRelays live) → MissionActive
+    /// — and the client must follow the host through ALL of them (an OperationLoadRelay only exists in the
+    /// BrowsingMap scene, so a client still at MainMenu literally has nothing to start — the bug the first 2-player
+    /// test hit).
+    ///   • HOST watches its own <c>MissionManager.CurrentPhase</c> and replicates EVERY transition: →MissionActive
+    ///     broadcasts MISSION_START (with the OperationID); →BrowsingMap / →MainMenu broadcast GO_TO_PHASE.
+    ///   • CLIENT applies them: GO_TO_PHASE → <c>EnterBrowsingMap()</c> / <c>ReturnToMap()</c> / <c>LoadMainMenu()</c>
+    ///     / <c>EndOperationAndReturnToMenu()</c> (picked by where it currently is). MISSION_START → start the
+    ///     OperationLoadRelay whose <c>operation.OperationID</c> matches the host's. The 4a sim-gate keeps the
     ///     client's MissionGraph from bootstrapping, so it loads the scene but spawns nothing — the host's
-    ///     entities arrive via <see cref="CoopEntities"/>. MISSION_END → <c>ReturnToMap()</c> /
-    ///     <c>EndOperationAndReturnToMenu()</c> to follow the host back out.
+    ///     entities arrive via <see cref="CoopEntities"/>.
     ///   • Once the client reaches MissionActive it sends MISSION_READY; the host then re-sends the entity
     ///     snapshot — covering spawns the host streamed before the client's scene finished loading.
     ///
     /// Only the HOST broadcasts phase changes (the client only receives + applies), so there's no feedback loop.
-    /// Join-in-progress: if the host is ALREADY in a mission when the client connects, <see cref="SendSnapshot"/>
-    /// (from the JIP coordinator) sends MISSION_START so the joiner loads in.
+    /// Join-in-progress: <see cref="SendSnapshot"/> tells a fresh joiner the host's CURRENT phase (enter the map;
+    /// and if mid-mission, the map command + MISSION_START), so a peer that joined at the MainMenu catches up.
     ///
     /// NOT YET HARDENED (noted): a client independently clicking "start operation" would desync (only the host's
     /// lifecycle should drive) — a future pass can Harmony-gate client-initiated StartOperation/LoadMission like
@@ -37,7 +41,7 @@ namespace IronNestVR
         private static ManualLogSource Log => Plugin.Logger;
 
         public const byte MSG_MISSION_START = 19;  // [t][scene str][missionId str][operationId str]  reliable  host->client
-        public const byte MSG_MISSION_END = 20;    // [t][targetPhase i32]           reliable  host->client
+        public const byte MSG_MISSION_END = 20;    // [t][targetPhase i32]  reliable host->client — "go to non-mission phase" (BrowsingMap/MainMenu)
         public const byte MSG_MISSION_READY = 21;  // [t]                            reliable  client->host
 
         private static int _lastPhase = -1;        // host: detect our own phase transitions
@@ -71,8 +75,11 @@ namespace IronNestVR
                     if (_lastPhase < 0) { _lastPhase = phase; return; }   // first read: adopt, don't fire
                     if (phase != _lastPhase)
                     {
+                        // Replicate EVERY transition so the client follows the host through the whole chain
+                        // (MainMenu→BrowsingMap→Mission). Previously only the Mission edges were sent, so a client
+                        // at the MainMenu never reached the BrowsingMap and had no relay to start.
                         if (phase == (int)MissionManager.GamePhase.MissionActive) SendMissionStart();
-                        else if (_lastPhase == (int)MissionManager.GamePhase.MissionActive) SendMissionEnd(phase);
+                        else SendGoToPhase(phase);
                         _lastPhase = phase;
                     }
                 }
@@ -104,13 +111,26 @@ namespace IronNestVR
 
         // ---------------- join-in-progress ----------------
 
-        // Host → new joiner: if we're already mid-mission, command the joiner to load in. Called from the JIP
-        // coordinator BEFORE the entity snapshot (the joiner must load the scene before it can mirror entities;
-        // entity packets are dropped until it's InMission, then re-sent when it signals MISSION_READY).
+        // Host → new joiner: catch the joiner up to the host's CURRENT phase. A peer that connected at the
+        // MainMenu must be told to enter the operations map (where the relays live); if the host is already
+        // mid-mission, send the map command AND the mission-start (the joiner traverses the map, then the pending
+        // MISSION_START retries until the map's relays load). Called from the JIP coordinator before the entity
+        // snapshot (the joiner must reach the mission scene before it can mirror entities).
         public static void SendSnapshot()
         {
             if (!Config.CoopSceneSync || !CoopP2P.IsHost) return;
-            if (CurrentPhase() == (int)MissionManager.GamePhase.MissionActive) { SendMissionStart(); Log.LogInfo("[scene] JIP: host already in mission — commanding joiner to load in"); }
+            int phase = CurrentPhase();
+            if (phase == (int)MissionManager.GamePhase.MissionActive)
+            {
+                SendGoToPhase((int)MissionManager.GamePhase.BrowsingMap);
+                SendMissionStart();
+                Log.LogInfo("[scene] JIP: host in mission — sent map + mission-start so the joiner loads in");
+            }
+            else if (phase == (int)MissionManager.GamePhase.BrowsingMap)
+            {
+                SendGoToPhase((int)MissionManager.GamePhase.BrowsingMap);
+                Log.LogInfo("[scene] JIP: host in operations map — commanding joiner to follow");
+            }
         }
 
         // ---------------- receive ----------------
@@ -136,14 +156,13 @@ namespace IronNestVR
                     if (!_startInvoked) Log.LogInfo("[scene] no OperationLoadRelay yet — will retry until the scene is ready");
                     break;
                 }
-                case MSG_MISSION_END:
+                case MSG_MISSION_END:   // generalized: "go to this non-mission phase" from ANY current phase
                 {
                     if (CoopP2P.IsHost) return;
                     if (len < 5) return;
                     int target = GetInt(a, ref o);
-                    Log.LogInfo($"[scene] MISSION_END <- peer (target phase={target})");
-                    if (CurrentPhase() != (int)MissionManager.GamePhase.MissionActive) { Log.LogInfo("[scene] not in a mission — ignoring end"); return; }
-                    EndClientMission(target);
+                    Log.LogInfo($"[scene] GO_TO_PHASE <- peer (target phase={target})");
+                    ApplyGoToPhase(target);
                     break;
                 }
                 case MSG_MISSION_READY:
@@ -199,16 +218,30 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[scene] start client mission: " + e.Message); return false; }
         }
 
-        private static void EndClientMission(int targetPhase)
+        // Drive the client to a non-mission target phase, picking the right MissionManager call for where it
+        // currently is (EnterBrowsingMap from the menu vs ReturnToMap from a mission; LoadMainMenu from the map vs
+        // EndOperationAndReturnToMenu from a mission). Idempotent: no-op if already in the target phase.
+        private static void ApplyGoToPhase(int targetPhase)
         {
             try
             {
-                var mm = MissionManager.Instance;
-                if (mm == null) return;
-                if (targetPhase == (int)MissionManager.GamePhase.MainMenu) { mm.EndOperationAndReturnToMenu(); Log.LogInfo("[scene] client ending operation -> menu (host-commanded)"); }
-                else { mm.ReturnToMap(); Log.LogInfo("[scene] client returning to map (host-commanded)"); }
+                var mm = MissionManager.Instance; if (mm == null) return;
+                int cur = (int)mm.CurrentPhase;
+                if (cur == targetPhase) { Log.LogInfo($"[scene] already in phase {targetPhase} — nothing to do"); return; }
+                _pendingStartUntil = 0f; _startInvoked = false;   // reaching a non-mission phase cancels any pending load
+
+                if (targetPhase == (int)MissionManager.GamePhase.BrowsingMap)
+                {
+                    if (cur == (int)MissionManager.GamePhase.MissionActive) { mm.ReturnToMap(); Log.LogInfo("[scene] client returning to operations map (host-commanded)"); }
+                    else { mm.EnterBrowsingMap(); Log.LogInfo("[scene] client entering operations map (host-commanded)"); }
+                }
+                else if (targetPhase == (int)MissionManager.GamePhase.MainMenu)
+                {
+                    if (cur == (int)MissionManager.GamePhase.MissionActive) { mm.EndOperationAndReturnToMenu(); Log.LogInfo("[scene] client ending operation -> menu (host-commanded)"); }
+                    else { mm.LoadMainMenu(); Log.LogInfo("[scene] client -> main menu (host-commanded)"); }
+                }
             }
-            catch (Exception e) { Log.LogWarning("[scene] end client mission: " + e.Message); }
+            catch (Exception e) { Log.LogWarning("[scene] go-to-phase: " + e.Message); }
         }
 
         // ---------------- send ----------------
@@ -233,12 +266,12 @@ namespace IronNestVR
             Log.LogInfo($"[scene] MISSION_START -> peer (scene='{scene}' mission='{mid}' op='{oid}')");
         }
 
-        private static void SendMissionEnd(int targetPhase)
+        private static void SendGoToPhase(int targetPhase)
         {
             if (!EnsureBuf()) return;
             int o = 0; _buf[o++] = MSG_MISSION_END; o = PutInt(o, targetPhase);
             CoopP2P.Send(_buf, o, true);
-            Log.LogInfo($"[scene] MISSION_END -> peer (target phase={targetPhase})");
+            Log.LogInfo($"[scene] GO_TO_PHASE -> peer (target phase={targetPhase})");
         }
 
         private static void SendMissionReady()
