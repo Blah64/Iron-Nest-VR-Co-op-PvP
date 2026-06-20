@@ -52,7 +52,6 @@ namespace IronNestVR
         public static bool SelfTest;   // F6: mirror local pose as a fake remote, to verify avatar rendering solo
 
         private static int _sent, _recvd;
-        private static float _nextStat;
         private static float _nextSend;   // transmit-rate cap (see Config.CoopSendHz)
 
         public static void Init()
@@ -115,19 +114,18 @@ namespace IronNestVR
             UpdatePeer();
             Receive();
             if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
-            if (Time.unscaledTime >= _nextStat)
-            {
-                _nextStat = Time.unscaledTime + 5f;
-                if (HasPeer || _sent > 0 || _recvd > 0)
-                {
-                    // Position diag: myCam = where THIS player actually is (ground truth); mySent = the head
-                    // pose we transmit; remHead = where we DRAW the peer. Cross-machine, one player's myCam
-                    // should match the other player's remHead — if not, the two worlds aren't aligned.
-                    Camera cam = null; try { cam = Camera.main; } catch { }
-                    string myCam = cam != null ? V(cam.transform.position) : "n/a";
-                    Log.LogInfo($"[p2p] peer={(HasPeer ? Peer.m_SteamID.ToString() : "none")} sent={_sent} recvd={_recvd} remoteValid={RemoteValid} myCam={myCam} mySent={V(LastSentHead)} remHead={V(HeadPos)} remHands={HasHands}");
-                }
-            }
+        }
+
+        // One-line status for the co-op diagnostics hub. Position diag: myCam = where THIS player actually is
+        // (ground truth); mySent = the head pose we transmit; remHead = where we DRAW the peer. Cross-machine,
+        // one player's myCam should match the other player's remHead — if not, the two worlds aren't aligned.
+        public static string Status()
+        {
+            Camera cam = null; try { cam = Camera.main; } catch { }
+            string myCam = cam != null ? V(cam.transform.position) : "n/a";
+            return $"net: {(SteamNet.InLobby ? "in-lobby" : "no-lobby")} peer={(HasPeer ? Peer.m_SteamID.ToString() : "none")} " +
+                   $"role={(IsHost ? "HOST" : "client")} sent={_sent} recvd={_recvd} | avatar valid={RemoteValid} hands={HasHands} " +
+                   $"remHead={V(HeadPos)} myCam={myCam} mySent={V(LastSentHead)}";
         }
 
         private static void UpdatePeer()

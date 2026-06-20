@@ -110,7 +110,9 @@ namespace IronNestVR
                             string applied; try { applied = s.TargetText != null ? s.TargetText.text : text; } catch { applied = text; }
                             _last[tag] = applied ?? "";
                             _echoUntil[tag] = now + 0.4f;
+                            Log.LogInfo($"[clip] applied section '{tag}' ({(text != null ? text.Length : 0)} chars) <- peer");
                         }
+                        else Log.LogWarning($"[clip] section '{tag}' not found locally (can't apply peer text)");
                     }
                     catch (Exception e) { Log.LogWarning("[clip] apply section: " + e.Message); }
                     break;
@@ -125,12 +127,36 @@ namespace IronNestVR
                         if (sel != null && idx >= 0)
                         {
                             var slots = sel.slots;
-                            if (slots != null && idx < slots.Count) { sel.SelectTool(slots[idx]); _lastTool = idx; }
+                            if (slots != null && idx < slots.Count) { sel.SelectTool(slots[idx]); _lastTool = idx; Log.LogInfo($"[clip] applied tool {idx} <- peer"); }
                         }
                     }
                     catch (Exception e) { Log.LogWarning("[clip] apply tool: " + e.Message); }
                     break;
                 }
+            }
+        }
+
+        // ---------------- diagnostics ----------------
+
+        public static string Status()
+        {
+            return $"clip: {_sections.Count} sections tracked, selector={_selector != null}, tool={_lastTool}";
+        }
+
+        public static void Dump()
+        {
+            Log.LogInfo("[clip] " + Status());
+            foreach (var s in _sections)
+            {
+                if (s == null) continue;
+                string tag, text;
+                try { tag = s.UnityTag; } catch { continue; }
+                if (string.IsNullOrEmpty(tag)) continue;
+                try { var tt = s.TargetText; text = tt != null ? tt.text : ""; } catch { text = "?"; }
+                int len = text != null ? text.Length : 0;
+                string preview = text == null ? "" : text.Replace("\n", "\\n");
+                if (preview.Length > 60) preview = preview.Substring(0, 60) + "…";
+                Log.LogInfo($"[clip]   '{tag}' ({len} chars): {preview}");
             }
         }
 

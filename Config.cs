@@ -47,6 +47,10 @@ namespace IronNestVR
         // per-player board pan don't desync them). Dynamic markers + mission entities are separate/later.
         public static bool CoopMapSync = true;
 
+        // How often (seconds) the co-op diagnostics hub logs its status block while in a lobby. Keep it
+        // frequent enough to be useful to testers but not so chatty it floods the log.
+        public static float CoopDiagIntervalSec = 4f;
+
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
         // gap several seconds during a freeze) — otherwise the avatar blinks out. Genuine disconnects clear it

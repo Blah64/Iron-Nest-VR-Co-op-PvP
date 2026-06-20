@@ -26,7 +26,17 @@ $gf    = "$pkg\game-files"
 New-Item -ItemType Directory -Force -Path $gf | Out-Null
 
 Copy-Item $readme "$pkg\README.md" -Force
-Copy-Item "$game\winhttp.dll","$game\doorstop_config.ini","$game\.doorstop_version" $gf -Force
+
+# Game-root files the tester needs:
+#  - doorstop loader (winhttp/doorstop_config/.doorstop_version)
+#  - openxr_loader.dll: the native OpenXR loader the VR layer P/Invokes via Silk.NET.
+#    It is NOT part of the base demo and must sit in the game root or VR won't init.
+$rootFiles = "winhttp.dll", "doorstop_config.ini", ".doorstop_version", "openxr_loader.dll"
+foreach ($f in $rootFiles) {
+    $p = Join-Path $game $f
+    if (-not (Test-Path $p)) { throw "required game-root file missing: $p" }
+    Copy-Item $p $gf -Force
+}
 
 # BepInEx tree minus the auto-generated interop/cache (regenerated on the tester's
 # first launch) and log files. dotnet = the CoreCLR runtime BepInEx loads the plugin with.

@@ -56,6 +56,10 @@ namespace IronNestVR
         private readonly Hand _right = new Hand();
         private readonly Hand _left = new Hand();
         private AssetBundle _bundle;
+        // Shared with RemoteAvatar so the remote player's hands reuse this single loaded bundle (loading the
+        // same bundle twice throws). Set once loaded, cleared on Dispose; Unload(false) keeps already-
+        // instantiated meshes alive, so a remote avatar built from it survives VR teardown.
+        internal static AssetBundle SharedBundle;
         private bool _bundleTried;
         private bool _built;
         private bool _dumpedBones;   // log the hand bone hierarchy only once
@@ -312,6 +316,7 @@ namespace IronNestVR
                 // NOTE: do NOT call LoadAllAssets()/LoadAsset(name,Type) here — those use the injected span path
                 // and throw GetPinnableReference in this build. We load each hand later via the generic
                 // LoadAsset<T>(name), which marshals the name the old (span-free) way. See LoadPrefab.
+                SharedBundle = _bundle;   // let RemoteAvatar reuse it for the remote player's hands
                 Log.LogInfo("[hands] bundle loaded OK.");
             }
             catch (Exception e) { Log.LogWarning("[hands] bundle load failed: " + e.Message); }
@@ -604,8 +609,8 @@ namespace IronNestVR
             try { if (_right.Root != null) UnityEngine.Object.Destroy(_right.Root); } catch { }
             try { if (_left.Root != null) UnityEngine.Object.Destroy(_left.Root); } catch { }
             _right.Root = null; _left.Root = null;
-            try { if (_bundle != null) _bundle.Unload(false); } catch { }
-            _bundle = null;
+            try { if (_bundle != null) _bundle.Unload(false); } catch { }   // false: keep instantiated meshes (incl. RemoteAvatar's) alive
+            _bundle = null; SharedBundle = null;
             _built = false; _bundleTried = false;
         }
     }

@@ -133,6 +133,7 @@ namespace IronNestVR
                     {
                         if (it.LocalOwned) { if (CoopP2P.IsHost) return; it.LocalOwned = false; }
                         it.RemoteOwned = true; it.RemoteUntil = now + StaleSec;
+                        Log.LogInfo($"[map] remote grabbed '{it.T.name}' <- peer");
                     }
                     break;
                 }
@@ -161,6 +162,7 @@ namespace IronNestVR
                         catch (Exception e) { Log.LogWarning("[map] place: " + e.Message); }
                         it.RemoteOwned = false; it.HasRemotePos = false;
                         ClearExternal(it);
+                        Log.LogInfo($"[map] applied remote place '{it.T.name}' (slot={(slotId != 0)}) <- peer");
                     }
                     break;
                 }
@@ -268,6 +270,25 @@ namespace IronNestVR
         private static void ClearOwnership()
         {
             foreach (var it in _items.Values) { it.LocalOwned = false; it.RemoteOwned = false; it.PrevDragging = false; it.HasRemotePos = false; ClearExternal(it); }
+        }
+
+        // ---------------- diagnostics ----------------
+
+        public static string Status()
+        {
+            int local = 0, remote = 0;
+            foreach (var it in _items.Values) { if (it.LocalOwned) local++; if (it.RemoteOwned) remote++; }
+            return $"map: {_items.Count} tokens, {_slots.Count} slots, boardRef={_ref != null}, owned local={local} remote={remote}";
+        }
+
+        public static void Dump()
+        {
+            Log.LogInfo("[map] " + Status());
+            foreach (var it in _items.Values)
+            {
+                if (it.LocalOwned) Log.LogInfo($"[map]   LOCAL-owned: '{it.T.name}'");
+                else if (it.RemoteOwned) Log.LogInfo($"[map]   remote-owned: '{it.T.name}' localPos={it.RemoteLocal}");
+            }
         }
 
         // ---------------- helpers ----------------

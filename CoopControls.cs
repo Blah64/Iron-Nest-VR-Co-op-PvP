@@ -328,6 +328,7 @@ namespace IronNestVR
                         }
                         c.RemoteOwned = true; c.RemoteUntil = now + StaleSec;
                         MarkGroupRemote(c.Grp, now);
+                        Log.LogInfo($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- peer");
                     }
                     else { _pendingGrab[id] = g; }
                     break;
@@ -336,7 +337,7 @@ namespace IronNestVR
                 {
                     if (len < 5) return;
                     int id = GetInt(a, ref o);
-                    if (_byId.TryGetValue(id, out var c)) { c.RemoteOwned = false; RecomputeGroupRemote(c.Grp); }
+                    if (_byId.TryGetValue(id, out var c)) { c.RemoteOwned = false; RecomputeGroupRemote(c.Grp); Log.LogInfo($"[ctrl] remote released '{c.T.name}' <- peer"); }
                     _pendingGrab.Remove(id);
                     break;
                 }
@@ -373,6 +374,7 @@ namespace IronNestVR
                     {
                         ReplayClick(c.Switch);
                         _echoUntil[id] = now + 0.3f;   // don't bounce our own replay back
+                        Log.LogInfo($"[ctrl] applied remote click '{c.T.name}' <- peer");
                     }
                     break;
                 }
@@ -381,7 +383,7 @@ namespace IronNestVR
                     if (len < 2) return;
                     byte side = a[o++];
                     var gun = side == 0 ? _gunL : _gunR;
-                    if (gun != null) { try { gun.RequestFire(); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
+                    if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
                     _echoUntil[side == 0 ? FireKeyL : FireKeyR] = now + 0.3f;
                     break;
                 }
@@ -409,6 +411,38 @@ namespace IronNestVR
                 else { sw.OnClickDown(); sw.OnClickUp(); }
             }
             catch (Exception e) { Log.LogWarning("[ctrl] replay click: " + e.Message); }
+        }
+
+        // ---------------- diagnostics ----------------
+
+        public static string Status()
+        {
+            int drag = 0, click = 0, local = 0, remote = 0;
+            foreach (var c in _byId.Values)
+            {
+                if (c.Switch != null) click++; else drag++;
+                if (c.LocalOwned) local++;
+                if (c.RemoteOwned) remote++;
+            }
+            int gOwn = 0; for (int g = 1; g < _grp.Length; g++) if (_grp[g].RemoteOwned) gOwn++;
+            return $"controls: {drag} drag + {click} click registered, owned local={local} remote={remote}, " +
+                   $"remote groups={gOwn}, guns L={_gunL != null} R={_gunR != null}, turret={_turret != null}";
+        }
+
+        public static void Dump()
+        {
+            Log.LogInfo("[ctrl] " + Status());
+            foreach (var c in _byId.Values)
+            {
+                if (c.LocalOwned) Log.LogInfo($"[ctrl]   LOCAL-owned: '{c.T.name}' (grp={c.Grp})");
+                else if (c.RemoteOwned) Log.LogInfo($"[ctrl]   remote-owned: '{c.T.name}' (grp={c.Grp})");
+            }
+            for (int g = 1; g < _grp.Length; g++)
+            {
+                var gs = _grp[g];
+                if (!gs.RemoteOwned && !gs.Has) continue;
+                Log.LogInfo($"[ctrl]   group {(Group)g}: remoteOwned={gs.RemoteOwned} has={gs.Has} v=[{gs.V[0]:0.0},{gs.V[1]:0.0},{gs.V[2]:0.0},{gs.V[3]:0.0},{gs.V[4]:0.0}]");
+            }
         }
 
         // ---------------- ownership queries (for HandManipulator refusal) ----------------
@@ -444,6 +478,7 @@ namespace IronNestVR
             if (c.Grp != Group.Other) SendGroupState(c.Grp);
             int o = 0; _buf[o++] = MSG_RELEASE; o = PutInt(o, c.NetId);
             CoopP2P.Send(_buf, o, true);
+            Log.LogInfo($"[ctrl] released '{c.T.name}' -> peer");
         }
 
         private static void SendClick(int netId)
