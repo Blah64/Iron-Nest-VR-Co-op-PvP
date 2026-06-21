@@ -35,6 +35,13 @@ namespace IronNestVR
         // throttled further. Set <= 0 to disable the cap (send every frame).
         public static float CoopSendHz = 30f;
 
+        // Co-op: max players per lobby — the Steam lobby member cap AND the count the host-relay transport fans
+        // out to. The avatar / control / map-token / ownership layers are all per-peer, so raising this works
+        // structurally. CAVEAT: >2 is compile-verified but not yet runtime-validated end-to-end (see PLAN.md §9);
+        // lower back to 2 if a >2 session misbehaves. Steam allows up to 250, but the single shared turret makes
+        // ~4 the practical ceiling.
+        public static int CoopMaxPlayers = 4;
+
         // Phase 3 co-op: replicate cockpit-control operation + turret/gun physical state between the two
         // lobby members (transient per-control ownership). Off = avatars-only (Phase 2). Reuses CoopSendHz
         // for the value/state stream rate.

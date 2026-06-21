@@ -565,6 +565,19 @@ namespace IronNestVR
         private static ulong PrimaryRemoteOrigin()
             => IsHost ? (_peers.Count > 0 ? _peers[0].m_SteamID : 0UL) : _hostId.m_SteamID;
 
+        // Deterministic grab-conflict winner shared by every per-control / per-token owner (CoopControls, CoopMap):
+        // the host beats any client; among the same class the lower SteamID wins. All machines compute the same
+        // result from (id, host id), so simultaneous grabs converge with no host grant/deny round-trip. Reduces to
+        // "host keeps, client yields" at the 2-player cap.
+        public static bool GrabBeats(ulong a, ulong b)
+        {
+            if (a == b) return false;
+            ulong host = _hostId.m_SteamID;
+            bool aHost = a == host, bHost = b == host;
+            if (aHost != bHost) return aHost;
+            return a < b;
+        }
+
         // Resolve a raw wire packet now sitting in _recvArr: derive origin + inner length, then Deliver. Host
         // ingress (client→host) has no trailer and origin = the Steam `from` (hostSideOrigin). Client ingress
         // (host→client) carries an 8-byte origin trailer we strip; hostSideOrigin is unused there.

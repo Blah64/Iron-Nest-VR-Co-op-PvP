@@ -583,11 +583,11 @@ namespace IronNestVR
                             // clients the lower SteamID wins). Every machine computes the same winner, so it
                             // converges with no grant/deny protocol. At the 2-player cap this is exactly "host
                             // keeps, client yields".
-                            if (GrabBeats(CoopP2P.MyId, origin)) return;   // I win — keep mine, ignore their grab
+                            if (CoopP2P.GrabBeats(CoopP2P.MyId, origin)) return;   // I win — keep mine, ignore their grab
                             c.LocalOwned = false;                          // I lose — yield
                         }
                         // Adopt the incoming owner unless a higher-priority remote owner already holds it (N>2).
-                        if (c.RemoteOwner == 0 || now >= c.RemoteUntil || c.RemoteOwner == origin || GrabBeats(origin, c.RemoteOwner))
+                        if (c.RemoteOwner == 0 || now >= c.RemoteUntil || c.RemoteOwner == origin || CoopP2P.GrabBeats(origin, c.RemoteOwner))
                         {
                             c.RemoteOwner = origin; c.RemoteUntil = now + StaleSec;
                             MarkGroupRemote(c.Grp, now);
@@ -703,7 +703,7 @@ namespace IronNestVR
                     else if (type == CoopScore.MSG_OUTCOME || type == CoopScore.MSG_OPSTATE) CoopScore.OnPacket(type, a, len);
                     else if (type == CoopImpact.MSG_IMPACT) CoopImpact.OnPacket(type, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
-                    else CoopMap.OnPacket(type, a, len);
+                    else CoopMap.OnPacket(type, origin, a, len);
                     break;
             }
         }
@@ -1034,19 +1034,6 @@ namespace IronNestVR
         }
 
         // ---------------- ownership bookkeeping ----------------
-
-        // Deterministic grab-conflict winner: the host beats any client; among the same class the lower SteamID
-        // wins. Every machine computes the same result from (id, host id), so simultaneous grabs converge with NO
-        // host grant/deny round-trip. At the 2-player cap this reduces exactly to "host keeps, client yields"
-        // (PLAN.md §9 deferred item 4, resolved).
-        private static bool GrabBeats(ulong a, ulong b)
-        {
-            if (a == b) return false;
-            ulong host = CoopP2P.HostSteamId;
-            bool aHost = a == host, bHost = b == host;
-            if (aHost != bHost) return aHost;
-            return a < b;
-        }
 
         private static void MarkGroupRemote(Group g, float now)
         {

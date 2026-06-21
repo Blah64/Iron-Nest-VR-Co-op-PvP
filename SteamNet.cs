@@ -30,7 +30,7 @@ namespace IronNestVR
         private const string ModKey = "invr_coop";   // lobby-data marker so the browser lists only our lobbies
         private const string ModVal = "1";
         private const string NameKey = "name";
-        private const int MaxMembers = 2;
+        private static int MaxMembers => Config.CoopMaxPlayers;   // lobby member cap (Config-driven; see CoopMaxPlayers)
 
         // Shared IL2CPP dispatcher, so pumping ourselves is safe. Flip off only if it ever proves otherwise.
         public static bool PumpCallbacks = true;

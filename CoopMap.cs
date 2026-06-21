@@ -81,7 +81,7 @@ namespace IronNestVR
             public Transform T;
             public bool LocalOwned;
             public bool PrevDragging;
-            public bool RemoteOwned;
+            public ulong RemoteOwner;       // SteamID of the peer dragging this token (0 = none)
             public float RemoteUntil;
             public bool HasRemotePos;
             public Vector3 RemoteLocal;     // board-local target position
@@ -290,7 +290,7 @@ namespace IronNestVR
 
                     if (dragging && !it.PrevDragging)
                     {
-                        if (!(it.RemoteOwned && now < it.RemoteUntil)) { it.LocalOwned = true; SendGrab(it.NetId); Log.LogInfo($"[map] grabbed '{it.T.name}' -> owner"); }
+                        if (!(it.RemoteOwner != 0 && now < it.RemoteUntil)) { it.LocalOwned = true; SendGrab(it.NetId); Log.LogInfo($"[map] grabbed '{it.T.name}' -> owner"); }
                     }
                     else if (!dragging && it.PrevDragging && it.LocalOwned)
                     {
@@ -300,7 +300,7 @@ namespace IronNestVR
                     it.PrevDragging = dragging;
 
                     if (it.LocalOwned && sendNow) SendPos(it);
-                    if (it.RemoteOwned && now >= it.RemoteUntil) { it.RemoteOwned = false; ClearExternal(it); }
+                    if (it.RemoteOwner != 0 && now >= it.RemoteUntil) { it.RemoteOwner = 0; ClearExternal(it); }
                 }
             }
             catch (Exception e) { Log.LogWarning("[map] tick: " + e.Message); }
@@ -314,7 +314,7 @@ namespace IronNestVR
             float now = Time.unscaledTime;
             foreach (var it in _items.Values)
             {
-                if (it.LocalOwned || !it.RemoteOwned || now >= it.RemoteUntil || !it.HasRemotePos || it.Token == null || it.T == null) continue;
+                if (it.LocalOwned || it.RemoteOwner == 0 || now >= it.RemoteUntil || !it.HasRemotePos || it.Token == null || it.T == null) continue;
                 try
                 {
                     if (!it.Token._externallyControlled) it.Token._externallyControlled = true;
@@ -326,7 +326,12 @@ namespace IronNestVR
 
         // ---------------- receive ----------------
 
-        public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
+        // origin = the SteamID that authored this packet (CoopP2P derives it from the Steam `from`, or the
+        // host-stamped trailer on a relayed packet). Used for PER-TOKEN draggable ownership so a release from
+        // player B can't free a token player C is holding, and a simultaneous grab is broken deterministically.
+        // Marker add/delete and 3D fire-mission piece moves are NOT per-token-owned (any player may add/delete/
+        // move and both sides propagate), so they ignore origin.
+        public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
             float now = Time.unscaledTime;
             int o = 1;
@@ -338,9 +343,20 @@ namespace IronNestVR
                     int id = GetInt(a, ref o);
                     if (_items.TryGetValue(id, out var it))
                     {
-                        if (it.LocalOwned) { if (CoopP2P.IsHost) return; it.LocalOwned = false; }
-                        it.RemoteOwned = true; it.RemoteUntil = now + StaleSec;
-                        Log.LogInfo($"[map] remote grabbed '{it.T.name}' <- peer");
+                        if (it.LocalOwned)
+                        {
+                            // Simultaneous grab: deterministic priority tie-break (host beats any client; among
+                            // clients the lower SteamID wins) so every machine converges with no grant/deny
+                            // protocol. At the 2-player cap this reduces to "host keeps, client yields".
+                            if (CoopP2P.GrabBeats(CoopP2P.MyId, origin)) return;   // I win — keep mine, ignore their grab
+                            it.LocalOwned = false;                          // I lose — yield
+                        }
+                        // Adopt the incoming owner unless a higher-priority remote owner already holds it (N>2).
+                        if (it.RemoteOwner == 0 || now >= it.RemoteUntil || it.RemoteOwner == origin || CoopP2P.GrabBeats(origin, it.RemoteOwner))
+                        {
+                            it.RemoteOwner = origin; it.RemoteUntil = now + StaleSec;
+                            Log.LogInfo($"[map] remote grabbed '{it.T.name}' <- {origin}");
+                        }
                     }
                     break;
                 }
@@ -349,7 +365,15 @@ namespace IronNestVR
                     if (len < 17) return;
                     int id = GetInt(a, ref o);
                     Vector3 p = GetV(a, ref o);
-                    if (_items.TryGetValue(id, out var it) && Finite(p)) { it.RemoteLocal = p; it.HasRemotePos = true; it.RemoteOwned = true; it.RemoteUntil = now + StaleSec; }
+                    if (_items.TryGetValue(id, out var it) && Finite(p))
+                    {
+                        // Adopt the streaming owner under the same priority guard as a grab (a POS can arrive
+                        // before/without its grab). Only refresh visuals/ownership for the held-or-winning origin.
+                        if (it.RemoteOwner == 0 || now >= it.RemoteUntil || it.RemoteOwner == origin || CoopP2P.GrabBeats(origin, it.RemoteOwner))
+                        {
+                            it.RemoteLocal = p; it.HasRemotePos = true; it.RemoteOwner = origin; it.RemoteUntil = now + StaleSec;
+                        }
+                    }
                     break;
                 }
                 case MSG_PLACE:
@@ -367,9 +391,10 @@ namespace IronNestVR
                                 slot.PlaceItem(it.Token);        // make a slot placement stick
                         }
                         catch (Exception e) { Log.LogWarning("[map] place: " + e.Message); }
-                        it.RemoteOwned = false; it.HasRemotePos = false;
-                        ClearExternal(it);
-                        Log.LogInfo($"[map] applied remote place '{it.T.name}' (slot={(slotId != 0)}) <- peer");
+                        // A place is a release: clear ownership ONLY if this origin is the current owner, so player
+                        // B's place can't free a token player C is holding (at the 2-player cap origin == owner).
+                        if (it.RemoteOwner == origin) { it.RemoteOwner = 0; it.HasRemotePos = false; ClearExternal(it); }
+                        Log.LogInfo($"[map] applied remote place '{it.T.name}' (slot={(slotId != 0)}) <- {origin}");
                     }
                     break;
                 }
@@ -379,10 +404,10 @@ namespace IronNestVR
                     int netId = GetInt(a, ref o);
                     string prefabName = GetStr(a, ref o, len);
                     if (o + 16 > len) return;
-                    Vector2 origin = new Vector2(GetF(a, ref o), GetF(a, ref o));
+                    Vector2 originLocal = new Vector2(GetF(a, ref o), GetF(a, ref o));   // marker geometry origin (not the packet author)
                     Vector2 target = new Vector2(GetF(a, ref o), GetF(a, ref o));   // ABSOLUTE endpoint = origin+tip
                     if (_markers.ContainsKey(netId)) return;   // already mirrored (dup / JIP re-send)
-                    SpawnMirror(netId, prefabName ?? "", origin, target);
+                    SpawnMirror(netId, prefabName ?? "", originLocal, target);
                     break;
                 }
                 case MSG_PIECE_MOVE:
@@ -783,7 +808,7 @@ namespace IronNestVR
                         // Same path id, but a scene reload gives it a NEW GameObject — re-bind a dead entry so
                         // the token registers against the live object (else it'd stay pointed at the destroyed one).
                         if (ex.Token == null || ex.T == null)
-                        { ex.Token = d; ex.T = tr; ex.LocalOwned = false; ex.RemoteOwned = false; ex.HasRemotePos = false; ex.PrevDragging = false; addedItems++; }
+                        { ex.Token = d; ex.T = tr; ex.LocalOwned = false; ex.RemoteOwner = 0; ex.HasRemotePos = false; ex.PrevDragging = false; addedItems++; }
                         continue;
                     }
                     _items[id] = new Item { NetId = id, Token = d, T = tr };
@@ -816,7 +841,7 @@ namespace IronNestVR
 
         private static void ClearOwnership()
         {
-            foreach (var it in _items.Values) { it.LocalOwned = false; it.RemoteOwned = false; it.PrevDragging = false; it.HasRemotePos = false; ClearExternal(it); }
+            foreach (var it in _items.Values) { it.LocalOwned = false; it.RemoteOwner = 0; it.PrevDragging = false; it.HasRemotePos = false; ClearExternal(it); }
             _draggingLocal.Clear();
             ClearMarkers(true);   // co-op ended → drop the peer's mirrored markers; locals re-detect on reconnect
         }
@@ -826,7 +851,7 @@ namespace IronNestVR
         public static string Status()
         {
             int local = 0, remote = 0;
-            foreach (var it in _items.Values) { if (it.LocalOwned) local++; if (it.RemoteOwned) remote++; }
+            foreach (var it in _items.Values) { if (it.LocalOwned) local++; if (it.RemoteOwner != 0) remote++; }
             int mLocal = 0, mRemote = 0;
             foreach (var m in _markers.Values) { if (m.IsLocal) mLocal++; else mRemote++; }
             return $"map: {_items.Count} tokens, {_slots.Count} slots, {_pieces.Count} pieces, owned local={local} remote={remote} | " +
@@ -839,7 +864,7 @@ namespace IronNestVR
             foreach (var it in _items.Values)
             {
                 if (it.LocalOwned) Log.LogInfo($"[map]   LOCAL-owned: '{it.T.name}'");
-                else if (it.RemoteOwned) Log.LogInfo($"[map]   remote-owned: '{it.T.name}' localPos={it.RemoteLocal}");
+                else if (it.RemoteOwner != 0) Log.LogInfo($"[map]   remote-owned: '{it.T.name}' by {it.RemoteOwner} localPos={it.RemoteLocal}");
             }
             foreach (var m in _markers.Values)
                 Log.LogInfo($"[map]   marker id={m.NetId} {(m.IsLocal ? "local" : "mirror")} prefab='{m.PrefabName}' dist={SafeF(m.Ui, true):0.0} ang={SafeF(m.Ui, false):0.0}");
