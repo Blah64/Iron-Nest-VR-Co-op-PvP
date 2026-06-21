@@ -552,6 +552,15 @@ namespace IronNestVR
                 || type == CoopScene.MSG_MISSION_READY;
         }
 
+        // Streaming packet types the host relays UNRELIABLE (high-rate, loss-tolerant). MSG_POSE is handled by
+        // CoopP2P. Everything else relays reliable so a lost grab/release/click/snapshot/edit isn't dropped.
+        public static bool IsUnreliableStream(byte type)
+        {
+            return type == MSG_VALUE || type == MSG_GROUP
+                || type == CoopMap.MSG_POS || type == CoopMap.MSG_PIECE_MOVE
+                || type == CoopEntities.MSG_MOVE;
+        }
+
         // origin = the SteamID that authored this packet (derived by CoopP2P from the Steam `from`, or the
         // host-stamped trailer on a relayed packet). Unused by the control handlers at the 2-player cap; Phase C
         // keys per-control ownership on it so a release from player B doesn't clear player C's lock.
@@ -570,16 +579,20 @@ namespace IronNestVR
                     {
                         if (c.LocalOwned)
                         {
-                            // Both grabbed the same control. Host-priority tie-break: host keeps it, client
-                            // yields. Correct for host-vs-client (the only conflict at the 2-player cap). NOTE:
-                            // client-vs-client conflicts (N>2) need host-arbitrated grant/deny — deferred to the
-                            // cap-lift (PLAN.md §9); with the optimistic tie-break both clients would yield.
-                            if (CoopP2P.IsHost) return;            // I'm host — ignore their grab, keep mine
-                            c.LocalOwned = false;                  // I'm client — yield to host
+                            // Simultaneous grab: deterministic priority tie-break (host beats any client; among
+                            // clients the lower SteamID wins). Every machine computes the same winner, so it
+                            // converges with no grant/deny protocol. At the 2-player cap this is exactly "host
+                            // keeps, client yields".
+                            if (GrabBeats(CoopP2P.MyId, origin)) return;   // I win — keep mine, ignore their grab
+                            c.LocalOwned = false;                          // I lose — yield
                         }
-                        c.RemoteOwner = origin; c.RemoteUntil = now + StaleSec;
-                        MarkGroupRemote(c.Grp, now);
-                        Log.LogInfo($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- {origin}");
+                        // Adopt the incoming owner unless a higher-priority remote owner already holds it (N>2).
+                        if (c.RemoteOwner == 0 || now >= c.RemoteUntil || c.RemoteOwner == origin || GrabBeats(origin, c.RemoteOwner))
+                        {
+                            c.RemoteOwner = origin; c.RemoteUntil = now + StaleSec;
+                            MarkGroupRemote(c.Grp, now);
+                            Log.LogInfo($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- {origin}");
+                        }
                     }
                     else { _pendingGrab[id] = origin; }
                     break;
@@ -1021,6 +1034,19 @@ namespace IronNestVR
         }
 
         // ---------------- ownership bookkeeping ----------------
+
+        // Deterministic grab-conflict winner: the host beats any client; among the same class the lower SteamID
+        // wins. Every machine computes the same result from (id, host id), so simultaneous grabs converge with NO
+        // host grant/deny round-trip. At the 2-player cap this reduces exactly to "host keeps, client yields"
+        // (PLAN.md §9 deferred item 4, resolved).
+        private static bool GrabBeats(ulong a, ulong b)
+        {
+            if (a == b) return false;
+            ulong host = CoopP2P.HostSteamId;
+            bool aHost = a == host, bHost = b == host;
+            if (aHost != bHost) return aHost;
+            return a < b;
+        }
 
         private static void MarkGroupRemote(Group g, float now)
         {

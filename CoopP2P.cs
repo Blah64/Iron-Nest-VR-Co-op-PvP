@@ -65,6 +65,7 @@ namespace IronNestVR
         // Role: the lobby owner is the host. Ownership tie-breaker (Phase 3) + sim-gating (Phase 4).
         public static bool IsHost;
         public static ulong MyId => _myId;
+        public static ulong HostSteamId => _hostId.m_SteamID;   // lobby owner; used by the grab priority tie-break
 
         // Per-peer remote pose (world space), keyed by the authoring SteamID (Phase B). RemoteAvatar pools one
         // rig per entry, so >2 avatars render. Replaces the single-slot block. The F6 solo render test injects
@@ -102,6 +103,7 @@ namespace IronNestVR
         // session up so the snapshot isn't dropped by the receive-side peer gate. Cleared if the peer leaves.
         private static float _snapAt;
         private static CSteamID _snapTarget;   // the freshly-joined peer the pending snapshot is for
+        private static bool _snapActive;       // while true, host Send unicasts to _snapTarget (JIP), not broadcast
 
         public static void Init()
         {
@@ -349,12 +351,21 @@ namespace IronNestVR
         private static void SendJoinSnapshot()
         {
             if (_peers.Count == 0 || !IsHost) return;
-            Log.LogInfo("[p2p] host: sending join-in-progress snapshot to new peer");
-            try { CoopControls.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ctrl: " + e.Message); }
-            try { CoopClipboard.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot clip: " + e.Message); }
-            try { CoopMap.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot map: " + e.Message); }
-            try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
-            try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
+            Log.LogInfo($"[p2p] host: sending join-in-progress snapshot to {_snapTarget.m_SteamID}");
+            // Redirect every subsystem snapshot send to the JOINER only — a late-join catch-up must not replay
+            // onto the existing clients and snap their turret/clipboard/mission state (PLAN.md §2.4 / §3A). The
+            // subsystems still call CoopP2P.Send; while _snapActive the host unicasts it to _snapTarget. At the
+            // 2-player cap the lone peer is the joiner, so this is identical to the old broadcast.
+            _snapActive = true;
+            try
+            {
+                try { CoopControls.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ctrl: " + e.Message); }
+                try { CoopClipboard.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot clip: " + e.Message); }
+                try { CoopMap.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot map: " + e.Message); }
+                try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
+                try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
+            }
+            finally { _snapActive = false; }
         }
 
         public static void SendPose(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr,
@@ -405,6 +416,7 @@ namespace IronNestVR
             {
                 if (IsHost)
                 {
+                    if (_snapActive) { bool oks = RawSendTrailer(_snapTarget, buf, len, reliable, _myId); if (oks) _sent++; return oks; }   // JIP: unicast to the joiner
                     bool any = false;
                     foreach (var p in _peers) any |= RawSendTrailer(p, buf, len, reliable, _myId);
                     if (any) _sent++;
@@ -430,14 +442,17 @@ namespace IronNestVR
         // Host relay: re-broadcast a client-authored packet (sitting in _recvArr[0..len]) to every OTHER client,
         // stamped with the original sender's id. Fired from Deliver (= at NetSim release), never at raw receive,
         // so the host's local apply and its relay are ordered from the same event (PLAN.md §8.2). Dormant at the
-        // 2-player cap (the only peer == origin → excluded). Relayed reliable for now (TODO: mirror the unreliable
-        // classes — pose/value/group — when the cap is lifted, to keep the high-rate streams non-blocking).
+        // 2-player cap (the only peer == origin → excluded). The high-rate streams (pose / dial value / turret
+        // group / map drag / entity move) relay UNRELIABLE so they don't head-of-line-block; everything else
+        // (grab/release/click/fire/snapshots/edits) relays reliable.
         private static void RelayInner(ulong origin, int innerLen)
         {
+            byte type = _recvArr[0];
+            bool reliable = !(type == MSG_POSE || CoopControls.IsUnreliableStream(type));
             for (int i = 0; i < _peers.Count; i++)
             {
                 if (_peers[i].m_SteamID == origin) continue;
-                RawSendTrailer(_peers[i], _recvArr, innerLen, true, origin);
+                RawSendTrailer(_peers[i], _recvArr, innerLen, reliable, origin);
             }
         }
 
