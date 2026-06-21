@@ -40,9 +40,9 @@ namespace IronNestVR
         private static ManualLogSource Log => Plugin.Logger;
 
         public const byte MSG_SPAWN = 16;    // [t][key i32][id str][name str][icon str][role i32][pos 3f][state i32][hp i32][maxHp i32][armour i32][stars i32][scale i32]  reliable
-        public const byte MSG_UPDATE = 17;   // [t][key i32][pos 3f][state i32][hp i32]   RELIABLE — only on discrete state/hp change
+        public const byte MSG_UPDATE = 17;   // [t][key i32][seq i32][pos 3f][state i32][hp i32]  RELIABLE — discrete state/hp change OR periodic position keyframe (REVIEW-fix P2)
         public const byte MSG_DESPAWN = 18;  // [t][key i32]                              reliable
-        public const byte MSG_MOVE = 23;     // [t][key i32][pos 3f]                      UNRELIABLE — position-only stream
+        public const byte MSG_MOVE = 23;     // [t][key i32][seq i32][pos 3f]            UNRELIABLE — position stream; per-entity seq drops late/reordered moves (REVIEW-fix P2)
         // REVIEW-fix (P1): movement is a SEPARATE position-only packet so a reordered/stale unreliable move can
         // never carry old state/hp and roll back a newer reliable damage/death. Discrete state/hp travels ONLY
         // on the reliable+ordered MSG_UPDATE; MSG_MOVE touches position alone (self-correcting next frame).
@@ -53,6 +53,8 @@ namespace IronNestVR
             public Vector3 Pos;
             public int State;
             public int Health;
+            public int Seq;            // REVIEW-fix (P2): per-entity monotonic seq across move+update (position ordering)
+            public float LastKeyframe; // last time we sent a reliable position keyframe for this entity
         }
 
         private sealed class Mirror
@@ -64,6 +66,7 @@ namespace IronNestVR
             public MapEntity Entity;
             public bool IsClone;          // we instantiated it (destroy on despawn) vs adopted a scene entity
             public int LastState;
+            public int LastSeq;           // REVIEW-fix (P2): highest position seq applied (drops late/reordered moves)
         }
 
         // Host: last broadcast state per entity (diff source). Client: live mirrors.
@@ -71,6 +74,9 @@ namespace IronNestVR
         private static readonly Dictionary<int, Mirror> _mirrors = new Dictionary<int, Mirror>();
         private static readonly List<int> _toRemove = new List<int>();
         private static readonly HashSet<int> _seen = new HashSet<int>();
+
+        // Desync detector: entities this side currently tracks (host = broadcast set, client = mirrors); should match.
+        public static int LocalEntityCount => CoopP2P.IsHost ? _sent.Count : _mirrors.Count;
 
         // Spawns that arrived before a clone template was available (a gated client just entered the mission scene
         // and hasn't found anything to clone yet). The host diff-sends each entity exactly ONCE, so a dropped SPAWN
@@ -144,14 +150,23 @@ namespace IronNestVR
                 if (!_sent.TryGetValue(key, out var s))
                 {
                     SendSpawn(key, e);
-                    _sent[key] = new SentState { ID = id, Pos = pos, State = state, Health = hp };
+                    _sent[key] = new SentState { ID = id, Pos = pos, State = state, Health = hp, Seq = 0, LastKeyframe = now };
                 }
                 else
                 {
                     bool discrete = s.State != state || s.Health != hp;
                     bool moved = (s.Pos - pos).sqrMagnitude > MoveEpsilonSq;
-                    if (discrete) { SendUpdate(key, pos, state, hp); s.State = state; s.Health = hp; s.Pos = pos; Log.LogInfo($"[ent] '{s.ID}' state/hp -> peer (state={state} hp={hp})"); }
-                    else if (moved) { SendMove(key, pos); s.Pos = pos; }
+                    // REVIEW-fix (P2): a reliable position keyframe every CoopEntityKeyframeSec bounds drift after a
+                    // lost unreliable move; a discrete state/hp change is itself a reliable keyframe (carries pos+seq),
+                    // so fold them together. Plain moves stay unreliable in between. Every send bumps the shared seq.
+                    bool keyframe = Config.CoopEntityKeyframeSec > 0f && now - s.LastKeyframe >= Config.CoopEntityKeyframeSec;
+                    if (discrete || keyframe)
+                    {
+                        s.Seq++; SendUpdate(key, pos, state, hp, s.Seq);
+                        if (discrete) Log.LogInfo($"[ent] '{s.ID}' state/hp -> peer (state={state} hp={hp})");
+                        s.State = state; s.Health = hp; s.Pos = pos; s.LastKeyframe = now;
+                    }
+                    else if (moved) { s.Seq++; SendMove(key, pos, s.Seq); s.Pos = pos; }
                 }
             }
 
@@ -234,20 +249,26 @@ namespace IronNestVR
                 }
                 case MSG_UPDATE:
                 {
-                    if (len < 1 + 4 + 12 + 4 + 4) return;
+                    if (len < 1 + 4 + 4 + 12 + 4 + 4) return;
                     int key = GetInt(a, ref o);
+                    int seq = GetInt(a, ref o);
                     Vector3 pos = GetV(a, ref o);
                     int state = GetInt(a, ref o);
                     int hp = GetInt(a, ref o);
-                    if (_mirrors.TryGetValue(key, out var m)) ApplyUpdate(m, pos, state, hp);
+                    // Reliable+ordered: always apply state/hp/pos, and advance the position seq so an older unreliable
+                    // move delivered late is dropped instead of yanking the entity back (REVIEW-fix P2).
+                    if (_mirrors.TryGetValue(key, out var m)) { ApplyUpdate(m, pos, state, hp); if (seq > m.LastSeq) m.LastSeq = seq; }
                     break;
                 }
                 case MSG_MOVE:
                 {
-                    if (len < 1 + 4 + 12) return;
+                    if (len < 1 + 4 + 4 + 12) return;
                     int key = GetInt(a, ref o);
+                    int seq = GetInt(a, ref o);
                     Vector3 pos = GetV(a, ref o);
-                    if (_mirrors.TryGetValue(key, out var m)) ApplyMove(m, pos);   // position only — never touches state/hp
+                    // Drop a stale/reordered move so a late unreliable packet can't settle the entity at an old
+                    // position (REVIEW-fix P2). Position-only either way — never touches state/hp.
+                    if (_mirrors.TryGetValue(key, out var m) && seq > m.LastSeq) { ApplyMove(m, pos); m.LastSeq = seq; }
                     break;
                 }
                 case MSG_DESPAWN:
@@ -409,19 +430,21 @@ namespace IronNestVR
             Log.LogInfo($"[ent] spawn '{id}' -> peer (role={role} hp={hp}/{maxHp} state={state})");
         }
 
-        // Discrete state/hp change — ALWAYS reliable (and Steam-ordered), so it can't be overtaken by a stale move.
-        private static void SendUpdate(int key, Vector3 pos, int state, int hp)
+        // Discrete state/hp change OR periodic position keyframe — ALWAYS reliable (and Steam-ordered), so it can't
+        // be overtaken by a stale move. Carries the shared position seq so the client can order it against moves.
+        private static void SendUpdate(int key, Vector3 pos, int state, int hp, int seq)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_UPDATE; o = PutInt(o, key); o = PutV(o, pos); o = PutInt(o, state); o = PutInt(o, hp);
+            int o = 0; _buf[o++] = MSG_UPDATE; o = PutInt(o, key); o = PutInt(o, seq); o = PutV(o, pos); o = PutInt(o, state); o = PutInt(o, hp);
             CoopP2P.Send(_buf, o, true);
         }
 
-        // High-rate position stream — unreliable, position only (no state/hp), per REVIEW-fix P1.
-        private static void SendMove(int key, Vector3 pos)
+        // High-rate position stream — unreliable, position only (no state/hp). Per-entity seq lets the receiver
+        // drop a late/reordered move (REVIEW-fix P1/P2).
+        private static void SendMove(int key, Vector3 pos, int seq)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_MOVE; o = PutInt(o, key); o = PutV(o, pos);
+            int o = 0; _buf[o++] = MSG_MOVE; o = PutInt(o, key); o = PutInt(o, seq); o = PutV(o, pos);
             CoopP2P.Send(_buf, o, false);
         }
 

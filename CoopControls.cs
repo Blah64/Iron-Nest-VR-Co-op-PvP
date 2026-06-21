@@ -54,6 +54,7 @@ namespace IronNestVR
         private const byte MSG_CLICK = 6;    // [t][netId i32]               reliable   LookAtTarget click
         private const byte MSG_FIRE = 7;     // [t][side u8]                 reliable   gun discharge (0=L,1=R)
         private const byte MSG_SNAP = 13;    // [t][9×f32]                   reliable   join-in-progress turret/gun state
+        private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
 
         // How long remote ownership / streamed state survives without a refresh. The stream runs at
         // CoopSendHz (~30/s), so 2s easily rides minor packet loss but recovers fast if the peer vanishes
@@ -112,6 +113,7 @@ namespace IronNestVR
         private static int _turretIid = -1;
         private static float _nextScan;
         private static float _nextSend;
+        private static float _nextRecon;   // host: next current-state reconcile broadcast (REVIEW-fix P3)
 
         // Reusable send buffer (control packets are tiny: 1+4+4 max). Lazily created on the Unity thread.
         private static Il2CppStructArray<byte> _buf;
@@ -194,6 +196,14 @@ namespace IronNestVR
                     if (_grp[g].RemoteOwned && now >= _grp[g].Until) _grp[g].RemoteOwned = false;
 
                 DetectFire(now);
+
+                // REVIEW-fix (P3): host broadcasts a low-rate CURRENT-state reconcile so the client can correct any
+                // accumulated CurrentAngle/elevation drift (framerate-dependent slew, a missed reliable packet).
+                if (CoopP2P.IsHost && Config.CoopTurretReconcile && now >= _nextRecon)
+                {
+                    _nextRecon = now + Mathf.Max(0.25f, Config.CoopTurretReconcileSec);
+                    SendRecon();
+                }
             }
             catch (Exception e) { Log.LogWarning("[ctrl] tick: " + e.Message); }
         }
@@ -394,6 +404,62 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[ctrl] apply snapshot: " + e.Message); }
         }
 
+        // ---------------- current-state reconcile (REVIEW-fix P3) ----------------
+
+        // Host → client: the CURRENT turret/gun physical state, broadcast on a low-rate reliable heartbeat. Same
+        // 9-float layout as the JIP snapshot, but a SEPARATE type so the client applies it softly (drift-gated)
+        // rather than hard-snapping like a join.
+        private static void SendRecon()
+        {
+            if (_turret == null || !EnsureBuf()) return;
+            try
+            {
+                int o = 0; _buf[o++] = MSG_RECON;
+                o = PutFloat(o, _turret.DesiredRotation);
+                o = PutFloat(o, _turret.CurrentAngle);
+                o = PutFloat(o, _turret.DesiredElevation);
+                o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
+                o = PutFloat(o, _gunL != null ? _gunL.CurrentElevation : 0f);
+                o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
+                o = PutFloat(o, _gunR != null ? _gunR.CurrentElevation : 0f);
+                o = PutFloat(o, _gunL != null ? _gunL.PowderCharges : 0f);
+                o = PutFloat(o, _gunR != null ? _gunR.PowderCharges : 0f);
+                CoopP2P.Send(_buf, o, true);
+            }
+            catch (Exception e) { Log.LogWarning("[ctrl] send recon: " + e.Message); }
+        }
+
+        // Client: keep DESIRED aim in sync (cheap, idempotent), and snap CURRENT angle/elevation to the host's only
+        // when drift exceeds the tolerance — so a converged turret never twitches, but a drifted one is pulled back.
+        // Skips any group the client is operating right now (the player's hand always wins; symmetric live drive is
+        // untouched). Powder is set to the host value regardless (discrete, no slew).
+        private static void ApplyRecon(float[] v)
+        {
+            float tol = Mathf.Max(0.1f, Config.CoopTurretReconcileTolDeg);
+            try
+            {
+                if (!LocallyOwnsGroup(Group.Rotation) && Finite(v[0]) && Finite(v[1]))
+                {
+                    _turret.DesiredRotation = v[0];
+                    if (Mathf.Abs(Mathf.DeltaAngle(_turret.CurrentAngle, v[1])) > tol)
+                    {
+                        _turret.CurrentAngle = v[1];
+                        try { _turret.ApplyRotationToTransforms(); } catch { }
+                        Log.LogInfo($"[ctrl] reconciled rotation -> {v[1]:0.0} (drift>{tol:0.0}deg) <- host");
+                    }
+                }
+                if (!LocallyOwnsGroup(Group.Elevation))
+                {
+                    if (Finite(v[2])) _turret.DesiredElevation = v[2];
+                    if (_gunL != null && Finite(v[3]) && Finite(v[4])) { _gunL.DesiredElevationAngle = v[3]; if (Mathf.Abs(_gunL.CurrentElevation - v[4]) > tol) _gunL.CurrentElevation = v[4]; }
+                    if (_gunR != null && Finite(v[5]) && Finite(v[6])) { _gunR.DesiredElevationAngle = v[5]; if (Mathf.Abs(_gunR.CurrentElevation - v[6]) > tol) _gunR.CurrentElevation = v[6]; }
+                }
+                if (_gunL != null && !LocallyOwnsGroup(Group.GunLeft)) { int p = Mathf.RoundToInt(v[7]); try { if (_gunL.PowderCharges != p) _gunL.SetPowderCharge(p); } catch { } }
+                if (_gunR != null && !LocallyOwnsGroup(Group.GunRight)) { int p = Mathf.RoundToInt(v[8]); try { if (_gunR.PowderCharges != p) _gunR.SetPowderCharge(p); } catch { } }
+            }
+            catch (Exception e) { Log.LogWarning("[ctrl] apply recon: " + e.Message); }
+        }
+
         // ---------------- receive ----------------
 
         public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
@@ -508,12 +574,21 @@ namespace IronNestVR
                     else _pendingSnap = v;                    // … else stash for Tick once the registry resolves
                     break;
                 }
+                case MSG_RECON:
+                {
+                    if (len < 1 + 9 * 4 || CoopP2P.IsHost || _turret == null) return;   // client applies; needs a turret
+                    var v = new float[9];
+                    for (int i = 0; i < 9; i++) v[i] = GetFloat(a, ref o);
+                    ApplyRecon(v);
+                    break;
+                }
                 default:
                     // Other co-op subsystems share the same P2P channel; forward by type.
                     if (type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL) CoopClipboard.OnPacket(type, a, len);
                     else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN || type == CoopEntities.MSG_MOVE) CoopEntities.OnPacket(type, a, len);
                     else if (type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY) CoopScene.OnPacket(type, a, len);
                     else if (type == CoopOrders.MSG_ORDER) CoopOrders.OnPacket(type, a, len);
+                    else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
                     else CoopMap.OnPacket(type, a, len);
                     break;
             }
@@ -583,6 +658,32 @@ namespace IronNestVR
                     return e.RemoteOwned && now < e.RemoteUntil;
             }
             return false;
+        }
+
+        // ---------------- desync-detector hooks (CoopNetDiag) ----------------
+
+        // True if the local player is operating any control right now, so the detector can skip the turret-angle
+        // comparison while someone is actively slewing (that legitimately diverges across a laggy link).
+        public static bool AnyLocalOwnership
+        {
+            get { foreach (var c in _byId.Values) if (c.LocalOwned) return true; return false; }
+        }
+
+        // Snapshot the convergent turret/gun CURRENT state for the digest. False if no turret is resolved.
+        public static bool TryGetTurretDigest(out float rot, out float elevL, out float elevR, out int powderL, out int powderR)
+        {
+            rot = elevL = elevR = 0f; powderL = powderR = 0;
+            var t = _turret; if (t == null) return false;
+            try
+            {
+                rot = t.CurrentAngle;
+                elevL = _gunL != null ? _gunL.CurrentElevation : 0f;
+                elevR = _gunR != null ? _gunR.CurrentElevation : 0f;
+                powderL = _gunL != null ? _gunL.PowderCharges : 0;
+                powderR = _gunR != null ? _gunR.PowderCharges : 0;
+                return true;
+            }
+            catch { return false; }
         }
 
         // ---------------- send ----------------

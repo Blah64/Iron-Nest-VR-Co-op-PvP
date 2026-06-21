@@ -74,6 +74,11 @@ namespace IronNestVR
         // mission (GamePhase.MissionActive) so the hub is untouched. Needs CoopSimAuthority on (gated client).
         public static bool CoopEntitySync = true;
 
+        // REVIEW-fix (P2): how often (seconds) the host re-sends each entity's position on the RELIABLE channel as a
+        // keyframe, so a lost unreliable move self-heals within this bound instead of leaving the mirror stale. A
+        // discrete state/hp change counts as a keyframe too (already reliable). 0 disables periodic keyframes.
+        public static float CoopEntityKeyframeSec = 3f;
+
         // Phase 4 co-op (4b keystone): replicate the mission/scene transition so both players are co-located.
         // The HOST broadcasts its own phase changes (→MissionActive / back out); the CLIENT follows by driving
         // its own OperationLoadRelay.StartAssignedOperation() / ReturnToMap(). Without this, the host starting a
@@ -90,6 +95,24 @@ namespace IronNestVR
         // Scoped to an active mission. See CoopOrders / CoopSim.
         public static bool CoopOrdersSync = true;
 
+        // REVIEW-fix (P3): turret CURRENT-state reconcile. Both machines slew their turret locally toward the shared
+        // DESIRED aim so they normally converge — but a lost reliable packet or framerate-dependent slew can leave
+        // CurrentAngle/CurrentElevation drifting. The HOST periodically broadcasts its current turret/gun state; the
+        // client snaps a group to it ONLY when it isn't operating that group itself and the drift exceeds the
+        // tolerance, so it never fights the player's hand or jumps during normal play. Active only with a peer.
+        public static bool CoopTurretReconcile = true;
+        public static float CoopTurretReconcileSec = 2.5f;     // how often the host broadcasts current turret state
+        public static float CoopTurretReconcileTolDeg = 1.5f;  // min drift (deg) before the client corrects
+
+        // REVIEW-fix (desync detector): each side periodically exchanges a quantized digest of convergent state
+        // (turret aim/elevation/powder + mirrored entity/marker counts) and logs when a field stays divergent for
+        // CoopDesyncPersist consecutive digests — surfacing the silent desyncs latency/loss cause. Diagnostic only
+        // (it logs; never changes gameplay). Active only with a peer. See CoopNetDiag.
+        public static bool CoopDesyncDetect = true;
+        public static float CoopDesyncIntervalSec = 1f;
+        public static float CoopDesyncAngleTolDeg = 2.5f;
+        public static int CoopDesyncPersist = 3;
+
         // --- Co-op LOCAL TEST transport (same-machine, no second Steam account/PC) ---
         // TEST AID ONLY. When on, the Ctrl+F1/F2/F3 keys can stand up a localhost TCP link between two game
         // instances on ONE machine, bypassing Steam entirely so the whole co-op stack (avatars, control /
@@ -99,6 +122,35 @@ namespace IronNestVR
         //   Ctrl+F1 = host (instance A)   Ctrl+F2 = join 127.0.0.1 (instance B)   Ctrl+F3 = stop
         public static bool CoopLoopback = true;
         public static int CoopLoopbackPort = 56561;
+
+        // Same-machine test: keep each instance in a WINDOW of this size while a loopback link is up. Two
+        // standalone instances can't both hold Windows EXCLUSIVE fullscreen on one display, so when the host
+        // grabs it on a mission scene-load the background client gets knocked to a tiny resolution. Forcing a
+        // plain window sidesteps that. Defaults match the rig in use (two windowed 2560x1080). Set
+        // CoopTestForceWindow=false to leave the game's own window handling alone, or change W/H for another size.
+        // Active ONLY while connected via the loopback test transport → zero effect on a normal flatscreen player.
+        public static bool CoopTestForceWindow = true;
+        public static int CoopTestWindowW = 2560;
+        public static int CoopTestWindowH = 1080;
+
+        // --- Co-op NETSIM: artificial WAN conditions on the INGRESS path (TEST AID; off by default) ---
+        // Loopback (and a same-room LAN) hides the desyncs real distance causes — zero latency/loss. Turn this on
+        // to inject latency/jitter/loss/dup/reorder/bandwidth/link-drops at the RECEIVE side, so the sync code and
+        // the desync detector get a realistic beating from your desk. Shapes ONE side's ingress (Side) so the link
+        // is lopsided like a real one. Loss/dup/reorder hit UNRELIABLE packets only (Steam retransmits reliable
+        // ones); reliable packets are delayed/queued, never dropped — except during a simulated link-drop, which
+        // blacks out ALL ingress for a window (exercises reconnect/resync). Off => completely inert. See CoopNetSim.
+        public static bool CoopNetSim = false;
+        public static int CoopNetSimLatencyMs = 120;       // base one-way added delay
+        public static int CoopNetSimJitterMs = 40;         // uniform extra 0..this added per packet
+        public static float CoopNetSimLossPct = 3f;        // unreliable drop chance (%)
+        public static float CoopNetSimDupPct = 1f;         // unreliable duplicate chance (%)
+        public static float CoopNetSimReorderPct = 3f;     // unreliable extra-delay (reorder) chance (%)
+        public static int CoopNetSimBandwidthBps = 0;      // 0 = unlimited; e.g. 32000 ≈ 256 kbit/s (bufferbloat under load)
+        public static int CoopNetSimSeed = 12345;          // deterministic RNG so a failing run reproduces
+        public static int CoopNetSimSide = 2;              // whose ingress to shape: 0=both, 1=host, 2=client (default)
+        public static float CoopNetSimDropEverySec = 0f;   // 0 = never; else simulate a link drop this often …
+        public static float CoopNetSimDropForSec = 3f;     // … lasting this long (ingress blackout → reconnect/resync test)
 
         // --- Co-op presence niceties (avatar polish) ---
         // Pop a short, non-focus-pulling toast when a peer joins/leaves the lobby (so it's obvious someone

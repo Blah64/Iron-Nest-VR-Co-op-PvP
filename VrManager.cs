@@ -126,6 +126,33 @@ namespace IronNestVR
             }
         }
 
+        // Same-machine test ONLY (runs while a loopback link is up — never for a normal flatscreen player, who
+        // never connects it, so flatscreen parity is preserved). Two standalone instances can't both hold
+        // EXCLUSIVE fullscreen on one display: when the host (re)grabs it — e.g. on a mission scene load — the
+        // background client is knocked out of the display mode and Unity drops it to a tiny resolution (the
+        // "client window shrank when the host launched the mission" report). We call SetResolution NOWHERE else;
+        // the game owns it. Fix: keep this instance in a plain WINDOW at the configured Coop test size (the rig
+        // runs two windowed 2560x1080), which never contends for the exclusive display. Re-applies only on drift
+        // (≤1×/s) — so after one correction it goes quiet, and a deliberate same-size window is left untouched.
+        private void KeepWindowedForTest()
+        {
+            if (!Config.CoopLoopback || !Config.CoopTestForceWindow) return;
+            try
+            {
+                int wantW = Config.CoopTestWindowW, wantH = Config.CoopTestWindowH;
+                if (wantW <= 0 || wantH <= 0) return;
+                var mode = Screen.fullScreenMode;
+                int w = Screen.width, h = Screen.height;
+                bool drift = mode != FullScreenMode.Windowed || Mathf.Abs(w - wantW) > 8 || Mathf.Abs(h - wantH) > 8;
+                if (drift)
+                {
+                    Screen.SetResolution(wantW, wantH, FullScreenMode.Windowed);
+                    Log.LogInfo($"[loop] forced windowed {wantW}x{wantH} (was mode={mode} {w}x{h}) — avoids the 2-instance exclusive-fullscreen resize");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[loop] window mode: " + e.Message); }
+        }
+
         private bool _loggedEnv;
         // One-time environment banner so a tester's log self-proves the two things that decide the D3D
         // race hypothesis — the launch options actually applied, and the real graphics threading mode —
@@ -171,7 +198,8 @@ namespace IronNestVR
             if (LoopbackTransport.Active && Time.unscaledTime >= _loopDiagNext)
             {
                 _loopDiagNext = Time.unscaledTime + 1f;
-                try { Log.LogInfo($"[loop] state focused={Application.isFocused} runInBackground={Application.runInBackground} timeScale={Time.timeScale:0.##} connected={LoopbackTransport.Connected}"); } catch { }
+                KeepWindowedForTest();   // stop the 2-instance exclusive-fullscreen fight that shrinks the bg window on scene load
+                try { Log.LogInfo($"[loop] state focused={Application.isFocused} runInBackground={Application.runInBackground} timeScale={Time.timeScale:0.##} mode={Screen.fullScreenMode} res={Screen.width}x{Screen.height} connected={LoopbackTransport.Connected}"); } catch { }
             }
             CoopP2P.Tick(Time.unscaledDeltaTime);
             CoopControls.Tick(Time.unscaledDeltaTime);   // Phase 3: detect local control drags + transmit
@@ -179,6 +207,7 @@ namespace IronNestVR
             CoopMap.Tick(Time.unscaledDeltaTime);        // Phase 3: replicate tactical-map token placements
             CoopEntities.Tick(Time.unscaledDeltaTime);   // Phase 4: replicate host mission entities to the client
             CoopScene.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate mission/scene transitions (host drives)
+            CoopNetDiag.Tick(Time.unscaledDeltaTime);    // REVIEW-fix: cross-machine desync detector (diagnostic only)
             if (!_xrReady)
             {
                 var fcam = Camera.main;

@@ -48,7 +48,7 @@ namespace IronNestVR
         public const byte MSG_PLACE = 12;       // [t][itemId i32][x,y,z f32][slotId i32]   reliable
         public const byte MSG_MARKER_ADD = 14;  // [t][netId i32][prefabName str][oX,oY,tX,tY f32] reliable  (13 = ctrl JIP snap) — (tX,tY)=ABSOLUTE target = origin+tip
         public const byte MSG_MARKER_DEL = 15;  // [t][netId i32]                           reliable
-        public const byte MSG_PIECE_MOVE = 24;  // [t][pieceId i32][pos 3f][rot 4f]         reliable  — MapPiece3D world transform on drag-end (reference-style)
+        public const byte MSG_PIECE_MOVE = 24;  // [t][pieceId i32][seq i32][flags u8][pos 3f][rot 4f]  — live=unreliable, final(flags&1)=reliable; per-piece seq drops late/reordered live moves (REVIEW-fix P1)
 
         // Harmony: fire-mission MAP PIECES (MapPiece3D) and LINES (MapMarkerLineUI) are driven by the game's own
         // drag/finalize methods, not a pollable list — so we hook them (matching the working reference co-op mod)
@@ -61,7 +61,18 @@ namespace IronNestVR
         private static float _nextDelScan;   // throttle for marker delete-detection poll
         private static float _nextAddScan;   // throttle for marker ADD-detection poll (hook-independent backstop)
 
+        // REVIEW-fix (P1): per-piece monotonic sequence so a late/reordered unreliable LIVE drag move can't
+        // overwrite the reliable drag-end FINAL (or a newer live move). The sender stamps an increasing seq per
+        // piece id; the receiver applies a move only if its seq beats the last it applied for that piece. The
+        // FINAL always carries the highest seq of its drag, so once applied no older live move can move it back.
+        // Cleared when the link drops so a reconnect's fresh low seqs aren't rejected by stale high water-marks.
+        private static readonly Dictionary<int, int> _pieceSeqOut = new Dictionary<int, int>();   // sender: next seq per piece
+        private static readonly Dictionary<int, int> _pieceSeqIn = new Dictionary<int, int>();    // receiver: last applied seq per piece
+
         private const float StaleSec = 2f;
+
+        // Desync detector: how many bearing/range markers this side currently tracks (should match the peer).
+        public static int MarkerCount => _markers.Count;
 
         private sealed class Item
         {
@@ -162,7 +173,7 @@ namespace IronNestVR
                 int id = Fnv(PathOf(tr));
                 if (!_pieces.ContainsKey(id)) _pieces[id] = __instance;
                 _draggingLocal.Remove(id);
-                SendPieceMove(id, tr.position, tr.rotation, true);   // authoritative final — reliable
+                SendPieceMove(id, tr.position, tr.rotation, true, true);   // authoritative final — reliable
                 Log.LogInfo($"[map] piece '{tr.name}' dropped -> peer");
             }
             catch (Exception e) { Log.LogWarning("[map] piece drag-end: " + e.Message); }
@@ -247,7 +258,7 @@ namespace IronNestVR
         public static void Tick(float dt)
         {
             if (!Config.CoopMapSync) return;
-            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { if (_items.Count > 0 || _markers.Count > 0) ClearOwnership(); return; }
+            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { if (_items.Count > 0 || _markers.Count > 0) ClearOwnership(); if (_pieceSeqIn.Count > 0) _pieceSeqIn.Clear(); if (_pieceSeqOut.Count > 0) _pieceSeqOut.Clear(); return; }
             try
             {
                 EnsureRegistry();   // resolves the token board AND the marker placer
@@ -266,7 +277,7 @@ namespace IronNestVR
                     {
                         if (!_pieces.TryGetValue(id, out var p) || p == null) continue;
                         var tr = p.transform; if (tr == null) continue;
-                        SendPieceMove(id, tr.position, tr.rotation, false);
+                        SendPieceMove(id, tr.position, tr.rotation, false, false);   // live drag — unreliable
                     }
 
                 DetectMarkerAdds();      // capture a locally-drawn bearing/range line (backstops the finalize hook)
@@ -379,11 +390,13 @@ namespace IronNestVR
                 }
                 case MSG_PIECE_MOVE:
                 {
-                    if (len < 1 + 4 + 12 + 16) return;
+                    if (len < 1 + 4 + 4 + 1 + 12 + 16) return;
                     int id = GetInt(a, ref o);
+                    int seq = GetInt(a, ref o);
+                    bool final = (a[o++] & 1) != 0;
                     Vector3 pos = GetV(a, ref o);
                     Quaternion rot = new Quaternion(GetF(a, ref o), GetF(a, ref o), GetF(a, ref o), GetF(a, ref o));
-                    ApplyPieceMove(id, pos, rot);
+                    ApplyPieceMove(id, seq, final, pos, rot);
                     break;
                 }
                 case MSG_MARKER_DEL:
@@ -475,7 +488,7 @@ namespace IronNestVR
                 {
                     var p = kv.Value; if (p == null) continue;
                     var tr = p.transform; if (tr == null) continue;
-                    SendPieceMove(kv.Key, tr.position, tr.rotation, true);
+                    SendPieceMove(kv.Key, tr.position, tr.rotation, true, true);   // JIP resync — reliable final
                     pc++;
                 }
                 if (n == 0 && mk == 0 && pc == 0) Log.LogInfo("[map] JIP snapshot: nothing to send (no tokens/markers/pieces present)");
@@ -511,25 +524,31 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[map] scan pieces: " + e.Message); }
         }
 
-        private static void ApplyPieceMove(int id, Vector3 pos, Quaternion rot)
+        private static void ApplyPieceMove(int id, int seq, bool final, Vector3 pos, Quaternion rot)
         {
             try
             {
                 if (!Finite(pos)) return;
                 if (_draggingLocal.Contains(id)) return;   // we're dragging this piece locally — local input wins, ignore the peer
+                // REVIEW-fix (P1): drop a stale/reordered move. The reliable FINAL carries the highest seq of its
+                // drag, so once it lands no older unreliable live move can move the piece back to an in-flight spot.
+                if (_pieceSeqIn.TryGetValue(id, out var last) && seq <= last) return;
                 if (!_pieces.TryGetValue(id, out var p) || p == null) { ScanPieces(true); _pieces.TryGetValue(id, out p); }
                 if (p == null) { Log.LogWarning($"[map] piece move for unknown id={id} — not in this scene (graph-spawned + gated away on the client?)"); return; }
                 var tr = p.transform; if (tr == null) return;
                 tr.SetPositionAndRotation(pos, rot);
-                Log.LogInfo($"[map] applied remote piece move '{tr.name}' <- peer");
+                _pieceSeqIn[id] = seq;
+                if (final) Log.LogInfo($"[map] applied remote piece move '{tr.name}' (final seq={seq}) <- peer");
             }
             catch (Exception e) { Log.LogWarning("[map] apply piece move: " + e.Message); }
         }
 
-        private static void SendPieceMove(int id, Vector3 pos, Quaternion rot, bool reliable)
+        private static void SendPieceMove(int id, Vector3 pos, Quaternion rot, bool reliable, bool final)
         {
             if (!EnsureBuf() || !Finite(pos)) return;
-            int o = 0; _buf[o++] = MSG_PIECE_MOVE; o = PutInt(o, id); o = PutV(o, pos);
+            _pieceSeqOut.TryGetValue(id, out var seq); seq++; _pieceSeqOut[id] = seq;   // per-piece monotonic (REVIEW-fix P1)
+            int o = 0; _buf[o++] = MSG_PIECE_MOVE; o = PutInt(o, id); o = PutInt(o, seq); _buf[o++] = (byte)(final ? 1 : 0);
+            o = PutV(o, pos);
             o = PutF(o, rot.x); o = PutF(o, rot.y); o = PutF(o, rot.z); o = PutF(o, rot.w);
             CoopP2P.Send(_buf, o, reliable);
         }

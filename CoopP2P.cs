@@ -144,6 +144,7 @@ namespace IronNestVR
             Init();
             UpdatePeer();
             Receive();
+            CoopNetSim.Pump(Time.unscaledTime, DispatchManaged);   // release any NetSim-delayed packets (test aid)
             if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
             if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
         }
@@ -176,6 +177,7 @@ namespace IronNestVR
             }
 
             ReceiveLoopback();
+            CoopNetSim.Pump(Time.unscaledTime, DispatchManaged);   // release any NetSim-delayed packets (test aid)
             if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
             if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
         }
@@ -339,7 +341,13 @@ namespace IronNestVR
                     if (!SteamNetworking.ReadP2PPacket(_recvArr, (uint)_recvArr.Length, out uint read, out CSteamID from, Channel)) break;
                     // Only the current lobby peer may drive our state — drop anything else (spoof / stale peer).
                     if (!HasPeer || from.m_SteamID != Peer.m_SteamID) continue;
-                    DispatchPacket(read);
+                    if (CoopNetSim.Active)
+                    {
+                        int n = (int)read; var copy = new byte[n];
+                        for (int i = 0; i < n; i++) copy[i] = _recvArr[i];
+                        CoopNetSim.Ingest(copy, n);
+                    }
+                    else DispatchPacket(read);
                 }
             }
             catch (Exception e) { Log.LogWarning("[p2p] recv: " + e.Message); }
@@ -356,11 +364,28 @@ namespace IronNestVR
                 {
                     int read = frame.Length;
                     if (read < 1 || read > _recvArr.Length) continue;
-                    for (int i = 0; i < read; i++) _recvArr[i] = frame[i];
-                    DispatchPacket((uint)read);
+                    if (CoopNetSim.Active)
+                    {
+                        var copy = new byte[read]; Array.Copy(frame, copy, read);
+                        CoopNetSim.Ingest(copy, read);
+                    }
+                    else
+                    {
+                        for (int i = 0; i < read; i++) _recvArr[i] = frame[i];
+                        DispatchPacket((uint)read);
+                    }
                 }
             }
             catch (Exception e) { Log.LogWarning("[p2p] recv-loop: " + e.Message); }
+        }
+
+        // NetSim release path (test aid): copy a delayed/managed packet back into the Il2Cpp recv array and run it
+        // through the SAME parser. Only used while CoopNetSim is active; otherwise the receive paths dispatch direct.
+        private static void DispatchManaged(byte[] data, int len)
+        {
+            if (data == null || len < 1 || len > _recvArr.Length) return;
+            for (int i = 0; i < len; i++) _recvArr[i] = data[i];
+            DispatchPacket((uint)len);
         }
 
         // Parse one packet already sitting in _recvArr (length = read). Transport-agnostic — shared by the
