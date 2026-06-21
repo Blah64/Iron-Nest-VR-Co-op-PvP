@@ -21,6 +21,14 @@ namespace IronNestVR
         // How often (seconds) to retry OpenXR init while no headset/runtime is available yet.
         public const float XrRetryIntervalSec = 5f;
 
+        // VR fallback: how many CONSECUTIVE failing frames (xrWaitFrame returning a runtime error, not a
+        // benign not-yet-visible frame) we tolerate before abandoning VR and dropping to flatscreen for the
+        // rest of the session. A present-but-broken runtime (headset not actually streaming) makes xrWaitFrame
+        // block for seconds then error EVERY frame, freezing the game at <1 fps; this bounds that to a few
+        // frames before flatscreen takes over. Each failing frame can cost several seconds (the block is inside
+        // the runtime, with no app-side timeout), so keep this small.
+        public const int XrFrameFailLimit = 3;
+
         // Co-op: cap on how many pose packets we transmit per second. A high-fps VR host otherwise floods the
         // wire (~90/s) with near-redundant poses; 30 Hz keeps the remote avatar smooth (receiver snaps to the
         // latest pose each frame). A client running BELOW this still sends every frame, so a slow peer is never
@@ -187,6 +195,25 @@ namespace IronNestVR
         // avatar's hands visibly close around dials/triggers instead of staying open. Uses the same curl rig
         // and Config.FingerCurl* tunables as the local hands.
         public static bool CoopFingerCurlSync = true;
+
+        // ---- Co-op avatar "uniform" props (gas mask + Castile flag) ----
+        // Render-only cosmetics hung on the REMOTE teammate's avatar, sourced from the GAME'S OWN loaded assets
+        // (gas-mask mesh / Castile flag). They add NOTHING to the wire — both are driven from the already-synced
+        // head pose. The gas mask tracks the FULL look direction (yaw + pitch); the Castile flag tracks YAW ONLY
+        // and hangs upright like a cape off the back shoulders. Identical for a VR teammate (VR head pose) and a
+        // flatscreen teammate (window camera) — the sender streams whichever camera applies. Tune live with F6
+        // (the solo self-test avatar) + this .cfg; offsets are in METRES, in head/torso-local space.
+        public static bool CoopGasMask = true;
+        public static float CoopMaskScale = 1f;
+        public static Vector3 CoopMaskOffset = new Vector3(0f, -0.03f, 0.06f);   // over the face
+        public static Vector3 CoopMaskEuler = Vector3.zero;
+
+        public static bool CoopFlag = true;
+        public static float CoopFlagScale = 1f;
+        // Cape collar (top-centre of the mesh) sits on the body axis at shoulder height; the mesh itself wraps the
+        // back + drapes down, so this just lifts the collar to the shoulders (z≈0 keeps it centred on the torso).
+        public static Vector3 CoopFlagOffset = new Vector3(0f, 0.27f, -0.02f);
+        public static Vector3 CoopFlagEuler = Vector3.zero;
 
         // Co-op: how long (seconds) the remote avatar holds its last pose before we hide it as stale. Must be
         // generous enough to ride out a low-fps / hitchy peer (a 4 fps client sends only ~4 poses/sec and can
@@ -447,6 +474,14 @@ namespace IronNestVR
                 WV(sb, "WatchHeadOffEul", WatchHeadOffEul);
                 WV(sb, "WatchOriginOffPos", WatchOriginOffPos);
                 WV(sb, "WatchOriginOffEul", WatchOriginOffEul);
+                WB(sb, "CoopGasMask", CoopGasMask);
+                WF(sb, "CoopMaskScale", CoopMaskScale);
+                WV(sb, "CoopMaskOffset", CoopMaskOffset);
+                WV(sb, "CoopMaskEuler", CoopMaskEuler);
+                WB(sb, "CoopFlag", CoopFlag);
+                WF(sb, "CoopFlagScale", CoopFlagScale);
+                WV(sb, "CoopFlagOffset", CoopFlagOffset);
+                WV(sb, "CoopFlagEuler", CoopFlagEuler);
                 File.WriteAllText(SettingsPath, sb.ToString());
                 Plugin.Logger?.LogInfo("[config] saved settings to " + SettingsPath);
             }
@@ -507,6 +542,14 @@ namespace IronNestVR
                 case "WatchHeadOffEul": WatchHeadOffEul = PV(v, WatchHeadOffEul); break;
                 case "WatchOriginOffPos": WatchOriginOffPos = PV(v, WatchOriginOffPos); break;
                 case "WatchOriginOffEul": WatchOriginOffEul = PV(v, WatchOriginOffEul); break;
+                case "CoopGasMask": CoopGasMask = PB(v, CoopGasMask); break;
+                case "CoopMaskScale": CoopMaskScale = PF(v, CoopMaskScale); break;
+                case "CoopMaskOffset": CoopMaskOffset = PV(v, CoopMaskOffset); break;
+                case "CoopMaskEuler": CoopMaskEuler = PV(v, CoopMaskEuler); break;
+                case "CoopFlag": CoopFlag = PB(v, CoopFlag); break;
+                case "CoopFlagScale": CoopFlagScale = PF(v, CoopFlagScale); break;
+                case "CoopFlagOffset": CoopFlagOffset = PV(v, CoopFlagOffset); break;
+                case "CoopFlagEuler": CoopFlagEuler = PV(v, CoopFlagEuler); break;
             }
         }
 

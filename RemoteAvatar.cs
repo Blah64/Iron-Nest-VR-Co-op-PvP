@@ -32,9 +32,24 @@ namespace IronNestVR
             public List<FingerCurl.Joint> Joints;  // finger bones for streamed curl (mesh hands only)
         }
 
+        // A render-only prop sourced from the game's own assets (built by AvatarProps). Posed manually from the
+        // head pose each frame — NOT parented to the head/body primitives, whose 0.22/0.34 localScale children
+        // would inherit and shrink; posing directly keeps the offsets in real metres.
+        private sealed class PropObj { public GameObject Go; public Vector3 Intrinsic; }
+
         private static GameObject _root, _head, _body;
         private static HandObj _l, _r;
         private static bool _built;
+
+        // Co-op "uniform": the gas mask rides the head (full look direction, yaw + pitch); the Castile flag rides
+        // the upright torso (yaw only) so it hangs like a cape off the back. Both are driven entirely by the
+        // already-synced head pose — no extra netcode — and behave the same for a VR teammate (VR head pose) or a
+        // flatscreen teammate (window camera), since the sender streams whichever camera applies.
+        private static PropObj _mask, _flag;
+        private static GameObject _nose;          // facing cube, tucked away while the mask covers the face
+        private static float _nextPropScan;
+        private static readonly string[] MaskTokens = { "gas", "mask" };
+        private static readonly string[] FlagTokens = { "castile", "flag" };
 
         // Floating persona name tag above the head.
         private static GameObject _nameRoot;
@@ -76,6 +91,8 @@ namespace IronNestVR
                     PlaceHand(_l, false, CoopP2P.LPos, CoopP2P.LRot);
                     PlaceHand(_r, true, CoopP2P.RPos, CoopP2P.RRot);
                 }
+
+                TickProps(CoopP2P.HeadPos, CoopP2P.HeadRot);
             }
             catch (Exception e) { Log.LogWarning("[avatar] update: " + e.Message); }
         }
@@ -88,6 +105,57 @@ namespace IronNestVR
             float yaw = headRot.eulerAngles.y;
             var yawRot = Quaternion.Euler(0f, yaw, 0f);
             _body.transform.SetPositionAndRotation(headPos + Vector3.down * 0.45f, yawRot);
+        }
+
+        // ---------------- uniform props (gas mask + Castile flag) ----------------
+
+        // Resolve each enabled prop from the game's loaded assets on a light timer until found, then pose it from
+        // the head pose every frame: the mask tracks the FULL head rotation, the flag tracks YAW ONLY.
+        private static void TickProps(Vector3 headPos, Quaternion headRot)
+        {
+            bool needMask = Config.CoopGasMask && (_mask == null || _mask.Go == null);
+            bool needFlag = Config.CoopFlag && (_flag == null || _flag.Go == null);
+            if ((needMask || needFlag) && Time.unscaledTime >= _nextPropScan)
+            {
+                _nextPropScan = Time.unscaledTime + 2f;
+                if (needMask) { var go = AvatarProps.Build("gasmask", MaskTokens, HeadColor); if (go != null) _mask = Attach(go); }
+                if (needFlag) { var go = AvatarProps.BuildCape("castileflag", FlagTokens, BodyColor); if (go != null) _flag = Attach(go); }
+            }
+
+            // Gas mask: parented to nothing, posed at the head with a head-local offset → inherits yaw + pitch.
+            PoseProp(_mask, Config.CoopGasMask, Config.CoopMaskScale,
+                     headPos, headRot, Config.CoopMaskOffset, Config.CoopMaskEuler);
+
+            // Castile flag: posed at the torso anchor with a yaw-only rotation → hangs upright like a cape.
+            float yaw = headRot.eulerAngles.y;
+            var yawRot = Quaternion.Euler(0f, yaw, 0f);
+            PoseProp(_flag, Config.CoopFlag, Config.CoopFlagScale,
+                     headPos + Vector3.down * 0.45f, yawRot, Config.CoopFlagOffset, Config.CoopFlagEuler);
+
+            // Tuck the facing "nose" cube away while the mask covers the face (cosmetic).
+            bool maskOn = _mask != null && _mask.Go != null && Config.CoopGasMask;
+            if (_nose != null && _nose.activeSelf == maskOn) _nose.SetActive(!maskOn);
+        }
+
+        // Park a freshly built prop under the avatar root (unscaled) and remember its intrinsic scale so the
+        // Config scale stays a clean uniform multiplier (matters for the texture-quad path, whose intrinsic
+        // localScale carries the flag's aspect ratio).
+        private static PropObj Attach(GameObject go)
+        {
+            go.transform.SetParent(_root.transform, false);
+            SetLayer(go, 0);
+            return new PropObj { Go = go, Intrinsic = go.transform.localScale };
+        }
+
+        private static void PoseProp(PropObj p, bool on, float scale, Vector3 anchorPos, Quaternion anchorRot, Vector3 off, Vector3 eul)
+        {
+            if (p == null || p.Go == null) return;
+            if (p.Go.activeSelf != on) p.Go.SetActive(on);
+            if (!on) return;
+            var t = p.Go.transform;
+            Vector3 bs = p.Intrinsic;
+            t.localScale = new Vector3(bs.x * scale, bs.y * scale, bs.z * scale);
+            t.SetPositionAndRotation(anchorPos + anchorRot * off, anchorRot * Quaternion.Euler(eul));
         }
 
         // VR passes the head pose so the name tag faces the player's eyes; flatscreen leaves it invalid and we
@@ -154,13 +222,13 @@ namespace IronNestVR
 
             _head = Ball(0.22f, HeadColor);
             _head.transform.SetParent(_root.transform, false);
-            var nose = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            StripCollider(nose);
-            nose.transform.SetParent(_head.transform, false);
-            nose.transform.localScale = new Vector3(0.05f, 0.05f, 0.14f);
-            nose.transform.localPosition = new Vector3(0f, 0f, 0.16f);
-            Paint(nose, new Color(1f, 0.85f, 0.2f));
-            nose.layer = 0;
+            _nose = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            StripCollider(_nose);
+            _nose.transform.SetParent(_head.transform, false);
+            _nose.transform.localScale = new Vector3(0.05f, 0.05f, 0.14f);
+            _nose.transform.localPosition = new Vector3(0f, 0f, 0.16f);
+            Paint(_nose, new Color(1f, 0.85f, 0.2f));
+            _nose.layer = 0;
 
             // Torso: a capsule (~0.6 m tall) standing under the head.
             _body = GameObject.CreatePrimitive(PrimitiveType.Capsule);

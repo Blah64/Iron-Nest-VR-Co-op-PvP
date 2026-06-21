@@ -52,6 +52,12 @@ namespace IronNestVR
 
         public bool Running => _running;
         public bool ExitRequested => _exitRequested;
+        // Result of the most recent xrWaitFrame (Success when the session simply isn't running/visible yet).
+        // A NEGATIVE result is a genuine OpenXR error (runtime/session/instance lost) — the signal the caller
+        // uses to abandon VR rather than spin on a wedged runtime. Positive warnings (e.g. SessionLossPending)
+        // are surfaced via the state-change events / ExitRequested, not here.
+        public Result LastWaitResult { get; private set; }
+        public bool LastFrameFailed => (long)LastWaitResult < 0;
         public bool IsFocused => _state == SessionState.Focused;
         public bool InputReady => _inputAttached;
         public VrInput Input => _input;
@@ -272,6 +278,7 @@ namespace IronNestVR
         public bool BeginFrameLocateViews()
         {
             ViewsValid = false;
+            LastWaitResult = Result.Success;
             if (!_running) return false;
 
             bool tr = _submitFrames < 30;
@@ -279,6 +286,7 @@ namespace IronNestVR
             var fwi = new FrameWaitInfo { Type = StructureType.TypeFrameWaitInfo };
             var fs = new FrameState { Type = StructureType.TypeFrameState };
             var wfr = _xr.WaitFrame(_session, &fwi, &fs);
+            LastWaitResult = wfr;
             if (wfr != Result.Success) { WarnRc("xrWaitFrame", wfr); return false; }
             if (tr) Dbg.Step("WaitFrame <<");
             PredictedDisplayTime = fs.PredictedDisplayTime;

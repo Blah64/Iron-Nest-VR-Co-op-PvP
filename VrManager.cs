@@ -33,6 +33,8 @@ namespace IronNestVR
         private float _appliedRenderScale;
         private bool _xrReady;
         private float _nextXrTry;
+        private int _frameFailStreak;   // consecutive failing frames (xrWaitFrame runtime error)
+        private bool _vrAbandoned;      // VR came up but the runtime kept erroring per-frame → flatscreen for the rest of this session
         private string _lastError;
         private float _nextErrLog;
         private float _nextPoseLog;
@@ -223,6 +225,11 @@ namespace IronNestVR
 
             if (!_xrReady)
             {
+                // VR was abandoned after the runtime kept failing per-frame: stay flatscreen for the rest of
+                // the session. Re-initialising would recreate the same session and re-enter the freeze, so we
+                // do NOT retry here (unlike the no-headset case below, where init quietly fails and VR can
+                // still come up later if a headset appears).
+                if (_vrAbandoned) return;
                 if (Time.unscaledTime >= _nextXrTry)
                 {
                     _nextXrTry = Time.unscaledTime + Config.XrRetryIntervalSec;
@@ -250,6 +257,26 @@ namespace IronNestVR
 
                 bool shouldRender = _xr.BeginFrameLocateViews();
                 Dbg.Beat($"begin shouldRender={shouldRender} focused={_xr.IsFocused}");
+
+                // Runtime-failure fallback. A present-but-broken runtime (e.g. headset not actually streaming)
+                // makes xrWaitFrame block for seconds and return an error EVERY frame — the game freezes at
+                // <1 fps instead of running. This is NOT the no-headset case (which never gets a session this
+                // far); the session came up and is now erroring. After a few consecutive failures, abandon VR
+                // and run flatscreen. A benign not-yet-visible frame (WaitFrame success, ShouldRender=0) resets
+                // the streak, so normal Synchronized→Visible→Focused bring-up is unaffected.
+                if (_xr.LastFrameFailed)
+                {
+                    if (++_frameFailStreak >= Config.XrFrameFailLimit)
+                    {
+                        Log.LogWarning($"[vr] OpenXR frame loop failing ({_xr.LastWaitResult}) — runtime is up but not " +
+                                       "presenting (headset not streaming?). Abandoning VR; continuing in flatscreen. " +
+                                       "Reconnect the headset and relaunch to use VR.");
+                        _vrAbandoned = true;
+                        TeardownVr();
+                        return;
+                    }
+                }
+                else _frameFailStreak = 0;
 
                 // Controller input + cockpit interaction. Pose locate needs the frame's predicted
                 // display time (set by BeginFrameLocateViews) and a focused session. The interactor is
@@ -363,6 +390,7 @@ namespace IronNestVR
                 _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab };
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
+                _frameFailStreak = 0;
                 _xrReady = true;
                 LobbyGui.Shown = false;   // VR uses the in-headset menu page, not the flatscreen panel
                 _lastError = null;
