@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BepInEx.Logging;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Steamworks;
@@ -7,14 +8,22 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 2 co-op transport: a Steam P2P data channel between the two lobby members, streaming each
-    /// player's head + hand poses so the other sees an avatar. Uses the byte-array SteamNetworking P2P API
-    /// (SendP2PPacket/ReadP2PPacket) — simpler than SteamNetworkingMessages and avoids the message-struct
-    /// pointer unpacking. The peer is the other member of the current <see cref="SteamNet"/> lobby.
+    /// Co-op transport: a host-relay STAR over Steam P2P. Every client holds a single session with the host;
+    /// the host fans out (broadcast / unicast / relay) to all clients. Streams each player's head + hand poses
+    /// (so the others see an avatar) plus the Phase 3+ subsystem traffic, distinguished by the first packet byte.
     ///
-    /// Poses are sent in WORLD space (both instances load the same scene at the same world coords, so the
-    /// remote head lands where that player actually is). If the rotating cockpit (Barbet) makes avatars
-    /// drift once turret aim is desynced, switch to Barbet-local in a later pass.
+    /// ORIGIN MODEL (PLAN.md §2.2): the host derives a packet's origin from the Steam `from` (never trusts a
+    /// client-supplied field). On the host→client leg an 8-byte sender SteamID is appended as a TRAILER; the
+    /// receiving client strips it and dispatches the inner packet at offset 0 with the reduced length, so every
+    /// parser sees the exact byte offsets it did in the 2-player build. client→host packets carry no trailer.
+    ///
+    /// At the current cap (2 players) there is one peer, so broadcast == "send to the peer", relay is a no-op
+    /// (the host has no OTHER client to relay to), and behavior is identical to the single-peer build. The
+    /// fan-out / relay machinery is dormant until the lobby cap is lifted (kept at 2 in SteamNet until the
+    /// multi-client path is validated — see PLAN.md §6).
+    ///
+    /// Poses are sent in WORLD space (both instances load the same scene at the same world coords). If the
+    /// rotating cockpit (Barbet) makes avatars drift once turret aim is desynced, switch to Barbet-local later.
     /// </summary>
     internal static class CoopP2P
     {
@@ -22,8 +31,7 @@ namespace IronNestVR
 
         private const int Channel = 0;
         private const byte MSG_POSE = 1;
-        // Pose flag-byte bits: hands present, and (implies hands) finger-curl present. Older builds sent the
-        // flag as a plain 0/1 bool — the curl bit is additive, so a peer that doesn't send curl just leaves it 0.
+        // Pose flag-byte bits: hands present, and (implies hands) finger-curl present.
         private const byte FLAG_HANDS = 1;
         private const byte FLAG_CURL = 2;
         // Exact wire sizes so truncated packets are rejected instead of parsing stale buffer bytes.
@@ -31,24 +39,35 @@ namespace IronNestVR
         private const int HandPacketLen = 2 + (12 + 16) * 3;    // + left + right hand = 86
         private const int HandCurlPacketLen = HandPacketLen + 16; // + Lindex,Lother,Rindex,Rother (4f) = 102
 
+        // Host→client origin trailer width (PLAN.md §2.2). Appended AFTER the inner packet; the client reads it
+        // from the last 8 bytes and dispatches the inner packet with the reduced length, so offsets never move.
+        private const int OriginTrailerLen = 8;
+
         private static bool _inited;
         private static ulong _myId;
         private static Callback<P2PSessionRequest_t> _cbSession;
-        private static Il2CppStructArray<byte> _sendArr;   // persistent, sized for max packet
+        private static Il2CppStructArray<byte> _sendArr;   // pose serialization
+        private static Il2CppStructArray<byte> _outArr;    // outbound staging (inner packet + origin trailer)
         private static Il2CppStructArray<byte> _recvArr;
         private static readonly byte[] _f4 = new byte[4];
         private static byte[] _loopScratch;                // managed copy of an outbound packet for the loopback wire
         private static bool _wasLoopback;                  // so we can clear peer state when loopback ends
 
-        public static CSteamID Peer;
-        public static bool HasPeer;
+        // Current co-op peers = every lobby member except me. Single source of truth for fan-out. Real SteamIDs
+        // over Steam; one synthetic id over loopback. Maintained by UpdatePeer / TickLoopback.
+        private static readonly List<CSteamID> _peers = new List<CSteamID>();
+        private static readonly List<CSteamID> _scratch = new List<CSteamID>();
+        private static CSteamID _hostId;   // lobby owner; the address a client sends to
 
-        // Role: the lobby owner is the host. Used as the ownership tie-breaker in Phase 3 (control sync) and
-        // for sim-gating in Phase 4. Recomputed each tick while in a lobby; false when solo / not in a lobby.
+        public static bool HasPeer => _peers.Count > 0;
+        public static int PeerCount => _peers.Count;
+
+        // Role: the lobby owner is the host. Ownership tie-breaker (Phase 3) + sim-gating (Phase 4).
         public static bool IsHost;
         public static ulong MyId => _myId;
 
-        // Latest remote pose (world space).
+        // Latest remote pose (world space). SINGLE-slot for now — correct at the 2-player cap; Phase B replaces
+        // this with a per-origin dictionary so >2 avatars render. Pose origin is derived but not yet keyed on.
         public static bool RemoteValid;
         private static float _remoteAge;
         public static Vector3 HeadPos; public static Quaternion HeadRot = Quaternion.identity;
@@ -72,6 +91,7 @@ namespace IronNestVR
         // CoopSnapshotDelaySec later (0 = none pending). The delay lets both sides resolve the peer + bring the
         // session up so the snapshot isn't dropped by the receive-side peer gate. Cleared if the peer leaves.
         private static float _snapAt;
+        private static CSteamID _snapTarget;   // the freshly-joined peer the pending snapshot is for
 
         public static void Init()
         {
@@ -80,6 +100,7 @@ namespace IronNestVR
             {
                 _myId = SteamUser.GetSteamID().m_SteamID;
                 _sendArr = new Il2CppStructArray<byte>(128);
+                _outArr = new Il2CppStructArray<byte>(1280);
                 _recvArr = new Il2CppStructArray<byte>(1200);
                 _cbSession = Callback<P2PSessionRequest_t>.Create((Action<P2PSessionRequest_t>)OnSessionRequest);
                 _inited = true;
@@ -93,8 +114,7 @@ namespace IronNestVR
             try
             {
                 // Accepting a session NAT-punches and reveals our IP to the requester, so only accept from a
-                // current lobby member. (Gate the accept on membership — looser than HasPeer==sender so we
-                // don't reject the peer's first request before UpdatePeer has resolved them; consume is strict.)
+                // current lobby member.
                 if (!IsCurrentLobbyMember(r.m_steamIDRemote))
                 {
                     Log.LogWarning($"[p2p] ignoring P2P session from non-lobby sender {r.m_steamIDRemote.m_SteamID}");
@@ -129,15 +149,14 @@ namespace IronNestVR
         public static void Tick(float dt)
         {
             // Same-machine TEST mode: route everything over the localhost link instead of Steam (see
-            // LoopbackTransport). Mutually exclusive with the Steam path — we never touch SteamAPI here, so
-            // the second instance doesn't even need Steam initialised.
+            // LoopbackTransport). Mutually exclusive with the Steam path.
             if (LoopbackTransport.Active) { _wasLoopback = true; TickLoopback(dt); return; }
             if (_wasLoopback)   // loopback was just stopped — drop the synthetic peer so subsystems clear
             {
                 _wasLoopback = false;
-                HasPeer = false; IsHost = false; PeerName = ""; _snapAt = 0f;
+                ClearPeers(); IsHost = false; PeerName = ""; _snapAt = 0f;
                 if (!SelfTest) RemoteValid = false;
-                Log.LogInfo("[p2p] loopback ended — peer cleared");
+                Log.LogInfo("[p2p] loopback ended — peers cleared");
             }
 
             if (!SteamNet.Ready) return;
@@ -149,29 +168,31 @@ namespace IronNestVR
             if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
         }
 
-        // Loopback (same-machine test) counterpart of the Steam Init+UpdatePeer+Receive trio. Derives peer +
-        // role from the TCP link, gives the two sides synthetic deterministic ids (host=1, client=2) so the
-        // host-priority ownership tie-break works without real SteamIDs, then drains the link through the SAME
-        // DispatchPacket path the Steam receive uses. The join-in-progress snapshot rides along for free.
+        // Loopback (same-machine test) counterpart of the Steam Init+UpdatePeer+Receive trio. Derives role from
+        // the TCP link, gives the two sides synthetic deterministic ids (host=1, client=2) so host-priority
+        // ownership works without real SteamIDs, then drains the link through the SAME deliver path the Steam
+        // receive uses. A single synthetic peer is kept in _peers; multi-client loopback is PLAN.md §8.1.
         private static void TickLoopback(float dt)
         {
             EnsureArrays();
-            bool was = HasPeer;
             IsHost = LoopbackTransport.IsHost;
-            HasPeer = LoopbackTransport.Connected;
             _myId = IsHost ? 1UL : 2UL;
+            _hostId = new CSteamID { m_SteamID = 1UL };
+            ulong peerSyn = IsHost ? 2UL : 1UL;
+            bool connected = LoopbackTransport.Connected;
 
-            if (HasPeer && !was)
+            if (connected && _peers.Count == 0)
             {
+                _peers.Add(new CSteamID { m_SteamID = peerSyn });
                 PeerName = IsHost ? "Loopback client" : "Loopback host";
                 Log.LogInfo($"[p2p] loopback link up — role={(IsHost ? "HOST" : "client")}");
                 Notify.PeerJoined(PeerName, IsHost);
-                if (IsHost) { _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo("[p2p] host: loopback join snapshot scheduled"); }
+                if (IsHost) { _snapTarget = new CSteamID { m_SteamID = peerSyn }; _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo("[p2p] host: loopback join snapshot scheduled"); }
                 else _snapAt = 0f;
             }
-            else if (!HasPeer && was)
+            else if (!connected && _peers.Count > 0)
             {
-                Notify.PeerLeft(PeerName); PeerName = ""; _snapAt = 0f;
+                _peers.Clear(); Notify.PeerLeft(PeerName); PeerName = ""; _snapAt = 0f;
                 if (!SelfTest) RemoteValid = false;
                 Log.LogInfo("[p2p] loopback link down");
             }
@@ -187,27 +208,40 @@ namespace IronNestVR
         private static void EnsureArrays()
         {
             if (_sendArr == null) _sendArr = new Il2CppStructArray<byte>(128);
+            if (_outArr == null) _outArr = new Il2CppStructArray<byte>(1280);
             if (_recvArr == null) _recvArr = new Il2CppStructArray<byte>(1200);
             if (_loopScratch == null) _loopScratch = new byte[1200];
         }
 
-        // One-line status for the co-op diagnostics hub. Position diag: myCam = where THIS player actually is
-        // (ground truth); mySent = the head pose we transmit; remHead = where we DRAW the peer. Cross-machine,
-        // one player's myCam should match the other player's remHead — if not, the two worlds aren't aligned.
+        private static void EnsureOut(int need)
+        {
+            if (_outArr == null || _outArr.Length < need) _outArr = new Il2CppStructArray<byte>(Math.Max(1280, need));
+        }
+
+        private static void ClearPeers()
+        {
+            if (!LoopbackTransport.Active)
+                foreach (var p in _peers) CloseSession(p);
+            _peers.Clear();
+        }
+
+        // One-line status for the co-op diagnostics hub.
         public static string Status()
         {
             Camera cam = null; try { cam = Camera.main; } catch { }
             string myCam = cam != null ? V(cam.transform.position) : "n/a";
-            return $"net: {(SteamNet.InLobby ? "in-lobby" : "no-lobby")} peer={(HasPeer ? Peer.m_SteamID.ToString() : "none")} " +
+            return $"net: {(SteamNet.InLobby ? "in-lobby" : "no-lobby")} peers={_peers.Count} " +
                    $"role={(IsHost ? "HOST" : "client")} sent={_sent} recvd={_recvd} | avatar valid={RemoteValid} hands={HasHands} " +
                    $"remHead={V(HeadPos)} myCam={myCam} mySent={V(LastSentHead)}";
         }
 
+        // Rebuild _peers from the lobby roster (everyone except me), opening/closing sessions and firing
+        // join/leave toasts on the delta. Host = lobby owner; a client sends to _hostId.
         private static void UpdatePeer()
         {
             if (!SteamNet.InLobby)
             {
-                if (HasPeer) { CloseSession(Peer); HasPeer = false; PeerName = ""; Log.LogInfo("[p2p] not in lobby — peer cleared"); }
+                if (_peers.Count > 0) { Notify.PeerLeft(PeerName); ClearPeers(); PeerName = ""; Log.LogInfo("[p2p] not in lobby — peers cleared"); }
                 IsHost = false;
                 _snapAt = 0f;
                 if (!SelfTest) RemoteValid = false;
@@ -216,42 +250,61 @@ namespace IronNestVR
             try
             {
                 var lobby = SteamNet.CurrentLobby;
-                try { IsHost = SteamMatchmaking.GetLobbyOwner(lobby).m_SteamID == _myId; } catch { }
+                try { _hostId = SteamMatchmaking.GetLobbyOwner(lobby); IsHost = _hostId.m_SteamID == _myId; } catch { }
+
+                // Snapshot the current roster (minus me).
+                _scratch.Clear();
                 int n = SteamMatchmaking.GetNumLobbyMembers(lobby);
                 for (int i = 0; i < n; i++)
                 {
                     var m = SteamMatchmaking.GetLobbyMemberByIndex(lobby, i);
-                    if (m.m_SteamID != _myId)
-                    {
-                        if (!HasPeer || Peer.m_SteamID != m.m_SteamID)
-                        {
-                            if (HasPeer && Peer.m_SteamID != m.m_SteamID) CloseSession(Peer);  // drop the old peer's session
-                            Peer = m; HasPeer = true;
-                            try { PeerName = SteamFriends.GetFriendPersonaName(m); } catch { PeerName = ""; }
-                            if (!SelfTest) RemoteValid = false;   // don't carry an old peer's avatar onto the new one
-                            Log.LogInfo($"[p2p] peer = {m.m_SteamID} ('{PeerName}')");
-                            Notify.PeerJoined(PeerName, IsHost);   // non-blocking toast (flat + VR)
-                            // Host pushes a full-world snapshot to the joiner once the session settles.
-                            if (IsHost) { _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo($"[p2p] host: join-in-progress snapshot scheduled in {Config.CoopSnapshotDelaySec:0.0}s"); }
-                            else _snapAt = 0f;
-                        }
-                        return;
-                    }
+                    if (m.m_SteamID != _myId) _scratch.Add(m);
                 }
-                if (HasPeer) { Notify.PeerLeft(PeerName); CloseSession(Peer); HasPeer = false; PeerName = ""; Log.LogInfo("[p2p] peer left lobby"); }
-                _snapAt = 0f;
-                if (!SelfTest) RemoteValid = false;
+
+                // Additions: members in the roster we don't have yet.
+                for (int i = 0; i < _scratch.Count; i++)
+                {
+                    var m = _scratch[i];
+                    if (ContainsId(_peers, m.m_SteamID)) continue;
+                    _peers.Add(m);
+                    string nm = ""; try { nm = SteamFriends.GetFriendPersonaName(m); } catch { }
+                    PeerName = nm;
+                    if (!SelfTest) RemoteValid = false;   // don't carry a stale avatar onto a new peer
+                    Log.LogInfo($"[p2p] peer + {m.m_SteamID} ('{nm}')  (now {_peers.Count} peer(s))");
+                    Notify.PeerJoined(nm, IsHost);
+                    // Host pushes a full-world snapshot to the joiner once the session settles.
+                    if (IsHost) { _snapTarget = m; _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo($"[p2p] host: join-in-progress snapshot scheduled in {Config.CoopSnapshotDelaySec:0.0}s"); }
+                }
+
+                // Removals: peers no longer in the roster.
+                for (int i = _peers.Count - 1; i >= 0; i--)
+                {
+                    if (ContainsId(_scratch, _peers[i].m_SteamID)) continue;
+                    var gone = _peers[i];
+                    CloseSession(gone);
+                    _peers.RemoveAt(i);
+                    Log.LogInfo($"[p2p] peer - {gone.m_SteamID} left  (now {_peers.Count} peer(s))");
+                    Notify.PeerLeft(PeerName);
+                }
+
+                if (_peers.Count == 0) { _snapAt = 0f; if (!SelfTest) RemoteValid = false; }
             }
             catch (Exception e) { Log.LogWarning("[p2p] peer: " + e.Message); }
         }
 
-        // Host-only: push a one-time authoritative snapshot of the whole shared world to a freshly-joined peer
-        // so it converges to the host's state instead of its stale default. Each subsystem re-sends its current
-        // state over its own reliable packets (turret/gun, clipboard text, map tokens); the joiner applies them
-        // idempotently through the same paths the live stream uses. Fired from Tick once _snapAt elapses.
+        private static bool ContainsId(List<CSteamID> list, ulong id)
+        {
+            for (int i = 0; i < list.Count; i++) if (list[i].m_SteamID == id) return true;
+            return false;
+        }
+
+        // Host-only: push a one-time authoritative snapshot of the whole shared world to a freshly-joined peer.
+        // Each subsystem re-sends its current state; the joiner applies it idempotently. NOTE: at the 2-player
+        // cap the host has a single peer, so the subsystems' broadcast Send reaches exactly the joiner. Threading
+        // a per-peer target (SendTo) through every SendSnapshot is the cap-lift follow-up (PLAN.md §3A / §2.4).
         private static void SendJoinSnapshot()
         {
-            if (!HasPeer || !IsHost) return;
+            if (_peers.Count == 0 || !IsHost) return;
             Log.LogInfo("[p2p] host: sending join-in-progress snapshot to new peer");
             try { CoopControls.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ctrl: " + e.Message); }
             try { CoopClipboard.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot clip: " + e.Message); }
@@ -266,8 +319,7 @@ namespace IronNestVR
             LastSentHead = hp;   // record even if we don't send, so the diag shows what we WOULD transmit
             if (!HasPeer) return;
             if (!LoopbackTransport.Active && !_inited) return;   // Steam path needs Init(); loopback doesn't
-            // Rate cap: skip this frame's send if we're ahead of the target Hz. Framerate below the cap always
-            // passes (now >= _nextSend), so a slow peer keeps sending every frame.
+            // Rate cap: skip this frame's send if we're ahead of the target Hz.
             float now = Time.unscaledTime;
             if (Config.CoopSendHz > 0f)
             {
@@ -287,32 +339,87 @@ namespace IronNestVR
                 o = PutV(o, hp); o = PutQ(o, hr);
                 if (hasHands) { o = PutV(o, lp); o = PutQ(o, lr); o = PutV(o, rp); o = PutQ(o, rr); }
                 if (curl) { o = PutF(o, lCurlIdx); o = PutF(o, lCurlOth); o = PutF(o, rCurlIdx); o = PutF(o, rCurlOth); }
-                if (LoopbackTransport.Active) { if (LoopSend(_sendArr, o)) _sent++; }
-                else if (SteamNetworking.SendP2PPacket(Peer, _sendArr, (uint)o, EP2PSend.k_EP2PSendUnreliableNoDelay, Channel)) _sent++;
+                Send(_sendArr, o, false);   // unreliable-no-delay; host appends the origin trailer per-peer
             }
             catch (Exception e) { Log.LogWarning("[p2p] send: " + e.Message); }
         }
 
-        // Generic send for non-pose channels (Phase 3 control sync). The caller owns its buffer + framing
-        // (first byte = message type, distinct from MSG_POSE). Reliable for state-transition events
-        // (grab/release), unreliable-no-delay for the continuous value/state stream. Shares the pose channel
-        // and peer; safe because every packet is type-tagged and Receive() dispatches on the first byte.
+        // Generic outbound for every channel. Host → broadcast to all peers (each with an origin trailer of our
+        // own id); client → send to the host (no trailer; the host derives our origin from the Steam `from`).
+        // Reliable for state-transition events; unreliable-no-delay for the continuous value/state/pose stream.
         public static bool Send(Il2CppStructArray<byte> buf, int len, bool reliable)
         {
-            // Loopback maps both reliability classes to TCP (ordered + reliable) — fine for a local test.
-            if (LoopbackTransport.Active) { if (LoopSend(buf, len)) { _sent++; return true; } return false; }
-            if (!_inited || !HasPeer) return false;
+            if (LoopbackTransport.Active)
+            {
+                if (_peers.Count == 0) return false;
+                bool okl = IsHost ? RawSendTrailer(default, buf, len, reliable, _myId) : RawSendPlain(default, buf, len, reliable);
+                if (okl) _sent++;
+                return okl;
+            }
+            if (!_inited || _peers.Count == 0) return false;
             try
             {
-                var mode = reliable ? EP2PSend.k_EP2PSendReliable : EP2PSend.k_EP2PSendUnreliableNoDelay;
-                if (SteamNetworking.SendP2PPacket(Peer, buf, (uint)len, mode, Channel)) { _sent++; return true; }
+                if (IsHost)
+                {
+                    bool any = false;
+                    foreach (var p in _peers) any |= RawSendTrailer(p, buf, len, reliable, _myId);
+                    if (any) _sent++;
+                    return any;
+                }
+                bool ok = RawSendPlain(_hostId, buf, len, reliable);
+                if (ok) _sent++;
+                return ok;
             }
             catch (Exception e) { Log.LogWarning("[p2p] send2: " + e.Message); }
             return false;
         }
 
-        // Copy an Il2Cpp packet buffer into the managed scratch and hand it to the localhost link. Keeps the
-        // subsystems' Il2Cpp send buffers untouched (they don't know about the transport).
+        // Host-only targeted unicast (join-in-progress snapshots to a single joiner). Carries our origin trailer.
+        public static bool SendTo(CSteamID peer, Il2CppStructArray<byte> buf, int len, bool reliable)
+        {
+            if (!IsHost) return false;
+            if (LoopbackTransport.Active) { bool okl = RawSendTrailer(default, buf, len, reliable, _myId); if (okl) _sent++; return okl; }
+            if (!_inited) return false;
+            bool ok = RawSendTrailer(peer, buf, len, reliable, _myId); if (ok) _sent++; return ok;
+        }
+
+        // Host relay: re-broadcast a client-authored packet (sitting in _recvArr[0..len]) to every OTHER client,
+        // stamped with the original sender's id. Fired from Deliver (= at NetSim release), never at raw receive,
+        // so the host's local apply and its relay are ordered from the same event (PLAN.md §8.2). Dormant at the
+        // 2-player cap (the only peer == origin → excluded). Relayed reliable for now (TODO: mirror the unreliable
+        // classes — pose/value/group — when the cap is lifted, to keep the high-rate streams non-blocking).
+        private static void RelayInner(ulong origin, int innerLen)
+        {
+            for (int i = 0; i < _peers.Count; i++)
+            {
+                if (_peers[i].m_SteamID == origin) continue;
+                RawSendTrailer(_peers[i], _recvArr, innerLen, true, origin);
+            }
+        }
+
+        // Stage [inner | origin(8)] into _outArr and transmit (host→client leg).
+        private static bool RawSendTrailer(CSteamID dest, Il2CppStructArray<byte> src, int len, bool reliable, ulong origin)
+        {
+            EnsureOut(len + OriginTrailerLen);
+            for (int i = 0; i < len; i++) _outArr[i] = src[i];
+            PutU64(_outArr, len, origin);
+            return WireSend(dest, _outArr, len + OriginTrailerLen, reliable);
+        }
+
+        // Transmit the buffer verbatim (client→host leg — no trailer).
+        private static bool RawSendPlain(CSteamID dest, Il2CppStructArray<byte> src, int len, bool reliable)
+        {
+            return WireSend(dest, src, len, reliable);
+        }
+
+        private static bool WireSend(CSteamID dest, Il2CppStructArray<byte> buf, int len, bool reliable)
+        {
+            if (LoopbackTransport.Active) return LoopSend(buf, len);   // single stream; dest implicit
+            var mode = reliable ? EP2PSend.k_EP2PSendReliable : EP2PSend.k_EP2PSendUnreliableNoDelay;
+            return SteamNetworking.SendP2PPacket(dest, buf, (uint)len, mode, Channel);
+        }
+
+        // Copy an Il2Cpp packet buffer into the managed scratch and hand it to the localhost link.
         private static bool LoopSend(Il2CppStructArray<byte> buf, int len)
         {
             if (!LoopbackTransport.Connected) return false;
@@ -321,7 +428,7 @@ namespace IronNestVR
             return LoopbackTransport.Send(_loopScratch, len);
         }
 
-        // Fake-remote injection for the F6 solo render test.
+        // Fake-remote injection for the F6 solo render test (writes the single-slot block directly; no wire).
         public static void InjectRemote(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr,
                                         bool hasCurl = false, float lCurlIdx = 0f, float lCurlOth = 0f, float rCurlIdx = 0f, float rCurlOth = 0f)
         {
@@ -336,31 +443,30 @@ namespace IronNestVR
             try
             {
                 int guard = 0;
-                while (SteamNetworking.IsP2PPacketAvailable(out _, Channel) && guard++ < 64)
+                while (SteamNetworking.IsP2PPacketAvailable(out _, Channel) && guard++ < 128)
                 {
                     if (!SteamNetworking.ReadP2PPacket(_recvArr, (uint)_recvArr.Length, out uint read, out CSteamID from, Channel)) break;
-                    // Only the current lobby peer may drive our state — drop anything else (spoof / stale peer).
-                    if (!HasPeer || from.m_SteamID != Peer.m_SteamID) continue;
+                    // Only current lobby members may drive our state — drop anything else (spoof / stale peer).
+                    if (!IsCurrentLobbyMember(from)) continue;
                     if (CoopNetSim.Active)
                     {
-                        int n = (int)read; var copy = new byte[n];
-                        for (int i = 0; i < n; i++) copy[i] = _recvArr[i];
-                        CoopNetSim.Ingest(copy, n);
+                        int nb = (int)read; var copy = new byte[nb];
+                        for (int i = 0; i < nb; i++) copy[i] = _recvArr[i];
+                        CoopNetSim.Ingest(copy, nb);
                     }
-                    else DispatchPacket(read);
+                    else DeliverFromWire((int)read, from.m_SteamID);
                 }
             }
             catch (Exception e) { Log.LogWarning("[p2p] recv: " + e.Message); }
         }
 
-        // Drain the localhost test link into the SAME parse path as Steam: copy each length-framed packet into
-        // the persistent Il2Cpp recv array, then dispatch identically. Only the wire differs from Receive().
+        // Drain the localhost test link into the SAME deliver path as Steam.
         private static void ReceiveLoopback()
         {
             try
             {
                 int guard = 0;
-                while (guard++ < 128 && LoopbackTransport.TryReceive(out var frame))
+                while (guard++ < 256 && LoopbackTransport.TryReceive(out var frame))
                 {
                     int read = frame.Length;
                     if (read < 1 || read > _recvArr.Length) continue;
@@ -372,33 +478,64 @@ namespace IronNestVR
                     else
                     {
                         for (int i = 0; i < read; i++) _recvArr[i] = frame[i];
-                        DispatchPacket((uint)read);
+                        DeliverFromWire(read, PrimaryRemoteOrigin());
                     }
                 }
             }
             catch (Exception e) { Log.LogWarning("[p2p] recv-loop: " + e.Message); }
         }
 
-        // NetSim release path (test aid): copy a delayed/managed packet back into the Il2Cpp recv array and run it
-        // through the SAME parser. Only used while CoopNetSim is active; otherwise the receive paths dispatch direct.
+        // NetSim release path (test aid): copy a delayed managed packet back into _recvArr and run it through the
+        // SAME deliver path. At the 2-player cap the host has a single client, so PrimaryRemoteOrigin() is its
+        // origin; threading the real per-sender origin through CoopNetSim is the >2 follow-up (PLAN.md §8.2).
         private static void DispatchManaged(byte[] data, int len)
         {
             if (data == null || len < 1 || len > _recvArr.Length) return;
             for (int i = 0; i < len; i++) _recvArr[i] = data[i];
-            DispatchPacket((uint)len);
+            DeliverFromWire(len, PrimaryRemoteOrigin());
         }
 
-        // Parse one packet already sitting in _recvArr (length = read). Transport-agnostic — shared by the
-        // Steam and loopback receive paths. Pose packets populate the remote-avatar fields; every other type
-        // byte fans out to the co-op subsystems via CoopControls.OnPacket (exactly as the Steam path always did).
-        private static void DispatchPacket(uint read)
+        // The single remote peer's id (host: the one client; client: the host). Used where a per-sender origin
+        // isn't otherwise available (loopback / NetSim release) — exact at the 2-player cap.
+        private static ulong PrimaryRemoteOrigin()
+            => IsHost ? (_peers.Count > 0 ? _peers[0].m_SteamID : 0UL) : _hostId.m_SteamID;
+
+        // Resolve a raw wire packet now sitting in _recvArr: derive origin + inner length, then Deliver. Host
+        // ingress (client→host) has no trailer and origin = the Steam `from` (hostSideOrigin). Client ingress
+        // (host→client) carries an 8-byte origin trailer we strip; hostSideOrigin is unused there.
+        private static void DeliverFromWire(int read, ulong hostSideOrigin)
+        {
+            ulong origin; int innerLen;
+            if (IsHost) { origin = hostSideOrigin; innerLen = read; }
+            else
+            {
+                if (read < OriginTrailerLen) return;       // malformed — must carry the origin trailer
+                innerLen = read - OriginTrailerLen;
+                origin = GetU64(_recvArr, innerLen);
+            }
+            Deliver(origin, innerLen);
+        }
+
+        // Apply one inner packet (already at _recvArr offset 0, length innerLen). On the host, relay client-
+        // authored types to the other clients FIRST (so relay + local apply fire from the same released event),
+        // then dispatch locally. Clients never relay.
+        private static void Deliver(ulong origin, int innerLen)
+        {
+            if (innerLen < 1) return;
+            byte type = _recvArr[0];
+            if (IsHost && (type == MSG_POSE || CoopControls.IsClientAuthored(type))) RelayInner(origin, innerLen);
+            DispatchPacket(origin, (uint)innerLen);
+        }
+
+        // Parse one inner packet in _recvArr (length = read). Pose populates the single-slot remote-avatar block
+        // (Phase B keys it per-origin); every other type byte fans out via CoopControls.OnPacket.
+        private static void DispatchPacket(ulong origin, uint read)
         {
             if (read < 1) return;
 
-            // Non-pose packets are Phase 3+ subsystem traffic — dispatch by type byte and move on.
             if (_recvArr[0] != MSG_POSE)
             {
-                try { CoopControls.OnPacket(_recvArr[0], _recvArr, (int)read); } catch (Exception ce) { Log.LogWarning("[ctrl] recv: " + ce.Message); }
+                try { CoopControls.OnPacket(_recvArr[0], origin, _recvArr, (int)read); } catch (Exception ce) { Log.LogWarning("[ctrl] recv: " + ce.Message); }
                 _recvd++;
                 return;
             }
@@ -436,10 +573,13 @@ namespace IronNestVR
             RemoteValid = true; _remoteAge = 0f; _recvd++;
         }
 
-        // --- (de)serialization: write into the persistent Il2Cpp send array, read from the recv array ---
+        // --- (de)serialization: write into a send array, read from the recv array ---
         private static int PutF(int o, float f) { int __b = BitConverter.SingleToInt32Bits(f); _sendArr[o] = (byte)__b; _sendArr[o + 1] = (byte)(__b >> 8); _sendArr[o + 2] = (byte)(__b >> 16); _sendArr[o + 3] = (byte)(__b >> 24); return o + 4; }
         private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
         private static int PutQ(int o, Quaternion q) { o = PutF(o, q.x); o = PutF(o, q.y); o = PutF(o, q.z); o = PutF(o, q.w); return o; }
+
+        private static void PutU64(Il2CppStructArray<byte> a, int o, ulong v) { for (int i = 0; i < 8; i++) a[o + i] = (byte)(v >> (8 * i)); }
+        private static ulong GetU64(Il2CppStructArray<byte> a, int o) { ulong v = 0; for (int i = 0; i < 8; i++) v |= ((ulong)a[o + i]) << (8 * i); return v; }
 
         private static string V(Vector3 v) => $"({v.x:F2},{v.y:F2},{v.z:F2})";
 

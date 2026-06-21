@@ -529,7 +529,33 @@ namespace IronNestVR
 
         // ---------------- receive ----------------
 
-        public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
+        // Relay ACL (PLAN.md §2.4): the packet types a client may author, which the host relays to the OTHER
+        // clients. These are the bidirectional, player-operated subsystems — cockpit controls, clipboard edits,
+        // map tokens — plus the join-readiness ack. Everything NOT listed is host-authored (the host is the sole
+        // source — never relayed) or a host-consumed diagnostic (MSG_DIGEST). CoopP2P relays MSG_POSE itself.
+        // This mirrors the role split the subsystems already self-guard on (`if (IsHost) return` etc.).
+        public static bool IsClientAuthored(byte type)
+        {
+            switch (type)
+            {
+                case MSG_GRAB:
+                case MSG_RELEASE:
+                case MSG_VALUE:
+                case MSG_GROUP:
+                case MSG_CLICK:
+                case MSG_FIRE:
+                    return true;   // cockpit controls — either crew member operates them
+            }
+            return type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL
+                || type == CoopMap.MSG_GRAB || type == CoopMap.MSG_POS || type == CoopMap.MSG_PLACE
+                || type == CoopMap.MSG_MARKER_ADD || type == CoopMap.MSG_MARKER_DEL || type == CoopMap.MSG_PIECE_MOVE
+                || type == CoopScene.MSG_MISSION_READY;
+        }
+
+        // origin = the SteamID that authored this packet (derived by CoopP2P from the Steam `from`, or the
+        // host-stamped trailer on a relayed packet). Unused by the control handlers at the 2-player cap; Phase C
+        // keys per-control ownership on it so a release from player B doesn't clear player C's lock.
+        public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
             float now = Time.unscaledTime;
             int o = 1;
