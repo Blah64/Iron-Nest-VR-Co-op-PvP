@@ -47,6 +47,8 @@ namespace IronNestVR
         }
 
         private readonly Dictionary<int, Item> _items = new Dictionary<int, Item>();
+        private readonly HashSet<int> _seenScratch = new HashSet<int>();
+        private readonly List<int> _deadScratch = new List<int>();
         private float _nextScan;
 
         private int _hand;             // 0 = none, 1 = left, 2 = right
@@ -340,7 +342,7 @@ namespace IronNestVR
             if (Time.unscaledTime < _nextScan) return;
             _nextScan = Time.unscaledTime + 1f;
 
-            var seen = new HashSet<int>();
+            var seen = _seenScratch; seen.Clear();
             var cam = Camera.main;
             Transform camT = cam != null ? cam.transform : null;
 
@@ -438,7 +440,7 @@ namespace IronNestVR
             // Drop anything that vanished (scene change / destroyed).
             if (_items.Count > 0)
             {
-                var dead = new List<int>();
+                var dead = _deadScratch; dead.Clear();
                 foreach (var kv in _items) if (!seen.Contains(kv.Key) || kv.Value.Move == null) dead.Add(kv.Key);
                 foreach (var id in dead)
                 {

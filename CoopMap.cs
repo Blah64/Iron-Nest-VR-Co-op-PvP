@@ -921,8 +921,8 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[map] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { var t = BitConverter.GetBytes(v); _buf[o] = t[0]; _buf[o + 1] = t[1]; _buf[o + 2] = t[2]; _buf[o + 3] = t[3]; return o + 4; }
-        private static int PutF(int o, float v) { var t = BitConverter.GetBytes(v); _buf[o] = t[0]; _buf[o + 1] = t[1]; _buf[o + 2] = t[2]; _buf[o + 3] = t[3]; return o + 4; }
+        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
+        private static int PutF(int o, float v) { int __b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)__b; _buf[o + 1] = (byte)(__b >> 8); _buf[o + 2] = (byte)(__b >> 16); _buf[o + 3] = (byte)(__b >> 24); return o + 4; }
         private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
 
         private static int PutStr(int o, string s)

@@ -114,6 +114,8 @@ namespace IronNestVR
         private static float _nextScan;
         private static float _nextSend;
         private static float _nextRecon;   // host: next current-state reconcile broadcast (REVIEW-fix P3)
+        private static float _nextElevDiag;     // throttle for the "applied peer elevation" (receiver) diagnostic
+        private static float _nextElevSendDiag;  // throttle for the "streaming elevation" (sender) diagnostic
 
         // Reusable send buffer (control packets are tiny: 1+4+4 max). Lazily created on the Unity thread.
         private static Il2CppStructArray<byte> _buf;
@@ -121,6 +123,9 @@ namespace IronNestVR
         // Scratch for strict group-packet parsing: read into here, validate every float finite, then publish to
         // gs.V only if the whole frame is intact (REVIEW-fix P2 — no partial/non-finite turret state).
         private static readonly float[] _tmpGroup = new float[5];
+        // Per-tick scratch: which groups WE own this frame. Cleared each Tick instead of reallocated. _grp is
+        // initialized above (source order), so sizing off _grp.Length here is safe at field-init time.
+        private static readonly bool[] _groupOwnedLocal = new bool[_grp.Length];
 
         private static int _grabs, _releases;
 
@@ -142,7 +147,8 @@ namespace IronNestVR
                 bool sendNow = Config.CoopSendHz <= 0f || now >= _nextSend;
                 if (sendNow && Config.CoopSendHz > 0f) _nextSend = now + 1f / Config.CoopSendHz;
 
-                bool[] groupOwnedLocal = new bool[_grp.Length];
+                Array.Clear(_groupOwnedLocal, 0, _groupOwnedLocal.Length);
+                var groupOwnedLocal = _groupOwnedLocal;
 
                 foreach (var c in _byId.Values)
                 {
@@ -191,6 +197,10 @@ namespace IronNestVR
                 if (sendNow)
                     for (int g = 1; g < _grp.Length; g++)
                         if (groupOwnedLocal[g]) SendGroupState((Group)g);
+
+                // Reclaimed the elevation dial locally → give gun-elevation control back to the turret controller
+                // (we force it off only while adopting the peer's aim).
+                if (_elevDriveSaved.HasValue && groupOwnedLocal[(int)Group.Elevation]) RestoreGunDrive();
 
                 for (int g = 0; g < _grp.Length; g++)
                     if (_grp[g].RemoteOwned && now >= _grp[g].Until) _grp[g].RemoteOwned = false;
@@ -323,9 +333,28 @@ namespace IronNestVR
                         _turret.DesiredRotation = gs.V[0];   // intent only — local sim slews CurrentAngle toward it
                         break;
                     case Group.Elevation:
+                        // The guns' elevation is normally slaved to the turret's elevation CONTROLLER
+                        // (driveGunElevationsFromController): every frame the turret re-derives each gun's target
+                        // from the physical elevation dial. On the side ADOPTING the peer's aim the dial is parked,
+                        // so that re-derivation kept clobbering the gun target back toward 0 and the barrel never
+                        // slewed. Worse, writing the DesiredElevationAngle PROPERTY only sets an inert reported
+                        // backing field — the slew physics (UpdateElevationPhysics) tracks the gun's
+                        // internalDesiredElevation, reached ONLY via SetDesiredElevation(). That double bug is the
+                        // "host sees the slider move but the elevation never changes / keeps resetting to the host's"
+                        // report. Fix: stop the controller re-driving, then hand each gun its REAL target. Restored
+                        // when we reclaim the dial (Tick) or drop the peer (ClearOwnership) — one owner at a time.
+                        OverrideGunDrive();
                         _turret.DesiredElevation = gs.V[0];
-                        if (_gunL != null) _gunL.DesiredElevationAngle = gs.V[1];
-                        if (_gunR != null) _gunR.DesiredElevationAngle = gs.V[2];
+                        if (_gunL != null) _gunL.SetDesiredElevation(gs.V[1]);
+                        if (_gunR != null) _gunR.SetDesiredElevation(gs.V[2]);
+                        // DIAG: with the fix, gunL.cur should now SLEW toward gunL.des across successive samples
+                        // (before, des stuck at the target while cur stayed 0 — the physics tracked a different field).
+                        if (Time.unscaledTime >= _nextElevDiag)
+                        {
+                            _nextElevDiag = Time.unscaledTime + 1f;
+                            Log.LogInfo($"[ctrl] applied peer elevation: turret={gs.V[0]:0.0} gunL={gs.V[1]:0.0} gunR={gs.V[2]:0.0} " +
+                                        $"(now gunL.des={(_gunL != null ? _gunL.DesiredElevationAngle : 0f):0.0} gunL.cur={(_gunL != null ? _gunL.CurrentElevation : 0f):0.0} drive={(_turret != null && _turret.driveGunElevationsFromController)})");
+                        }
                         break;
                     case Group.GunLeft:  ApplyGunState(_gunL, gs); break;
                     case Group.GunRight: ApplyGunState(_gunR, gs); break;
@@ -341,6 +370,30 @@ namespace IronNestVR
             try { if (gun.PowderCharges != powder) gun.SetPowderCharge(powder); } catch { }
             // gs.V[1] = reload-in-progress flag. We sync powder + readiness; faithful rammer-animation replay
             // is deferred (Phase 3 follow-up), so we don't force the reload coroutine state here.
+        }
+
+        // While we ADOPT the peer's elevation we force the turret controller to stop re-deriving the gun targets
+        // from our (parked) elevation dial — otherwise it overwrites the synced target every frame and the barrel
+        // never slews. Capture the original flag once; RestoreGunDrive puts it back when we reclaim the dial or
+        // lose the peer. Exactly ONE system drives the guns' elevation at a time (the dial OR the peer stream).
+        private static bool? _elevDriveSaved;
+        private static void OverrideGunDrive()
+        {
+            if (_turret == null) return;
+            try
+            {
+                if (!_elevDriveSaved.HasValue) _elevDriveSaved = _turret.driveGunElevationsFromController;
+                if (_turret.driveGunElevationsFromController) _turret.driveGunElevationsFromController = false;
+            }
+            catch { }
+        }
+        private static void RestoreGunDrive()
+        {
+            if (_turret != null && _elevDriveSaved.HasValue)
+            {
+                try { _turret.driveGunElevationsFromController = _elevDriveSaved.Value; } catch { }
+            }
+            _elevDriveSaved = null;
         }
 
         // ---------------- join-in-progress snapshot ----------------
@@ -415,13 +468,20 @@ namespace IronNestVR
             try
             {
                 int o = 0; _buf[o++] = MSG_RECON;
+                // The host's CURRENT gun elevation is authoritative ONLY while the host is the one driving it.
+                // When the CLIENT drives elevation (or nobody does) the host's gun-elevation reading must not be
+                // imposed on the client — broadcasting it (often stale, since the adopting side's barrel lags or,
+                // pre-fix, never slewed) is exactly what dragged the client's elevation back every reconcile.
+                // Send NaN for the gun CURRENT-elevation fields in that case; the client's Finite() guard skips
+                // them. Rotation stays authoritative — the turret always auto-slews CurrentAngle toward desired.
+                bool elevAuth = LocallyOwnsGroup(Group.Elevation);
                 o = PutFloat(o, _turret.DesiredRotation);
                 o = PutFloat(o, _turret.CurrentAngle);
                 o = PutFloat(o, _turret.DesiredElevation);
                 o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
-                o = PutFloat(o, _gunL != null ? _gunL.CurrentElevation : 0f);
+                o = PutFloat(o, elevAuth && _gunL != null ? _gunL.CurrentElevation : float.NaN);
                 o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
-                o = PutFloat(o, _gunR != null ? _gunR.CurrentElevation : 0f);
+                o = PutFloat(o, elevAuth && _gunR != null ? _gunR.CurrentElevation : float.NaN);
                 o = PutFloat(o, _gunL != null ? _gunL.PowderCharges : 0f);
                 o = PutFloat(o, _gunR != null ? _gunR.PowderCharges : 0f);
                 CoopP2P.Send(_buf, o, true);
@@ -429,30 +489,37 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[ctrl] send recon: " + e.Message); }
         }
 
-        // Client: keep DESIRED aim in sync (cheap, idempotent), and snap CURRENT angle/elevation to the host's only
-        // when drift exceeds the tolerance — so a converged turret never twitches, but a drifted one is pulled back.
-        // Skips any group the client is operating right now (the player's hand always wins; symmetric live drive is
-        // untouched). Powder is set to the host value regardless (discrete, no slew).
+        // Client: correct accumulated CURRENT-angle/elevation SLEW DRIFT against the host — but ONLY for a group
+        // whose DESIRED already AGREES with the host's (so we're fixing framerate/lost-packet slew lag, NOT
+        // overriding a fresh re-aim). It must NEVER write DESIRED: desired is the shared intent, delivered by the
+        // reliable ownership stream/release, and overwriting it is exactly what let the host drag the client's aim
+        // back to the host's value ("elevation keeps resetting to the host's" — the bug this fixes). Skips any group
+        // the client is operating right now. Powder is discrete (no slew) and host-authoritative when un-owned.
         private static void ApplyRecon(float[] v)
         {
             float tol = Mathf.Max(0.1f, Config.CoopTurretReconcileTolDeg);
             try
             {
-                if (!LocallyOwnsGroup(Group.Rotation) && Finite(v[0]) && Finite(v[1]))
+                // ROTATION: snap CurrentAngle only if the desired aim already matches and the current angle drifted.
+                if (!LocallyOwnsGroup(Group.Rotation) && Finite(v[0]) && Finite(v[1])
+                    && Mathf.Abs(Mathf.DeltaAngle(_turret.DesiredRotation, v[0])) <= tol
+                    && Mathf.Abs(Mathf.DeltaAngle(_turret.CurrentAngle, v[1])) > tol)
                 {
-                    _turret.DesiredRotation = v[0];
-                    if (Mathf.Abs(Mathf.DeltaAngle(_turret.CurrentAngle, v[1])) > tol)
-                    {
-                        _turret.CurrentAngle = v[1];
-                        try { _turret.ApplyRotationToTransforms(); } catch { }
-                        Log.LogInfo($"[ctrl] reconciled rotation -> {v[1]:0.0} (drift>{tol:0.0}deg) <- host");
-                    }
+                    _turret.CurrentAngle = v[1];
+                    try { _turret.ApplyRotationToTransforms(); } catch { }
+                    Log.LogInfo($"[ctrl] reconciled rotation current -> {v[1]:0.0} (desired agreed, drift>{tol:0.0}deg) <- host");
                 }
+                // ELEVATION (per-gun): snap CurrentElevation only where the gun's DESIRED already agrees with the host.
                 if (!LocallyOwnsGroup(Group.Elevation))
                 {
-                    if (Finite(v[2])) _turret.DesiredElevation = v[2];
-                    if (_gunL != null && Finite(v[3]) && Finite(v[4])) { _gunL.DesiredElevationAngle = v[3]; if (Mathf.Abs(_gunL.CurrentElevation - v[4]) > tol) _gunL.CurrentElevation = v[4]; }
-                    if (_gunR != null && Finite(v[5]) && Finite(v[6])) { _gunR.DesiredElevationAngle = v[5]; if (Mathf.Abs(_gunR.CurrentElevation - v[6]) > tol) _gunR.CurrentElevation = v[6]; }
+                    if (_gunL != null && Finite(v[3]) && Finite(v[4])
+                        && Mathf.Abs(_gunL.DesiredElevationAngle - v[3]) <= tol
+                        && Mathf.Abs(_gunL.CurrentElevation - v[4]) > tol)
+                        _gunL.CurrentElevation = v[4];
+                    if (_gunR != null && Finite(v[5]) && Finite(v[6])
+                        && Mathf.Abs(_gunR.DesiredElevationAngle - v[5]) <= tol
+                        && Mathf.Abs(_gunR.CurrentElevation - v[6]) > tol)
+                        _gunR.CurrentElevation = v[6];
                 }
                 if (_gunL != null && !LocallyOwnsGroup(Group.GunLeft)) { int p = Mathf.RoundToInt(v[7]); try { if (_gunL.PowderCharges != p) _gunL.SetPowderCharge(p); } catch { } }
                 if (_gunR != null && !LocallyOwnsGroup(Group.GunRight)) { int p = Mathf.RoundToInt(v[8]); try { if (_gunR.PowderCharges != p) _gunR.SetPowderCharge(p); } catch { } }
@@ -744,6 +811,17 @@ namespace IronNestVR
             int o = 0; _buf[o++] = MSG_GROUP; _buf[o++] = (byte)g;
             try { o = WriteGroupFloats(o, g); } catch { return; }
             CoopP2P.Send(_buf, o, false);
+            // DIAG (elevation desync hunt, sender side — self-sufficient on ONE log since host logs keep getting
+            // overwritten): what we actually STREAM for elevation. If gunL.des is ~0 while gunL.cur is raised, the
+            // control updates CURRENT not the DESIRED we send (capture bug → we must send current). If gunL.des
+            // carries the raised value but the peer's gun stays at 0 (per the [diag] DESYNC peer= field), the peer
+            // isn't adopting/slewing (apply bug).
+            if (g == Group.Elevation && Time.unscaledTime >= _nextElevSendDiag)
+            {
+                _nextElevSendDiag = Time.unscaledTime + 1f;
+                Log.LogInfo($"[ctrl] streaming elevation -> peer: turret.des={_turret.DesiredElevation:0.0} " +
+                            $"gunL.des={(_gunL != null ? _gunL.DesiredElevationAngle : 0f):0.0} gunL.cur={(_gunL != null ? _gunL.CurrentElevation : 0f):0.0}");
+            }
         }
 
         // Serialize a group's GroupFloatCount floats at offset o. Shared by the live MSG_GROUP stream and the
@@ -932,6 +1010,7 @@ namespace IronNestVR
             for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].Has = false; }
             _pendingGrab.Clear(); _pendingVal.Clear(); _echoUntil.Clear();
             _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
+            RestoreGunDrive();   // hand gun-elevation control back to the local turret controller on link-down
         }
 
         private static bool IsDragging(Ctrl c)
@@ -975,8 +1054,8 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[ctrl] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { var t = BitConverter.GetBytes(v); _buf[o] = t[0]; _buf[o + 1] = t[1]; _buf[o + 2] = t[2]; _buf[o + 3] = t[3]; return o + 4; }
-        private static int PutFloat(int o, float v) { var t = BitConverter.GetBytes(v); _buf[o] = t[0]; _buf[o + 1] = t[1]; _buf[o + 2] = t[2]; _buf[o + 3] = t[3]; return o + 4; }
+        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
+        private static int PutFloat(int o, float v) { int __b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)__b; _buf[o + 1] = (byte)(__b >> 8); _buf[o + 2] = (byte)(__b >> 16); _buf[o + 3] = (byte)(__b >> 24); return o + 4; }
 
         private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
         private static float GetFloat(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }

@@ -25,12 +25,17 @@ namespace IronNestVR
         public static bool Shown = false;         // opt-in via F7; never auto-grabs the flatscreen camera
         public static bool FlatInteractive;       // set by VrManager = Shown && not in VR -> free cursor + take clicks
 
-        private struct Btn { public Rect R; public string Label; public Action Act; }
+        private struct Btn { public Rect R; public string Label; public Action Act; public int JoinIdx; }
+
+        private static readonly List<(Rect r, string s)> _labels = new List<(Rect, string)>();
+        private static readonly List<Btn> _buttons = new List<Btn>();
 
         private static void Layout(out Rect box, out List<(Rect r, string s)> labels, out List<Btn> buttons)
         {
-            labels = new List<(Rect, string)>();
-            buttons = new List<Btn>();
+            _labels.Clear();
+            _buttons.Clear();
+            labels = _labels;
+            buttons = _buttons;
 
             const float x = 12f, w = 380f, rh = 26f, pad = 8f, gap = 4f;
             int count = SteamNet.Lobbies.Count;
@@ -43,9 +48,9 @@ namespace IronNestVR
             cy += rh + pad;
 
             float bw = (w - 20f - 2f * 6f) / 3f;
-            buttons.Add(new Btn { R = new Rect(x + 10f, cy, bw, rh), Label = "Create", Act = SteamNet.CreateLobby });
-            buttons.Add(new Btn { R = new Rect(x + 10f + (bw + 6f), cy, bw, rh), Label = "Refresh", Act = SteamNet.RefreshLobbyList });
-            buttons.Add(new Btn { R = new Rect(x + 10f + 2f * (bw + 6f), cy, bw, rh), Label = "Leave", Act = SteamNet.Leave });
+            buttons.Add(new Btn { R = new Rect(x + 10f, cy, bw, rh), Label = "Create", Act = SteamNet.CreateLobby, JoinIdx = -1 });
+            buttons.Add(new Btn { R = new Rect(x + 10f + (bw + 6f), cy, bw, rh), Label = "Refresh", Act = SteamNet.RefreshLobbyList, JoinIdx = -1 });
+            buttons.Add(new Btn { R = new Rect(x + 10f + 2f * (bw + 6f), cy, bw, rh), Label = "Leave", Act = SteamNet.Leave, JoinIdx = -1 });
             cy += rh + pad;
 
             labels.Add((new Rect(x + 10f, cy, w - 20f, rh), "Public lobbies:"));
@@ -58,9 +63,8 @@ namespace IronNestVR
             }
             for (int i = 0; i < count; i++)
             {
-                int idx = i;
                 labels.Add((new Rect(x + 16f, cy, w - 100f, rh), SteamNet.SlotLabel(i)));
-                buttons.Add(new Btn { R = new Rect(x + w - 80f, cy, 70f, rh - 2f), Label = "Join", Act = () => SteamNet.JoinLobbyByIndex(idx) });
+                buttons.Add(new Btn { R = new Rect(x + w - 80f, cy, 70f, rh - 2f), Label = "Join", Act = null, JoinIdx = i });
                 cy += rh + gap;
             }
         }
@@ -92,7 +96,7 @@ namespace IronNestVR
 
                 Layout(out _, out _, out var buttons);
                 for (int i = 0; i < buttons.Count; i++)
-                    if (buttons[i].R.Contains(gui)) { try { buttons[i].Act(); } catch { } break; }
+                    if (buttons[i].R.Contains(gui)) { try { if (buttons[i].JoinIdx >= 0) SteamNet.JoinLobbyByIndex(buttons[i].JoinIdx); else buttons[i].Act(); } catch { } break; }
             }
             catch { }
         }

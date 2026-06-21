@@ -437,7 +437,7 @@ namespace IronNestVR
         }
 
         // --- (de)serialization: write into the persistent Il2Cpp send array, read from the recv array ---
-        private static int PutF(int o, float f) { var t = BitConverter.GetBytes(f); _sendArr[o] = t[0]; _sendArr[o + 1] = t[1]; _sendArr[o + 2] = t[2]; _sendArr[o + 3] = t[3]; return o + 4; }
+        private static int PutF(int o, float f) { int __b = BitConverter.SingleToInt32Bits(f); _sendArr[o] = (byte)__b; _sendArr[o + 1] = (byte)(__b >> 8); _sendArr[o + 2] = (byte)(__b >> 16); _sendArr[o + 3] = (byte)(__b >> 24); return o + 4; }
         private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
         private static int PutQ(int o, Quaternion q) { o = PutF(o, q.x); o = PutF(o, q.y); o = PutF(o, q.z); o = PutF(o, q.w); return o; }
 
