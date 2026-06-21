@@ -8,13 +8,20 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Renders the other player from the pose stream in <see cref="CoopP2P"/>: a head (sphere + a "nose" cube
-    /// so facing is readable), a torso capsule so they read as a person rather than a floating head, and two
-    /// hands. The hands reuse the SAME XR-hand meshes as the local player (<see cref="HandVisuals.SharedBundle"/>),
-    /// posed at the remote grip poses with the same per-hand offset (<see cref="Config.HandOffsetPosR"/> etc.),
-    /// so a VR teammate looks like real hands instead of dots. Falls back to coloured spheres when the bundle
-    /// isn't loaded (e.g. on a flatscreen viewer, which never runs HandVisuals) — and upgrades to meshes if the
-    /// bundle appears later. A flatscreen player has no tracked hands, so they show as head + torso only.
+    /// Renders the other players from the per-peer pose stream in <see cref="CoopP2P"/>. Each remote player gets a
+    /// pooled <see cref="Avatar"/> rig: a head (sphere + a "nose" cube so facing is readable), a torso capsule so
+    /// they read as a person rather than a floating head, two hands, a floating persona name tag, and optional
+    /// "uniform" props (gas mask / Castile flag). The hands reuse the SAME XR-hand meshes as the local player
+    /// (<see cref="HandVisuals.SharedBundle"/>), posed at the remote grip poses with the same per-hand offset
+    /// (<see cref="Config.HandOffsetPosR"/> etc.), so a VR teammate looks like real hands instead of dots. Falls
+    /// back to coloured spheres when the bundle isn't loaded (e.g. on a flatscreen viewer, which never runs
+    /// HandVisuals) — and upgrades to meshes if the bundle appears later. A flatscreen player has no tracked
+    /// hands, so they show as head + torso only.
+    ///
+    /// Pooling: one <see cref="Avatar"/> per <see cref="CoopP2P.RemotePoses"/> key (the authoring SteamID; the F6
+    /// self-test injects under <see cref="CoopP2P.SelfTestId"/> and renders like any peer). When a key disappears
+    /// from the dictionary (the transport ages out stale poses) the matching avatar is hidden and reused later —
+    /// so we never thrash GameObject create/destroy as players come and go.
     ///
     /// Built on layer 0 with game-URP materials and colliders stripped, so both the VR eye cameras and the flat
     /// Main Camera draw it and it never blocks the laser / physics.
@@ -37,27 +44,36 @@ namespace IronNestVR
         // would inherit and shrink; posing directly keeps the offsets in real metres.
         private sealed class PropObj { public GameObject Go; public Vector3 Intrinsic; }
 
-        private static GameObject _root, _head, _body;
-        private static HandObj _l, _r;
-        private static bool _built;
+        // ---------------- per-peer avatar rig (pooled) ----------------
 
-        // Co-op "uniform": the gas mask rides the head (full look direction, yaw + pitch); the Castile flag rides
-        // the upright torso (yaw only) so it hangs like a cape off the back. Both are driven entirely by the
-        // already-synced head pose — no extra netcode — and behave the same for a VR teammate (VR head pose) or a
-        // flatscreen teammate (window camera), since the sender streams whichever camera applies.
-        private static PropObj _mask, _flag;
-        private static GameObject _nose;          // facing cube, tucked away while the mask covers the face
-        private static float _nextPropScan;
+        // All the GameObjects/state that used to be static now live per remote player. One instance per peer key;
+        // pooled in _avatars and hidden (not destroyed) when its peer drops out of the pose dictionary.
+        private sealed class Avatar
+        {
+            public GameObject Root, Head, Body, Nose;
+            public HandObj L, R;
+
+            // Co-op "uniform": the gas mask rides the head (full look direction, yaw + pitch); the Castile flag
+            // rides the upright torso (yaw only) so it hangs like a cape off the back. Both are driven entirely by
+            // the already-synced head pose — no extra netcode — and behave the same for a VR teammate (VR head
+            // pose) or a flatscreen teammate (window camera), since the sender streams whichever camera applies.
+            public PropObj Mask, Flag;
+            public float NextPropScan;
+
+            // Floating persona name tag above the head.
+            public GameObject NameRoot;
+            public TextMeshPro NameText;
+            public string ShownName;
+        }
+
+        private static readonly Dictionary<ulong, Avatar> _avatars = new Dictionary<ulong, Avatar>();
+        private static readonly List<ulong> _scratchKeys = new List<ulong>();   // safe iteration for removal pass
+
         private static readonly string[] MaskTokens = { "gas", "mask" };
         private static readonly string[] FlagTokens = { "castile", "flag" };
 
-        // Floating persona name tag above the head.
-        private static GameObject _nameRoot;
-        private static TextMeshPro _nameText;
-        private static string _shownName;
-
-        // Where the name tag should face. VR sets the head pose each frame (SetViewer); flatscreen falls back
-        // to Camera.main. Without this the tag would face the flat camera, which in VR isn't the player's eyes.
+        // Where name tags should face. VR sets the head pose each frame (SetViewer); flatscreen falls back to
+        // Camera.main. Without this the tags would face the flat camera, which in VR isn't the player's eyes.
         private static Vector3 _viewerPos;
         private static bool _viewerValid;
 
@@ -68,81 +84,99 @@ namespace IronNestVR
 
         public static void Update()
         {
-            if (!CoopP2P.RemoteValid)
-            {
-                if (_root != null && _root.activeSelf) _root.SetActive(false);
-                return;
-            }
             try
             {
-                Ensure();
-                if (!_root.activeSelf) { _root.SetActive(true); Log.LogInfo("[avatar] remote avatar shown"); }
+                var poses = CoopP2P.RemotePoses;
 
-                _head.transform.SetPositionAndRotation(CoopP2P.HeadPos, CoopP2P.HeadRot);
-                PositionBody(CoopP2P.HeadPos, CoopP2P.HeadRot);
-                UpdateNameTag(CoopP2P.HeadPos);
-
-                bool hands = CoopP2P.HasHands;
-                if (_l.Anchor.activeSelf != hands) _l.Anchor.SetActive(hands);
-                if (_r.Anchor.activeSelf != hands) _r.Anchor.SetActive(hands);
-                if (hands)
+                // Drive (or spawn) an avatar for every present peer.
+                foreach (var kv in poses)
                 {
-                    UpgradeIfBundleArrived();
-                    PlaceHand(_l, false, CoopP2P.LPos, CoopP2P.LRot);
-                    PlaceHand(_r, true, CoopP2P.RPos, CoopP2P.RRot);
+                    Avatar a = GetOrCreate(kv.Key);
+                    if (a == null) continue;
+                    DriveAvatar(a, kv.Value);
                 }
 
-                TickProps(CoopP2P.HeadPos, CoopP2P.HeadRot);
+                // Hide any pooled avatar whose peer dropped out of the dictionary (kept for reuse, not destroyed).
+                _scratchKeys.Clear();
+                foreach (var kv in _avatars)
+                    if (!poses.ContainsKey(kv.Key)) _scratchKeys.Add(kv.Key);
+                for (int i = 0; i < _scratchKeys.Count; i++)
+                {
+                    var a = _avatars[_scratchKeys[i]];
+                    if (a.Root != null && a.Root.activeSelf) a.Root.SetActive(false);
+                }
             }
             catch (Exception e) { Log.LogWarning("[avatar] update: " + e.Message); }
         }
 
+        private static void DriveAvatar(Avatar a, CoopP2P.RemotePose pose)
+        {
+            if (a.Root == null) return;
+            if (!a.Root.activeSelf) { a.Root.SetActive(true); Log.LogInfo("[avatar] remote avatar shown"); }
+
+            a.Head.transform.SetPositionAndRotation(pose.HeadPos, pose.HeadRot);
+            PositionBody(a, pose.HeadPos, pose.HeadRot);
+            UpdateNameTag(a, pose.HeadPos, pose.Name);
+
+            bool hands = pose.HasHands;
+            if (a.L.Anchor.activeSelf != hands) a.L.Anchor.SetActive(hands);
+            if (a.R.Anchor.activeSelf != hands) a.R.Anchor.SetActive(hands);
+            if (hands)
+            {
+                UpgradeIfBundleArrived(a);
+                PlaceHand(a.L, false, pose.LPos, pose.LRot, pose);
+                PlaceHand(a.R, true, pose.RPos, pose.RRot, pose);
+            }
+
+            TickProps(a, pose.HeadPos, pose.HeadRot);
+        }
+
         // The torso hangs below the head and follows only head YAW (not pitch/roll), so it reads as an upright
         // body leaning at the console rather than tumbling with the head.
-        private static void PositionBody(Vector3 headPos, Quaternion headRot)
+        private static void PositionBody(Avatar a, Vector3 headPos, Quaternion headRot)
         {
-            if (_body == null) return;
+            if (a.Body == null) return;
             float yaw = headRot.eulerAngles.y;
             var yawRot = Quaternion.Euler(0f, yaw, 0f);
-            _body.transform.SetPositionAndRotation(headPos + Vector3.down * 0.45f, yawRot);
+            a.Body.transform.SetPositionAndRotation(headPos + Vector3.down * 0.45f, yawRot);
         }
 
         // ---------------- uniform props (gas mask + Castile flag) ----------------
 
         // Resolve each enabled prop from the game's loaded assets on a light timer until found, then pose it from
         // the head pose every frame: the mask tracks the FULL head rotation, the flag tracks YAW ONLY.
-        private static void TickProps(Vector3 headPos, Quaternion headRot)
+        private static void TickProps(Avatar a, Vector3 headPos, Quaternion headRot)
         {
-            bool needMask = Config.CoopGasMask && (_mask == null || _mask.Go == null);
-            bool needFlag = Config.CoopFlag && (_flag == null || _flag.Go == null);
-            if ((needMask || needFlag) && Time.unscaledTime >= _nextPropScan)
+            bool needMask = Config.CoopGasMask && (a.Mask == null || a.Mask.Go == null);
+            bool needFlag = Config.CoopFlag && (a.Flag == null || a.Flag.Go == null);
+            if ((needMask || needFlag) && Time.unscaledTime >= a.NextPropScan)
             {
-                _nextPropScan = Time.unscaledTime + 2f;
-                if (needMask) { var go = AvatarProps.Build("gasmask", MaskTokens, HeadColor); if (go != null) _mask = Attach(go); }
-                if (needFlag) { var go = AvatarProps.BuildCape("castileflag", FlagTokens, BodyColor); if (go != null) _flag = Attach(go); }
+                a.NextPropScan = Time.unscaledTime + 2f;
+                if (needMask) { var go = AvatarProps.Build("gasmask", MaskTokens, HeadColor); if (go != null) a.Mask = Attach(a, go); }
+                if (needFlag) { var go = AvatarProps.BuildCape("castileflag", FlagTokens, BodyColor); if (go != null) a.Flag = Attach(a, go); }
             }
 
             // Gas mask: parented to nothing, posed at the head with a head-local offset → inherits yaw + pitch.
-            PoseProp(_mask, Config.CoopGasMask, Config.CoopMaskScale,
+            PoseProp(a.Mask, Config.CoopGasMask, Config.CoopMaskScale,
                      headPos, headRot, Config.CoopMaskOffset, Config.CoopMaskEuler);
 
             // Castile flag: posed at the torso anchor with a yaw-only rotation → hangs upright like a cape.
             float yaw = headRot.eulerAngles.y;
             var yawRot = Quaternion.Euler(0f, yaw, 0f);
-            PoseProp(_flag, Config.CoopFlag, Config.CoopFlagScale,
+            PoseProp(a.Flag, Config.CoopFlag, Config.CoopFlagScale,
                      headPos + Vector3.down * 0.45f, yawRot, Config.CoopFlagOffset, Config.CoopFlagEuler);
 
             // Tuck the facing "nose" cube away while the mask covers the face (cosmetic).
-            bool maskOn = _mask != null && _mask.Go != null && Config.CoopGasMask;
-            if (_nose != null && _nose.activeSelf == maskOn) _nose.SetActive(!maskOn);
+            bool maskOn = a.Mask != null && a.Mask.Go != null && Config.CoopGasMask;
+            if (a.Nose != null && a.Nose.activeSelf == maskOn) a.Nose.SetActive(!maskOn);
         }
 
         // Park a freshly built prop under the avatar root (unscaled) and remember its intrinsic scale so the
         // Config scale stays a clean uniform multiplier (matters for the texture-quad path, whose intrinsic
         // localScale carries the flag's aspect ratio).
-        private static PropObj Attach(GameObject go)
+        private static PropObj Attach(Avatar a, GameObject go)
         {
-            go.transform.SetParent(_root.transform, false);
+            go.transform.SetParent(a.Root.transform, false);
             SetLayer(go, 0);
             return new PropObj { Go = go, Intrinsic = go.transform.localScale };
         }
@@ -158,36 +192,36 @@ namespace IronNestVR
             t.SetPositionAndRotation(anchorPos + anchorRot * off, anchorRot * Quaternion.Euler(eul));
         }
 
-        // VR passes the head pose so the name tag faces the player's eyes; flatscreen leaves it invalid and we
-        // fall back to Camera.main. Called every frame from VrManager.
+        // VR passes the head pose so name tags face the player's eyes; flatscreen leaves it invalid and we fall
+        // back to Camera.main. Called every frame from VrManager; applies to every pooled avatar's name tag.
         public static void SetViewer(Vector3 pos, bool valid) { _viewerPos = pos; _viewerValid = valid; }
 
-        private static Vector3 ViewerPos()
+        private static Vector3 ViewerPos(Avatar a)
         {
             if (_viewerValid) return _viewerPos;
             try { var c = Camera.main; if (c != null) return c.transform.position; } catch { }
-            return (_head != null) ? _head.transform.position + Vector3.back : Vector3.back;
+            return (a != null && a.Head != null) ? a.Head.transform.position + Vector3.back : Vector3.back;
         }
 
         // Position + billboard the name tag above the head, and keep its text in sync with the peer's persona.
-        private static void UpdateNameTag(Vector3 headPos)
+        private static void UpdateNameTag(Avatar a, Vector3 headPos, string name)
         {
-            if (_nameRoot == null) return;
-            bool show = Config.CoopNameTags && !string.IsNullOrEmpty(CoopP2P.PeerName);
-            if (_nameRoot.activeSelf != show) _nameRoot.SetActive(show);
+            if (a.NameRoot == null) return;
+            bool show = Config.CoopNameTags && !string.IsNullOrEmpty(name);
+            if (a.NameRoot.activeSelf != show) a.NameRoot.SetActive(show);
             if (!show) return;
 
-            if (_shownName != CoopP2P.PeerName)
+            if (a.ShownName != name)
             {
-                _shownName = CoopP2P.PeerName;
-                if (_nameText != null) { _nameText.text = _shownName; _nameText.ForceMeshUpdate(false, false); }
+                a.ShownName = name;
+                if (a.NameText != null) { a.NameText.text = name; a.NameText.ForceMeshUpdate(false, false); }
             }
 
             Vector3 tagPos = headPos + Vector3.up * Config.NameTagHeight;
-            _nameRoot.transform.SetPositionAndRotation(tagPos, VrText.FaceViewer(tagPos, ViewerPos()));
+            a.NameRoot.transform.SetPositionAndRotation(tagPos, VrText.FaceViewer(tagPos, ViewerPos(a)));
         }
 
-        private static void PlaceHand(HandObj h, bool right, Vector3 pos, Quaternion rot)
+        private static void PlaceHand(HandObj h, bool right, Vector3 pos, Quaternion rot, CoopP2P.RemotePose pose)
         {
             if (h == null || h.Anchor == null) return;
             h.Anchor.transform.SetPositionAndRotation(pos, rot);
@@ -202,76 +236,85 @@ namespace IronNestVR
                 h.Model.localEulerAngles = right ? Config.HandOffsetEulR : Config.HandOffsetEulL;
 
                 // Curl the fingers from the peer's streamed amounts (mesh hands aren't mirrored, so no sign flip).
-                if (Config.CoopFingerCurlSync && CoopP2P.HasCurl && h.Joints != null)
+                if (Config.CoopFingerCurlSync && pose.HasCurl && h.Joints != null)
                 {
-                    float idx = right ? CoopP2P.RCurlIndex : CoopP2P.LCurlIndex;
-                    float oth = right ? CoopP2P.RCurlOther : CoopP2P.LCurlOther;
+                    float idx = right ? pose.RCurlIndex : pose.LCurlIndex;
+                    float oth = right ? pose.RCurlOther : pose.LCurlOther;
                     FingerCurl.Apply(h.Joints, idx, oth);
                 }
             }
         }
 
-        // ---------------- build ----------------
+        // ---------------- build / pool ----------------
 
-        private static void Ensure()
+        // Pool lookup: reuse a hidden avatar if this peer was seen before, otherwise build a fresh rig.
+        private static Avatar GetOrCreate(ulong id)
         {
-            if (_built && _root != null) return;
-            _root = new GameObject("CoopRemoteAvatar");
-            UnityEngine.Object.DontDestroyOnLoad(_root);
-            _root.hideFlags = HideFlags.HideAndDontSave;
+            if (_avatars.TryGetValue(id, out var a) && a != null && a.Root != null) return a;
+            a = Build();
+            if (a != null) _avatars[id] = a;
+            return a;
+        }
 
-            _head = Ball(0.22f, HeadColor);
-            _head.transform.SetParent(_root.transform, false);
-            _nose = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            StripCollider(_nose);
-            _nose.transform.SetParent(_head.transform, false);
-            _nose.transform.localScale = new Vector3(0.05f, 0.05f, 0.14f);
-            _nose.transform.localPosition = new Vector3(0f, 0f, 0.16f);
-            Paint(_nose, new Color(1f, 0.85f, 0.2f));
-            _nose.layer = 0;
+        private static Avatar Build()
+        {
+            var a = new Avatar();
+            a.Root = new GameObject("CoopRemoteAvatar");
+            UnityEngine.Object.DontDestroyOnLoad(a.Root);
+            a.Root.hideFlags = HideFlags.HideAndDontSave;
+
+            a.Head = Ball(0.22f, HeadColor);
+            a.Head.transform.SetParent(a.Root.transform, false);
+            a.Nose = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            StripCollider(a.Nose);
+            a.Nose.transform.SetParent(a.Head.transform, false);
+            a.Nose.transform.localScale = new Vector3(0.05f, 0.05f, 0.14f);
+            a.Nose.transform.localPosition = new Vector3(0f, 0f, 0.16f);
+            Paint(a.Nose, new Color(1f, 0.85f, 0.2f));
+            a.Nose.layer = 0;
 
             // Torso: a capsule (~0.6 m tall) standing under the head.
-            _body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
-            StripCollider(_body);
-            _body.name = "CoopBody";
-            _body.transform.SetParent(_root.transform, false);
-            _body.transform.localScale = new Vector3(0.34f, 0.30f, 0.34f);
-            Paint(_body, BodyColor);
-            _body.layer = 0;
+            a.Body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+            StripCollider(a.Body);
+            a.Body.name = "CoopBody";
+            a.Body.transform.SetParent(a.Root.transform, false);
+            a.Body.transform.localScale = new Vector3(0.34f, 0.30f, 0.34f);
+            Paint(a.Body, BodyColor);
+            a.Body.layer = 0;
 
-            _l = BuildHand(false);
-            _r = BuildHand(true);
+            a.L = BuildHand(a, false);
+            a.R = BuildHand(a, true);
 
-            BuildNameTag();
+            BuildNameTag(a);
 
-            _built = true;
-            Log.LogInfo($"[avatar] built remote avatar (head + body + hands{(_l.IsMesh ? " [mesh]" : " [sphere]")} + name tag)");
+            Log.LogInfo($"[avatar] built remote avatar (head + body + hands{(a.L.IsMesh ? " [mesh]" : " [sphere]")} + name tag)");
+            return a;
         }
 
         // A small floating card above the head carrying the peer's Steam persona name. 3D TMP on layer 0, so it
         // draws in both the VR eyes and the flat camera; billboarded toward the viewer each frame.
-        private static void BuildNameTag()
+        private static void BuildNameTag(Avatar a)
         {
             try
             {
-                _nameRoot = new GameObject("CoopNameTag");
-                _nameRoot.transform.SetParent(_root.transform, false);
-                _nameRoot.layer = 0;
-                var bg = VrText.Panel(_nameRoot.transform, new Vector2(0.36f, 0.10f),
+                a.NameRoot = new GameObject("CoopNameTag");
+                a.NameRoot.transform.SetParent(a.Root.transform, false);
+                a.NameRoot.layer = 0;
+                var bg = VrText.Panel(a.NameRoot.transform, new Vector2(0.36f, 0.10f),
                                       new Color(0.04f, 0.05f, 0.07f, 0.78f), 0);
                 bg.transform.localPosition = Vector3.zero;
-                _nameText = VrText.Make(_nameRoot.transform, "", new Vector2(0.33f, 0.075f),
+                a.NameText = VrText.Make(a.NameRoot.transform, "", new Vector2(0.33f, 0.075f),
                                         new Color(0.90f, 0.95f, 1f, 1f), 0, true);
-                _nameText.transform.localPosition = new Vector3(0f, 0f, -0.006f); // toward viewer => in front of bg
-                _nameRoot.SetActive(false);
+                a.NameText.transform.localPosition = new Vector3(0f, 0f, -0.006f); // toward viewer => in front of bg
+                a.NameRoot.SetActive(false);
             }
             catch (Exception e) { Log.LogWarning("[avatar] name tag build: " + e.Message); }
         }
 
-        private static HandObj BuildHand(bool right)
+        private static HandObj BuildHand(Avatar a, bool right)
         {
             var anchor = new GameObject(right ? "CoopHandR" : "CoopHandL");
-            anchor.transform.SetParent(_root.transform, false);
+            anchor.transform.SetParent(a.Root.transform, false);
             anchor.layer = 0;
             var h = new HandObj { Anchor = anchor };
             BuildHandModel(h, right);
@@ -325,11 +368,11 @@ namespace IronNestVR
         // If a hand was built as a sphere because the bundle wasn't ready yet, swap it for the real mesh once
         // the bundle has loaded (so a remote avatar that appeared before the local hands finished loading still
         // gets upgraded).
-        private static void UpgradeIfBundleArrived()
+        private static void UpgradeIfBundleArrived(Avatar a)
         {
             if (HandVisuals.SharedBundle == null) return;
-            if (!_l.IsMesh) Rebuild(_l, false);
-            if (!_r.IsMesh) Rebuild(_r, true);
+            if (!a.L.IsMesh) Rebuild(a.L, false);
+            if (!a.R.IsMesh) Rebuild(a.R, true);
         }
 
         private static void Rebuild(HandObj h, bool right)

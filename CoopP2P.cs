@@ -66,17 +66,27 @@ namespace IronNestVR
         public static bool IsHost;
         public static ulong MyId => _myId;
 
-        // Latest remote pose (world space). SINGLE-slot for now — correct at the 2-player cap; Phase B replaces
-        // this with a per-origin dictionary so >2 avatars render. Pose origin is derived but not yet keyed on.
-        public static bool RemoteValid;
-        private static float _remoteAge;
-        public static Vector3 HeadPos; public static Quaternion HeadRot = Quaternion.identity;
-        public static bool HasHands;
-        public static Vector3 LPos, RPos; public static Quaternion LRot = Quaternion.identity, RRot = Quaternion.identity;
-        // Remote finger curl (0..1): index from the trigger, "other" from the grip. RemoteAvatar bends the hand
-        // mesh from these when HasCurl. Only set when the peer streams it (FLAG_CURL).
-        public static bool HasCurl;
-        public static float LCurlIndex, LCurlOther, RCurlIndex, RCurlOther;
+        // Per-peer remote pose (world space), keyed by the authoring SteamID (Phase B). RemoteAvatar pools one
+        // rig per entry, so >2 avatars render. Replaces the single-slot block. The F6 solo render test injects
+        // under SelfTestId. Finger curl (0..1): index from the trigger, "other" from the grip; only set when the
+        // peer streams it (FLAG_CURL).
+        public struct RemotePose
+        {
+            public Vector3 HeadPos; public Quaternion HeadRot;
+            public bool HasHands; public Vector3 LPos, RPos; public Quaternion LRot, RRot;
+            public bool HasCurl; public float LCurlIndex, LCurlOther, RCurlIndex, RCurlOther;
+            public string Name;   // persona name for the avatar's name tag
+            public float Age;     // seconds since last update; > RemoteStaleSeconds ⇒ expired + removed
+        }
+        private static readonly Dictionary<ulong, RemotePose> _poses = new Dictionary<ulong, RemotePose>();
+        private static readonly Dictionary<ulong, string> _peerNames = new Dictionary<ulong, string>();
+        private static readonly List<ulong> _poseKeys = new List<ulong>();   // scratch for safe expiry iteration
+        public const ulong SelfTestId = 0xFEEDFACEUL;   // synthetic origin for the F6 solo render test
+
+        // Read-only view for RemoteAvatar to pool/iterate per peer. Do not mutate.
+        public static IReadOnlyDictionary<ulong, RemotePose> RemotePoses => _poses;
+        public static bool AnyRemote => _poses.Count > 0;
+
         public static Vector3 LastSentHead;   // diag: the head world-pos we last transmitted
 
         // The peer's Steam persona name (for the join toast + the avatar name tag); "" when no peer.
@@ -155,7 +165,7 @@ namespace IronNestVR
             {
                 _wasLoopback = false;
                 ClearPeers(); IsHost = false; PeerName = ""; _snapAt = 0f;
-                if (!SelfTest) RemoteValid = false;
+                ClearRealPoses();
                 Log.LogInfo("[p2p] loopback ended — peers cleared");
             }
 
@@ -165,7 +175,7 @@ namespace IronNestVR
             Receive();
             CoopNetSim.Pump(Time.unscaledTime, DispatchManaged);   // release any NetSim-delayed packets (test aid)
             if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
-            if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
+            AgeRemotePoses(dt);
         }
 
         // Loopback (same-machine test) counterpart of the Steam Init+UpdatePeer+Receive trio. Derives role from
@@ -185,6 +195,7 @@ namespace IronNestVR
             {
                 _peers.Add(new CSteamID { m_SteamID = peerSyn });
                 PeerName = IsHost ? "Loopback client" : "Loopback host";
+                _peerNames[peerSyn] = PeerName;
                 Log.LogInfo($"[p2p] loopback link up — role={(IsHost ? "HOST" : "client")}");
                 Notify.PeerJoined(PeerName, IsHost);
                 if (IsHost) { _snapTarget = new CSteamID { m_SteamID = peerSyn }; _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo("[p2p] host: loopback join snapshot scheduled"); }
@@ -192,15 +203,15 @@ namespace IronNestVR
             }
             else if (!connected && _peers.Count > 0)
             {
-                _peers.Clear(); Notify.PeerLeft(PeerName); PeerName = ""; _snapAt = 0f;
-                if (!SelfTest) RemoteValid = false;
+                _peers.Clear(); _peerNames.Clear(); Notify.PeerLeft(PeerName); PeerName = ""; _snapAt = 0f;
+                ClearRealPoses();
                 Log.LogInfo("[p2p] loopback link down");
             }
 
             ReceiveLoopback();
             CoopNetSim.Pump(Time.unscaledTime, DispatchManaged);   // release any NetSim-delayed packets (test aid)
             if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
-            if (RemoteValid && !SelfTest) { _remoteAge += dt; if (_remoteAge > Config.RemoteStaleSeconds) { RemoteValid = false; Log.LogInfo($"[p2p] remote pose stale ({_remoteAge:F1}s) — hiding avatar"); } }
+            AgeRemotePoses(dt);
         }
 
         // Allocate the persistent Il2Cpp packet buffers (+ the managed loopback scratch). Init() does this for
@@ -223,6 +234,36 @@ namespace IronNestVR
             if (!LoopbackTransport.Active)
                 foreach (var p in _peers) CloseSession(p);
             _peers.Clear();
+            _peerNames.Clear();
+        }
+
+        // Age every remote pose by dt and drop the ones that haven't refreshed within RemoteStaleSeconds (lost
+        // peer / link). The self-test pose persists while SelfTest is on (re-injected each frame). Keys are copied
+        // out first so we can Remove during the pass without invalidating the dictionary enumerator.
+        private static void AgeRemotePoses(float dt)
+        {
+            if (_poses.Count == 0) return;
+            _poseKeys.Clear();
+            foreach (var k in _poses.Keys) _poseKeys.Add(k);
+            for (int i = 0; i < _poseKeys.Count; i++)
+            {
+                ulong k = _poseKeys[i];
+                if (k == SelfTestId && SelfTest) continue;
+                var p = _poses[k];
+                p.Age += dt;
+                if (p.Age > Config.RemoteStaleSeconds) { _poses.Remove(k); Log.LogInfo($"[p2p] remote pose stale ({p.Age:F1}s) — hiding avatar {k}"); }
+                else _poses[k] = p;
+            }
+        }
+
+        // Drop all real remote poses (lobby left / peer gone / loopback ended). Keeps the self-test entry so F6
+        // mirroring survives a teardown — matching the old "if (!SelfTest) RemoteValid = false" behavior.
+        private static void ClearRealPoses()
+        {
+            if (_poses.Count == 0) return;
+            _poseKeys.Clear();
+            foreach (var k in _poses.Keys) _poseKeys.Add(k);
+            for (int i = 0; i < _poseKeys.Count; i++) if (_poseKeys[i] != SelfTestId) _poses.Remove(_poseKeys[i]);
         }
 
         // One-line status for the co-op diagnostics hub.
@@ -231,8 +272,8 @@ namespace IronNestVR
             Camera cam = null; try { cam = Camera.main; } catch { }
             string myCam = cam != null ? V(cam.transform.position) : "n/a";
             return $"net: {(SteamNet.InLobby ? "in-lobby" : "no-lobby")} peers={_peers.Count} " +
-                   $"role={(IsHost ? "HOST" : "client")} sent={_sent} recvd={_recvd} | avatar valid={RemoteValid} hands={HasHands} " +
-                   $"remHead={V(HeadPos)} myCam={myCam} mySent={V(LastSentHead)}";
+                   $"role={(IsHost ? "HOST" : "client")} sent={_sent} recvd={_recvd} | avatars={_poses.Count} " +
+                   $"myCam={myCam} mySent={V(LastSentHead)}";
         }
 
         // Rebuild _peers from the lobby roster (everyone except me), opening/closing sessions and firing
@@ -244,7 +285,7 @@ namespace IronNestVR
                 if (_peers.Count > 0) { Notify.PeerLeft(PeerName); ClearPeers(); PeerName = ""; Log.LogInfo("[p2p] not in lobby — peers cleared"); }
                 IsHost = false;
                 _snapAt = 0f;
-                if (!SelfTest) RemoteValid = false;
+                ClearRealPoses();
                 return;
             }
             try
@@ -269,7 +310,8 @@ namespace IronNestVR
                     _peers.Add(m);
                     string nm = ""; try { nm = SteamFriends.GetFriendPersonaName(m); } catch { }
                     PeerName = nm;
-                    if (!SelfTest) RemoteValid = false;   // don't carry a stale avatar onto a new peer
+                    _peerNames[m.m_SteamID] = nm;
+                    _poses.Remove(m.m_SteamID);   // don't carry a stale avatar onto a (re)joining peer
                     Log.LogInfo($"[p2p] peer + {m.m_SteamID} ('{nm}')  (now {_peers.Count} peer(s))");
                     Notify.PeerJoined(nm, IsHost);
                     // Host pushes a full-world snapshot to the joiner once the session settles.
@@ -283,11 +325,13 @@ namespace IronNestVR
                     var gone = _peers[i];
                     CloseSession(gone);
                     _peers.RemoveAt(i);
+                    _poses.Remove(gone.m_SteamID);
+                    _peerNames.Remove(gone.m_SteamID);
                     Log.LogInfo($"[p2p] peer - {gone.m_SteamID} left  (now {_peers.Count} peer(s))");
                     Notify.PeerLeft(PeerName);
                 }
 
-                if (_peers.Count == 0) { _snapAt = 0f; if (!SelfTest) RemoteValid = false; }
+                if (_peers.Count == 0) { _snapAt = 0f; ClearRealPoses(); }
             }
             catch (Exception e) { Log.LogWarning("[p2p] peer: " + e.Message); }
         }
@@ -428,14 +472,20 @@ namespace IronNestVR
             return LoopbackTransport.Send(_loopScratch, len);
         }
 
-        // Fake-remote injection for the F6 solo render test (writes the single-slot block directly; no wire).
+        // Fake-remote injection for the F6 solo render test (writes a self-test pose entry directly; no wire).
         public static void InjectRemote(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr,
                                         bool hasCurl = false, float lCurlIdx = 0f, float lCurlOth = 0f, float rCurlIdx = 0f, float rCurlOth = 0f)
         {
-            HeadPos = hp; HeadRot = hr; HasHands = hasHands; LPos = lp; LRot = lr; RPos = rp; RRot = rr;
-            HasCurl = hasHands && hasCurl;
-            if (HasCurl) { LCurlIndex = lCurlIdx; LCurlOther = lCurlOth; RCurlIndex = rCurlIdx; RCurlOther = rCurlOth; }
-            RemoteValid = true; _remoteAge = 0f;
+            bool curl = hasHands && hasCurl;
+            _poses[SelfTestId] = new RemotePose
+            {
+                HeadPos = hp, HeadRot = hr, HasHands = hasHands,
+                LPos = lp, LRot = lr, RPos = rp, RRot = rr,
+                HasCurl = curl,
+                LCurlIndex = curl ? lCurlIdx : 0f, LCurlOther = curl ? lCurlOth : 0f,
+                RCurlIndex = curl ? rCurlIdx : 0f, RCurlOther = curl ? rCurlOth : 0f,
+                Name = "(self-test)", Age = 0f,
+            };
         }
 
         private static void Receive()
@@ -562,15 +612,18 @@ namespace IronNestVR
             if (hands && (!Finite(lp) || !Finite(rp) || !FiniteRot(lr) || !FiniteRot(rr))) return;
             if (curl && (!Finite(lci) || !Finite(lco) || !Finite(rci) || !Finite(rco))) return;
 
-            HeadPos = hp; HeadRot = hr; HasHands = hands;
-            if (hands) { LPos = lp; LRot = lr; RPos = rp; RRot = rr; }
-            HasCurl = curl;
-            if (curl)
+            string nm = _peerNames.TryGetValue(origin, out var pn) ? pn : "";
+            _poses[origin] = new RemotePose
             {
-                LCurlIndex = Mathf.Clamp01(lci); LCurlOther = Mathf.Clamp01(lco);
-                RCurlIndex = Mathf.Clamp01(rci); RCurlOther = Mathf.Clamp01(rco);
-            }
-            RemoteValid = true; _remoteAge = 0f; _recvd++;
+                HeadPos = hp, HeadRot = hr, HasHands = hands,
+                LPos = hands ? lp : Vector3.zero, LRot = hands ? lr : Quaternion.identity,
+                RPos = hands ? rp : Vector3.zero, RRot = hands ? rr : Quaternion.identity,
+                HasCurl = curl,
+                LCurlIndex = curl ? Mathf.Clamp01(lci) : 0f, LCurlOther = curl ? Mathf.Clamp01(lco) : 0f,
+                RCurlIndex = curl ? Mathf.Clamp01(rci) : 0f, RCurlOther = curl ? Mathf.Clamp01(rco) : 0f,
+                Name = nm, Age = 0f,
+            };
+            _recvd++;
         }
 
         // --- (de)serialization: write into a send array, read from the recv array ---

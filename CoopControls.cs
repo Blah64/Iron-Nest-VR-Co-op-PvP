@@ -75,7 +75,7 @@ namespace IronNestVR
             public bool LocalOwned;                 // drag: we are operating it right now
             public bool PrevDragging;               // drag: edge-detect on isDragging
             public bool PrevClicked;                // click: edge-detect on isClicked
-            public bool RemoteOwned;                // the peer is operating it
+            public ulong RemoteOwner;               // SteamID of the peer operating it (0 = none)
             public float RemoteUntil;               // ownership/value freshness expiry
             public bool HasRemoteVal;
             public float RemoteVal;                 // dial: accumulated angle; slider: current distance
@@ -95,7 +95,7 @@ namespace IronNestVR
         // Remote messages that arrive before the control is registered (different scene-load timing). Applied
         // when the control first appears in EnsureRegistry.
         private static readonly Dictionary<int, float> _pendingVal = new Dictionary<int, float>();
-        private static readonly Dictionary<int, Group> _pendingGrab = new Dictionary<int, Group>();
+        private static readonly Dictionary<int, ulong> _pendingGrab = new Dictionary<int, ulong>();   // netId -> grab origin
 
         // Echo guard: when we REPLAY a peer's click/fire, the game flips isClicked/hasFired on our side too,
         // which our own poll would re-detect and bounce back. Suppress local detection for a control (keyed by
@@ -161,7 +161,7 @@ namespace IronNestVR
                         // Rising edge: claim the control unless the peer currently owns it (then we yield —
                         // their stream overrides our local movement in LateApply; we never fight the game's
                         // own drag system).
-                        if (!(c.RemoteOwned && now < c.RemoteUntil))
+                        if (!(c.RemoteOwner != 0 && now < c.RemoteUntil))
                         {
                             c.LocalOwned = true;
                             SendGrab(c);
@@ -185,7 +185,7 @@ namespace IronNestVR
                     }
 
                     // Expire remote ownership (lost RELEASE / vanished peer).
-                    if (c.RemoteOwned && now >= c.RemoteUntil) { c.RemoteOwned = false; RecomputeGroupRemote(c.Grp); }
+                    if (c.RemoteOwner != 0 && now >= c.RemoteUntil) { c.RemoteOwner = 0; RecomputeGroupRemote(c.Grp); }
                 }
 
                 // Stream the DESIRED aim only for groups WE are operating right now (symmetric — either side can
@@ -285,7 +285,7 @@ namespace IronNestVR
                 // own locally — our own drag drives those.
                 foreach (var c in _byId.Values)
                 {
-                    if (c.LocalOwned || !c.RemoteOwned || now >= c.RemoteUntil || !c.HasRemoteVal) continue;
+                    if (c.LocalOwned || c.RemoteOwner == 0 || now >= c.RemoteUntil || !c.HasRemoteVal) continue;
                     try
                     {
                         if (c.Dial != null) c.Dial.SetAccumulatedValueUnlimited(c.RemoteVal, false, false);
@@ -570,15 +570,18 @@ namespace IronNestVR
                     {
                         if (c.LocalOwned)
                         {
-                            // Both grabbed the same control. Host keeps it; client yields.
+                            // Both grabbed the same control. Host-priority tie-break: host keeps it, client
+                            // yields. Correct for host-vs-client (the only conflict at the 2-player cap). NOTE:
+                            // client-vs-client conflicts (N>2) need host-arbitrated grant/deny — deferred to the
+                            // cap-lift (PLAN.md §9); with the optimistic tie-break both clients would yield.
                             if (CoopP2P.IsHost) return;            // I'm host — ignore their grab, keep mine
                             c.LocalOwned = false;                  // I'm client — yield to host
                         }
-                        c.RemoteOwned = true; c.RemoteUntil = now + StaleSec;
+                        c.RemoteOwner = origin; c.RemoteUntil = now + StaleSec;
                         MarkGroupRemote(c.Grp, now);
-                        Log.LogInfo($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- peer");
+                        Log.LogInfo($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- {origin}");
                     }
-                    else { _pendingGrab[id] = g; }
+                    else { _pendingGrab[id] = origin; }
                     break;
                 }
                 case MSG_RELEASE:
@@ -609,8 +612,10 @@ namespace IronNestVR
                             }
                         }
                     }
-                    if (_byId.TryGetValue(id, out var c)) { c.RemoteOwned = false; RecomputeGroupRemote(c.Grp); Log.LogInfo($"[ctrl] remote released '{c.T.name}' <- peer"); }
-                    _pendingGrab.Remove(id);
+                    // Only the current owner's release clears ownership — so player B's release can't free a
+                    // control player C is holding (at the 2-player cap origin always == the owner).
+                    if (_byId.TryGetValue(id, out var c) && c.RemoteOwner == origin) { c.RemoteOwner = 0; RecomputeGroupRemote(c.Grp); Log.LogInfo($"[ctrl] remote released '{c.T.name}' <- {origin}"); }
+                    if (_pendingGrab.TryGetValue(id, out var po) && po == origin) _pendingGrab.Remove(id);
                     break;
                 }
                 case MSG_VALUE:
@@ -717,7 +722,7 @@ namespace IronNestVR
             {
                 if (c.Switch != null) click++; else drag++;
                 if (c.LocalOwned) local++;
-                if (c.RemoteOwned) remote++;
+                if (c.RemoteOwner != 0) remote++;
             }
             int gOwn = 0; for (int g = 1; g < _grp.Length; g++) if (_grp[g].RemoteOwned) gOwn++;
             return $"controls: {drag} drag + {click} click registered, owned local={local} remote={remote}, " +
@@ -730,7 +735,7 @@ namespace IronNestVR
             foreach (var c in _byId.Values)
             {
                 if (c.LocalOwned) Log.LogInfo($"[ctrl]   LOCAL-owned: '{c.T.name}' (grp={c.Grp})");
-                else if (c.RemoteOwned) Log.LogInfo($"[ctrl]   remote-owned: '{c.T.name}' (grp={c.Grp})");
+                else if (c.RemoteOwner != 0) Log.LogInfo($"[ctrl]   remote-owned: '{c.T.name}' (grp={c.Grp})");
             }
             for (int g = 1; g < _grp.Length; g++)
             {
@@ -751,7 +756,7 @@ namespace IronNestVR
             foreach (var e in _byId.Values)
             {
                 if ((object)e.Dial == c || (object)e.Slider == c)
-                    return e.RemoteOwned && now < e.RemoteUntil;
+                    return e.RemoteOwner != 0 && now < e.RemoteUntil;
             }
             return false;
         }
@@ -939,7 +944,7 @@ namespace IronNestVR
                 var c = new Ctrl { NetId = id, T = tr, Dial = d, Slider = s, Grp = Classify(PathOf(tr)) };
 
                 // Apply anything that arrived for this control before it existed.
-                if (_pendingGrab.TryGetValue(id, out var pg)) { c.RemoteOwned = true; c.RemoteUntil = Time.unscaledTime + StaleSec; MarkGroupRemote(c.Grp, Time.unscaledTime); _pendingGrab.Remove(id); }
+                if (_pendingGrab.TryGetValue(id, out var pgOrigin)) { c.RemoteOwner = pgOrigin; c.RemoteUntil = Time.unscaledTime + StaleSec; MarkGroupRemote(c.Grp, Time.unscaledTime); _pendingGrab.Remove(id); }
                 if (_pendingVal.TryGetValue(id, out var pv)) { c.RemoteVal = pv; c.HasRemoteVal = true; _pendingVal.Remove(id); }
 
                 _byId[id] = c;
@@ -1027,13 +1032,13 @@ namespace IronNestVR
         {
             int gi = (int)g; if (gi <= 0 || gi >= _grp.Length) return;
             bool any = false;
-            foreach (var c in _byId.Values) if (c.Grp == g && c.RemoteOwned) { any = true; break; }
+            foreach (var c in _byId.Values) if (c.Grp == g && c.RemoteOwner != 0) { any = true; break; }
             _grp[gi].RemoteOwned = any;
         }
 
         private static void ClearOwnership()
         {
-            foreach (var c in _byId.Values) { c.LocalOwned = false; c.RemoteOwned = false; c.PrevDragging = false; c.PrevClicked = false; c.HasRemoteVal = false; }
+            foreach (var c in _byId.Values) { c.LocalOwned = false; c.RemoteOwner = 0; c.PrevDragging = false; c.PrevClicked = false; c.HasRemoteVal = false; }
             for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].Has = false; }
             _pendingGrab.Clear(); _pendingVal.Clear(); _echoUntil.Clear();
             _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
