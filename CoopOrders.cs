@@ -13,9 +13,16 @@ namespace IronNestVR
     /// client's enemy SPAWN node — but tested 2026-06-20 the client's order text still came out EMPTY, because
     /// the gated <c>State_SpawnMapEntity</c> is what stashes the target in a graph context variable that the
     /// order node later resolves {grid}/{bearing} against. A client that skips the spawn has no target → blank
-    /// order. So the resolved text MUST come from the host. The client's own (empty) teleprinter node still runs;
-    /// we deliberately DON'T gate it (gating <c>State_TeleprinterText.OnEnter</c> could stall the graph on its
-    /// <c>WaitUntilComplete</c>) — its empty submit is harmless beside the replayed real text.
+    /// order. So the resolved text MUST come from the host.
+    ///
+    /// CLIENT-LOCAL SUPPRESSION (2026-06-21): the client's own teleprinter node DOES run (we don't gate the node,
+    /// to avoid stalling its <c>WaitUntilComplete</c>) — but its text is not just empty, it can be WRONG: the
+    /// client independently adjudicates its own shell (<c>State_ImpactStart</c>) and, finding the target already
+    /// host-destroyed, prints "MISS" over the host's replayed "HIT" (the tester's HIT→MISS flip). So a Harmony
+    /// PREFIX (<see cref="SuppressLocalPrint"/>) blanks the lines of every client-local in-mission submit, making
+    /// the HOST the sole source of real field-report text. The blank (not skipped) submit keeps a real, completing
+    /// <c>PrintJob</c> flowing through the node so the graph never stalls. The replay path sets
+    /// <see cref="ApplyingRemote"/> so the host's authoritative text passes through unblanked.
     ///
     /// Mission orders are emitted host-side by the SleepyNodes graph node <c>State_TeleprinterText</c>, which
     /// resolves {bearing}/{grid} tokens against live MapEntity/RNG state and calls <c>Teleprinter.SubmitLines</c>.
@@ -41,7 +48,11 @@ namespace IronNestVR
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
         private static readonly byte[] _scratch = new byte[512];
-        private static int _sent, _applied;
+        private static int _sent, _applied, _suppressed;
+
+        // Set true around the client's REPLAY submit so the local-print suppressor (SuppressLocalPrint) lets the
+        // host's authoritative text through instead of blanking it like the client's own graph submits.
+        public static bool ApplyingRemote;
 
         // ---------------- host capture (Harmony postfix on Teleprinter.SubmitLines) ----------------
 
@@ -64,6 +75,30 @@ namespace IronNestVR
                 Broadcast(ptype, sourceId, lines);
             }
             catch (Exception e) { Log.LogWarning("[ord] capture: " + e.Message); }
+        }
+
+        // Harmony PREFIX on Teleprinter.SubmitLines (registered by CoopSim). On a co-op CLIENT inside a mission,
+        // BLANK the lines of its OWN locally-generated teleprinter text. The client runs the full mission graph
+        // (narrow gate), so it independently adjudicates its own shell via State_ImpactStart and — finding the
+        // target already host-destroyed — prints "MISS", which fought the host's authoritative "HIT" replayed via
+        // the order path below (the tester's "field report said HIT then immediately MISS"). Now the host is the
+        // ONLY source of real field-report text on the client. We replace the content with a single empty line
+        // rather than skipping the call, so the State_TeleprinterText node still receives a real, completing
+        // PrintJob and never stalls on its WaitUntilComplete (the queued blank job fires onJobCompleted normally).
+        // The HOST (it authors) and the REPLAY path (ApplyingRemote) pass through untouched.
+        public static void SuppressLocalPrint(ref Il2CppSystem.Collections.Generic.IEnumerable<string> lines)
+        {
+            try
+            {
+                if (ApplyingRemote) return;                                   // host's replayed text — keep it
+                if (!Config.CoopOrdersSync || CoopP2P.IsHost) return;         // feature off / host authors
+                if (!SteamNet.InLobby || !CoopP2P.HasPeer || !InMission()) return;  // solo / hub: local is correct
+                var blank = new Il2CppSystem.Collections.Generic.List<string>();
+                blank.Add("");
+                lines = blank.Cast<Il2CppSystem.Collections.Generic.IEnumerable<string>>();
+                _suppressed++;
+            }
+            catch { }   // never break the teleprinter / mission graph
         }
 
         private static void Broadcast(byte ptype, string sourceId, Il2CppSystem.Collections.Generic.List<string> lines)
@@ -121,8 +156,14 @@ namespace IronNestVR
             {
                 var tp = FindTeleprinter(ptype);
                 if (tp == null) { Log.LogWarning($"[ord] no {(Teleprinter.Teleprinters)ptype} teleprinter to replay '{sourceId}' (not in mission scene yet?)"); return; }
-                tp.SubmitLines(sourceId ?? "", lines.Cast<Il2CppSystem.Collections.Generic.IEnumerable<string>>(), null, false);
-                tp.TryStart(false);
+                // Mark this as the authoritative remote text so SuppressLocalPrint doesn't blank it.
+                ApplyingRemote = true;
+                try
+                {
+                    tp.SubmitLines(sourceId ?? "", lines.Cast<Il2CppSystem.Collections.Generic.IEnumerable<string>>(), null, false);
+                    tp.TryStart(false);
+                }
+                finally { ApplyingRemote = false; }
                 _applied++;
                 Log.LogInfo($"[ord] applied teleprinter {(Teleprinter.Teleprinters)ptype} '{sourceId}' ({lines.Count} lines) <- peer");
             }
@@ -149,7 +190,7 @@ namespace IronNestVR
 
         // ---------------- diagnostics ----------------
 
-        public static string Status() => $"orders: sent={_sent} applied={_applied}";
+        public static string Status() => $"orders: sent={_sent} applied={_applied} localSuppressed={_suppressed}";
 
         // ---------------- helpers ----------------
 

@@ -73,13 +73,21 @@ namespace IronNestVR
             // TELEPRINTER ORDERS are the ONE thing the client can't resolve locally: the gated spawn node is what
             // stashes the target in a graph context variable, so a client that skips it prints a BLANK order (the
             // 2026-06-20 "empty text prompt"). So the HOST captures every resolved Teleprinter.SubmitLines via a
-            // postfix and CoopOrders replays it on the client's matching printer. The client's own (empty) order
-            // node still runs — we DON'T gate it (gating State_TeleprinterText.OnEnter risks stalling the graph on
-            // its WaitUntilComplete); its empty submit is harmless next to the replayed text. Gated by CoopOrdersSync.
+            // POSTFIX and CoopOrders replays it on the client's matching printer. A PREFIX (SuppressLocalPrint)
+            // blanks the client's OWN in-mission submits so its locally-adjudicated field reports (e.g. "MISS" on a
+            // host-killed target) can't fight the host's replayed "HIT" — the host is the sole field-report source
+            // on the client. We blank (not skip) so State_TeleprinterText still gets a completing PrintJob and can't
+            // stall on WaitUntilComplete. Both gated by CoopOrdersSync; the replay sets CoopOrders.ApplyingRemote.
             try
             {
                 var mi = AccessTools.Method(typeof(Teleprinter), "SubmitLines");
-                if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopOrders), nameof(CoopOrders.OnSubmitLines))); Log.LogInfo("[sim] teleprinter-order capture patched (Teleprinter.SubmitLines)"); }
+                if (mi != null)
+                {
+                    _harmony.Patch(mi,
+                        prefix: new HarmonyMethod(typeof(CoopOrders), nameof(CoopOrders.SuppressLocalPrint)),
+                        postfix: new HarmonyMethod(typeof(CoopOrders), nameof(CoopOrders.OnSubmitLines)));
+                    Log.LogInfo("[sim] teleprinter-order capture + client-local suppression patched (Teleprinter.SubmitLines)");
+                }
                 else Log.LogWarning("[sim] Teleprinter.SubmitLines not found — orders won't sync");
             }
             catch (Exception e) { Log.LogWarning("[sim] teleprinter patch: " + e.Message); }
@@ -105,6 +113,17 @@ namespace IronNestVR
                 else Log.LogWarning("[sim] FireMissionCard.Apply not found — cards won't sync");
             }
             catch (Exception e) { Log.LogWarning("[sim] card patch: " + e.Message); }
+
+            // IMPACT RESULT (4c map hit-markers): capture the host's authoritative per-shell adjudication so the
+            // client's ImpactIndicators light up on the map even though the client's own shell locally "missed" a
+            // target the host already destroyed. Postfix reads the returned hit list; CoopImpact broadcasts HITS only.
+            try
+            {
+                var mi = AccessTools.Method(typeof(SleepyNodes.State_ImpactStart), "StartImpact");
+                if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopImpact), nameof(CoopImpact.OnImpactAdjudicated))); Log.LogInfo("[sim] impact-result capture patched (State_ImpactStart.StartImpact)"); }
+                else Log.LogWarning("[sim] State_ImpactStart.StartImpact not found — map hit-markers won't sync");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] impact patch: " + e.Message); }
 
             // SCORE / OUTCOME: the host replays mission complete/fail onto the client so the result screens match.
             // CoopScore broadcasts (host-only); the client's replay re-hits these postfixes but bails on !IsHost.

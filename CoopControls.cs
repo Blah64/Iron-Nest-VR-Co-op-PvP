@@ -657,6 +657,7 @@ namespace IronNestVR
                     else if (type == CoopOrders.MSG_ORDER) CoopOrders.OnPacket(type, a, len);
                     else if (type == CoopCards.MSG_CARD) CoopCards.OnPacket(type, a, len);
                     else if (type == CoopScore.MSG_OUTCOME || type == CoopScore.MSG_OPSTATE) CoopScore.OnPacket(type, a, len);
+                    else if (type == CoopImpact.MSG_IMPACT) CoopImpact.OnPacket(type, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
                     else CoopMap.OnPacket(type, a, len);
                     break;

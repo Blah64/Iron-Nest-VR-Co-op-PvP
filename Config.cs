@@ -106,6 +106,12 @@ namespace IronNestVR
         // OUT of a mission (LoadOperationState is heavy → never applied mid-mission). See CoopScore.
         public static bool CoopScoreSync = true;
 
+        // Phase 4 co-op (4c): host-authoritative IMPACT RESULT. The host broadcasts each shell impact that HIT a
+        // target (location + hit entities + shell id) and the client replays it to its ImpactIndicators so the
+        // tactical map shows the hit — the client's own local adjudication usually misses (target already
+        // host-destroyed). Misses aren't replicated (client keeps its own fall-of-shot). See CoopImpact.
+        public static bool CoopImpactSync = true;
+
         // REVIEW-fix (P3): turret CURRENT-state reconcile. Both machines slew their turret locally toward the shared
         // DESIRED aim so they normally converge — but a lost reliable packet or framerate-dependent slew can leave
         // CurrentAngle/CurrentElevation drifting. The HOST periodically broadcasts its current turret/gun state; the
