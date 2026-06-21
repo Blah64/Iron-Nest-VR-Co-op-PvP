@@ -588,6 +588,8 @@ namespace IronNestVR
                     else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN || type == CoopEntities.MSG_MOVE) CoopEntities.OnPacket(type, a, len);
                     else if (type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY) CoopScene.OnPacket(type, a, len);
                     else if (type == CoopOrders.MSG_ORDER) CoopOrders.OnPacket(type, a, len);
+                    else if (type == CoopCards.MSG_CARD) CoopCards.OnPacket(type, a, len);
+                    else if (type == CoopScore.MSG_OUTCOME || type == CoopScore.MSG_OPSTATE) CoopScore.OnPacket(type, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
                     else CoopMap.OnPacket(type, a, len);
                     break;

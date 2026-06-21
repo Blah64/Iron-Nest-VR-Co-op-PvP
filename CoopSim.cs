@@ -83,6 +83,40 @@ namespace IronNestVR
                 else Log.LogWarning("[sim] Teleprinter.SubmitLines not found — orders won't sync");
             }
             catch (Exception e) { Log.LogWarning("[sim] teleprinter patch: " + e.Message); }
+
+            // HARDENING: block a co-op CLIENT from starting an operation on its own (only the host's lifecycle
+            // drives missions; the host-commanded start passes via CoopScene.ApplyingRemoteStart). Prefix returns
+            // false to skip the original. Host + solo are never blocked. Decline politely if the method moved.
+            try
+            {
+                var mi = AccessTools.Method(typeof(MissionManager), "StartOperation", new[] { typeof(SleepyNodes.OperationGraph), typeof(SleepyNodes.MissionGraph) })
+                         ?? AccessTools.Method(typeof(MissionManager), "StartOperation");
+                if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopScene), nameof(CoopScene.GateClientStart))); Log.LogInfo("[sim] client self-start guard patched (MissionManager.StartOperation)"); }
+                else Log.LogWarning("[sim] MissionManager.StartOperation not found — client self-start not guarded");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] self-start guard patch: " + e.Message); }
+
+            // FIRE-MISSION CARD (PATH B, player-driven): capture the resolved 6-string firing solution so the peer
+            // can mirror the printed card. Bidirectional + echo-guarded in CoopCards; gated by CoopCardSync.
+            try
+            {
+                var mi = AccessTools.Method(typeof(FireMissionCard), "Apply");
+                if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopCards), nameof(CoopCards.OnCardApplied))); Log.LogInfo("[sim] fire-mission card capture patched (FireMissionCard.Apply)"); }
+                else Log.LogWarning("[sim] FireMissionCard.Apply not found — cards won't sync");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] card patch: " + e.Message); }
+
+            // SCORE / OUTCOME: the host replays mission complete/fail onto the client so the result screens match.
+            // CoopScore broadcasts (host-only); the client's replay re-hits these postfixes but bails on !IsHost.
+            try
+            {
+                var c = AccessTools.Method(typeof(MissionManager), "MarkMissionComplete");
+                if (c != null) { _harmony.Patch(c, postfix: new HarmonyMethod(typeof(CoopScore), nameof(CoopScore.OnMissionComplete))); }
+                var f = AccessTools.Method(typeof(MissionManager), "MarkMissionFailed");
+                if (f != null) { _harmony.Patch(f, postfix: new HarmonyMethod(typeof(CoopScore), nameof(CoopScore.OnMissionFailed))); }
+                Log.LogInfo($"[sim] mission-outcome capture patched (complete={(c != null)} failed={(f != null)})");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] outcome patch: " + e.Message); }
         }
 
         private static int TryPatch(Type t, string method)

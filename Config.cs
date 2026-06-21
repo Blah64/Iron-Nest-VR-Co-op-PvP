@@ -95,6 +95,17 @@ namespace IronNestVR
         // Scoped to an active mission. See CoopOrders / CoopSim.
         public static bool CoopOrdersSync = true;
 
+        // Phase 4 co-op: replicate the gun-console FIRE-MISSION CARD (PATH B — player-driven). When a player
+        // computes a firing solution the printer spawns a FireMissionCard and Apply()s six resolved strings; we
+        // capture those and the peer spawns a mirror card from the printer's prefab. Bidirectional + echo-guarded
+        // (either player may print). See CoopCards.
+        public static bool CoopCardSync = true;
+
+        // Phase 4 co-op: host-authoritative SCORE / outcome. The host replays MarkMissionComplete/Failed onto the
+        // client (matching win/lose result), and syncs RequisitionPoints + PowderCharges via OperationState while
+        // OUT of a mission (LoadOperationState is heavy → never applied mid-mission). See CoopScore.
+        public static bool CoopScoreSync = true;
+
         // REVIEW-fix (P3): turret CURRENT-state reconcile. Both machines slew their turret locally toward the shared
         // DESIRED aim so they normally converge — but a lost reliable packet or framerate-dependent slew can leave
         // CurrentAngle/CurrentElevation drifting. The HOST periodically broadcasts its current turret/gun state; the

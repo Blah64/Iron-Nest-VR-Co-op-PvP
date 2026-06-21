@@ -207,6 +207,7 @@ namespace IronNestVR
             CoopMap.Tick(Time.unscaledDeltaTime);        // Phase 3: replicate tactical-map token placements
             CoopEntities.Tick(Time.unscaledDeltaTime);   // Phase 4: replicate host mission entities to the client
             CoopScene.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate mission/scene transitions (host drives)
+            CoopScore.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate score/requisition (host-authoritative, applied out-of-mission)
             CoopNetDiag.Tick(Time.unscaledDeltaTime);    // REVIEW-fix: cross-machine desync detector (diagnostic only)
             if (!_xrReady)
             {

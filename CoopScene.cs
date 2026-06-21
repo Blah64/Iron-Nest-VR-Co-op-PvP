@@ -32,9 +32,10 @@ namespace IronNestVR
     /// Join-in-progress: <see cref="SendSnapshot"/> tells a fresh joiner the host's CURRENT phase (enter the map;
     /// and if mid-mission, the map command + MISSION_START), so a peer that joined at the MainMenu catches up.
     ///
-    /// NOT YET HARDENED (noted): a client independently clicking "start operation" would desync (only the host's
-    /// lifecycle should drive) — a future pass can Harmony-gate client-initiated StartOperation/LoadMission like
-    /// CoopSim gates the graph. For now, host-drives is correct as long as the client doesn't self-start.
+    /// HARDENED (2026-06-21): a client clicking "start operation" itself can no longer desync — a Harmony prefix
+    /// (<c>GateClientStart</c>, registered by CoopSim) blocks <c>MissionManager.StartOperation</c> on a co-op
+    /// client unless <c>ApplyingRemoteStart</c> is set (the host-commanded path). The host and solo play are
+    /// never blocked. Only host lifecycle drives missions.
     /// </summary>
     internal static class CoopScene
     {
@@ -54,6 +55,11 @@ namespace IronNestVR
         private static float _nextStartTry;        // next retry time
         private static bool _startInvoked;         // StartAssignedOperation already called → wait for the load
         private static string _pendingScene, _pendingMission, _pendingOperation;
+
+        // Set true ONLY around the host-commanded StartOperation so the client self-start guard (GateClientStart,
+        // a Harmony prefix on MissionManager.StartOperation) lets that one call through while blocking any other
+        // client-initiated start.
+        internal static bool ApplyingRemoteStart;
 
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
@@ -201,7 +207,9 @@ namespace IronNestVR
                 var mission = FindMissionById(missionId);
                 if (op == null || mission == null) return false;   // assets not loaded yet — retry
 
-                mm.StartOperation(op, mission);
+                ApplyingRemoteStart = true;
+                try { mm.StartOperation(op, mission); }
+                finally { ApplyingRemoteStart = false; }
                 Log.LogInfo($"[scene] client StartOperation(op='{operationId}', mission='{missionId}') (host-commanded)");
                 return true;
             }
@@ -238,6 +246,26 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[scene] find mission: " + e.Message); }
             return null;
+        }
+
+        // Harmony prefix on MissionManager.StartOperation (registered by CoopSim.ApplyPatches). Blocks a co-op
+        // CLIENT from starting an operation on its own — e.g. clicking a briefing's Play button — so it can't
+        // diverge into a different mission than the host. Only the host's lifecycle starts missions, replicated
+        // via MISSION_START; that host-commanded start runs through StartClientMission, which sets
+        // ApplyingRemoteStart so this guard lets it pass. Never blocks the host or solo play. Returns false to
+        // skip the original. MUST NOT throw (a throw would break mission-start for everyone) → any error allows it.
+        public static bool GateClientStart()
+        {
+            try
+            {
+                if (!Config.CoopSceneSync) return true;                  // feature off
+                if (!SteamNet.InLobby || !CoopP2P.HasPeer) return true;  // solo
+                if (CoopP2P.IsHost) return true;                         // host drives
+                if (ApplyingRemoteStart) return true;                    // this IS the host-commanded start
+                Log.LogInfo("[scene] blocked client-initiated StartOperation (host drives missions in co-op)");
+                return false;                                            // client self-start — suppress
+            }
+            catch { return true; }
         }
 
         // Drive the client to a non-mission target phase, picking the right MissionManager call for where it

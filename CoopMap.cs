@@ -151,7 +151,6 @@ namespace IronNestVR
         {
             try
             {
-                Log.LogInfo($"[map] HOOK piece BeginDrag fired (sync={Config.CoopMapSync} inLobby={SteamNet.InLobby} peer={CoopP2P.HasPeer})");
                 if (!Config.CoopMapSync || !SteamNet.InLobby || !CoopP2P.HasPeer || __instance == null) return;
                 var tr = __instance.transform; if (tr == null) return;
                 int id = Fnv(PathOf(tr));
@@ -167,7 +166,6 @@ namespace IronNestVR
         {
             try
             {
-                Log.LogInfo($"[map] HOOK piece EndDrag fired (sync={Config.CoopMapSync} inLobby={SteamNet.InLobby} peer={CoopP2P.HasPeer})");
                 if (!Config.CoopMapSync || !SteamNet.InLobby || !CoopP2P.HasPeer || __instance == null) return;
                 var tr = __instance.transform; if (tr == null) return;
                 int id = Fnv(PathOf(tr));
@@ -187,7 +185,6 @@ namespace IronNestVR
         {
             try
             {
-                Log.LogInfo($"[map] HOOK line FinalizePlacement fired (applying={_applyingNetworkLine} sync={Config.CoopMapSync} inLobby={SteamNet.InLobby} peer={CoopP2P.HasPeer})");
                 if (_applyingNetworkLine) return;   // this is our own mirror being placed — don't bounce it back
                 if (!Config.CoopMapSync || !SteamNet.InLobby || !CoopP2P.HasPeer || __instance == null) return;
                 var go = __instance.gameObject; if (go == null) return;
