@@ -41,6 +41,13 @@ namespace IronNestVR
         // This instance hosts → it is the co-op HOST (authoritative), same role the Steam lobby owner gets.
         public static bool IsHost { get; private set; }
 
+        // Local-test convenience: STICKY free-cursor toggle. When true (Ctrl+F5), the OS cursor is held
+        // visible + unlocked so you can click between the two windows; mouselook is off while it's on. Defaults
+        // OFF so the camera works normally — for a momentary cursor (e.g. to reach the other window) hold Left
+        // Alt instead (see VrManager.LateUpdate). Honored only while CoopLoopback is on AND a link is Active, so
+        // normal play / shipped builds are untouched.
+        public static bool FreeCursor = false;
+
         private const int MaxFrame = 8192;   // sanity cap on a length-prefixed frame (largest real packet ~1.2KB)
 
         private static TcpListener _listener;
@@ -206,7 +213,7 @@ namespace IronNestVR
             UnityEngine.InputSystem.Keyboard kb;
             try { kb = UnityEngine.InputSystem.Keyboard.current; } catch { return; }
             if (kb == null) return;
-            if (!_loggedLive) { _loggedLive = true; Log.LogInfo("[loop] key handler live (waiting for Ctrl+F2)"); }
+            if (!_loggedLive) { _loggedLive = true; Log.LogInfo("[loop] key handler live (Ctrl+F2 connect · Ctrl+F3 stop · hold Alt or Ctrl+F5 = test cursor)"); }
             bool ctrl;
             try { ctrl = kb[UnityEngine.InputSystem.Key.LeftCtrl].isPressed || kb[UnityEngine.InputSystem.Key.RightCtrl].isPressed; }
             catch { return; }
@@ -215,6 +222,7 @@ namespace IronNestVR
             // key truly isn't arriving (laptop Fn-lock, wrong window focus) rather than a logic bug.
             if (Pressed(kb, UnityEngine.InputSystem.Key.F2)) { Log.LogInfo("[loop] Ctrl+F2 detected"); StartConnect(Config.CoopLoopbackPort); }   // auto: press in BOTH windows
             if (Pressed(kb, UnityEngine.InputSystem.Key.F3)) { Log.LogInfo("[loop] Ctrl+F3 detected"); Stop(); }
+            if (Pressed(kb, UnityEngine.InputSystem.Key.F5)) { FreeCursor = !FreeCursor; Log.LogInfo("[loop] test cursor (sticky) " + (FreeCursor ? "ON — cursor visible, mouselook off (click between windows)" : "OFF — mouselook on, cursor hidden; hold Alt for a momentary cursor")); }
         }
 
         private static bool Pressed(UnityEngine.InputSystem.Keyboard kb, UnityEngine.InputSystem.Key k)

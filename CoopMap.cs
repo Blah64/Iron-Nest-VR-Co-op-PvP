@@ -795,6 +795,8 @@ namespace IronNestVR
             _nextScan = Time.unscaledTime + 3f;
 
             int addedItems = 0, addedSlots = 0;
+            var reqItemSlots = CollectRequisitionItemSlots();   // the requisition console's submit slot — not a map slot
+            var punchItems = CollectPunchcardItems();           // punchcards: the DraggableItem each PunchcardRuntime owns
             try
             {
                 var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<DraggableItem>(), FindObjectsSortMode.None);
@@ -802,6 +804,12 @@ namespace IronNestVR
                 {
                     var d = arr[i].TryCast<DraggableItem>(); if (d == null) continue;
                     var tr = d.transform; if (tr == null) continue;
+                    // EXCLUDE punchcards. They are runtime-spawned CLONES with identical names → identical transform
+                    // paths → COLLIDING FNV netIds, so the map's path-keyed sync cross-wires them (moving one card
+                    // drives a DIFFERENT card on the peer — the tester's "cards that moved were different on each
+                    // screen") and its generic ItemSlot.PlaceItem fights the RequisitionSlot's own submit (rejects
+                    // cards). CoopPunchcards will sync them properly, keyed by card-definition ID.
+                    if (punchItems.Contains(d.GetInstanceID()) || IsPunchcardItem(d)) continue;
                     int id = Fnv(PathOf(tr));
                     if (_items.TryGetValue(id, out var ex))
                     {
@@ -823,6 +831,7 @@ namespace IronNestVR
                 {
                     var s = arr[i].TryCast<ItemSlot>(); if (s == null) continue;
                     var tr = s.transform; if (tr == null) continue;
+                    if (reqItemSlots != null && reqItemSlots.Contains(s.GetInstanceID())) continue;   // requisition submit slot — CoopPunchcards owns it
                     int id = Fnv(PathOf(tr));
                     if (_slots.TryGetValue(id, out var ex) && ex != null) continue;
                     _slots[id] = s;   // (re)bind — replaces a dead slot from a previous scene
@@ -832,6 +841,60 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[map] scan slots: " + e.Message); }
 
             if (addedItems + addedSlots > 0) Log.LogInfo($"[map] registry: {_items.Count} tokens, {_slots.Count} slots (host={CoopP2P.IsHost})");
+        }
+
+        // A punchcard is a DraggableItem carrying (on itself or an ancestor) a PunchcardRuntime.
+        private static bool IsPunchcardItem(DraggableItem d)
+        {
+            try
+            {
+                var t = d.transform;
+                for (int depth = 0; t != null && depth < 8; depth++)
+                {
+                    if (t.GetComponent<PunchcardRuntime>() != null) return true;
+                    t = t.parent;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        // The ItemSlot owned by each RequisitionSlot (its `itemSlot`), keyed by instanceId so the map sync skips the
+        // requisition console's submit slot (it may sit on a child of the RequisitionSlot).
+        private static HashSet<int> CollectRequisitionItemSlots()
+        {
+            var set = new HashSet<int>();
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<RequisitionSlot>(), FindObjectsSortMode.None);
+                if (arr != null) for (int i = 0; i < arr.Length; i++)
+                {
+                    var r = arr[i].TryCast<RequisitionSlot>(); if (r == null) continue;
+                    ItemSlot its = null; try { its = r.itemSlot; } catch { }
+                    if (its != null) { try { set.Add(its.GetInstanceID()); } catch { } }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[map] collect req slots: " + e.Message); }
+            return set;
+        }
+
+        // The DraggableItem each PunchcardRuntime owns, so the skip works regardless of whether the DraggableItem and
+        // PunchcardRuntime sit on the same GameObject.
+        private static HashSet<int> CollectPunchcardItems()
+        {
+            var set = new HashSet<int>();
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PunchcardRuntime>(), FindObjectsSortMode.None);
+                if (arr != null) for (int i = 0; i < arr.Length; i++)
+                {
+                    var r = arr[i].TryCast<PunchcardRuntime>(); if (r == null) continue;
+                    DraggableItem di = null; try { di = r.DraggableItem; } catch { }
+                    if (di != null) { try { set.Add(di.GetInstanceID()); } catch { } }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[map] collect punch items: " + e.Message); }
+            return set;
         }
 
         private static void ClearExternal(Item it)

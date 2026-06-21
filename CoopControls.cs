@@ -84,6 +84,7 @@ namespace IronNestVR
         private sealed class GroupState
         {
             public bool RemoteOwned;
+            public ulong RemoteOwner;               // SteamID currently driving this group (0 = none); gates the value/group stream at N>2
             public float Until;
             public bool Has;
             public readonly float[] V = new float[5];
@@ -94,7 +95,7 @@ namespace IronNestVR
 
         // Remote messages that arrive before the control is registered (different scene-load timing). Applied
         // when the control first appears in EnsureRegistry.
-        private static readonly Dictionary<int, float> _pendingVal = new Dictionary<int, float>();
+        private static readonly Dictionary<int, (ulong Origin, float V)> _pendingVal = new Dictionary<int, (ulong, float)>();
         private static readonly Dictionary<int, ulong> _pendingGrab = new Dictionary<int, ulong>();   // netId -> grab origin
 
         // Echo guard: when we REPLAY a peer's click/fire, the game flips isClicked/hasFired on our side too,
@@ -549,7 +550,8 @@ namespace IronNestVR
             return type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL
                 || type == CoopMap.MSG_GRAB || type == CoopMap.MSG_POS || type == CoopMap.MSG_PLACE
                 || type == CoopMap.MSG_MARKER_ADD || type == CoopMap.MSG_MARKER_DEL || type == CoopMap.MSG_PIECE_MOVE
-                || type == CoopScene.MSG_MISSION_READY;
+                || type == CoopScene.MSG_MISSION_READY
+                || type == CoopCards.MSG_CARD;   // fire-mission cards are bidirectional — fan out to the other clients (N>2)
         }
 
         // Streaming packet types the host relays UNRELIABLE (high-rate, loss-tolerant). MSG_POSE is handled by
@@ -590,7 +592,7 @@ namespace IronNestVR
                         if (c.RemoteOwner == 0 || now >= c.RemoteUntil || c.RemoteOwner == origin || CoopP2P.GrabBeats(origin, c.RemoteOwner))
                         {
                             c.RemoteOwner = origin; c.RemoteUntil = now + StaleSec;
-                            MarkGroupRemote(c.Grp, now);
+                            MarkGroupRemote(c.Grp, origin, now);
                             Log.LogInfo($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- {origin}");
                         }
                     }
@@ -610,8 +612,12 @@ namespace IronNestVR
                         int gi = (int)g;
                         if (gi > 0 && gi < _grp.Length)
                         {
+                            // Only honor a settled-final from the group's owner — a non-owner's release must not
+                            // settle the dial (REVIEW-fix P1a). Ownership is still set here (we clear it below).
+                            var gsOwn = _grp[gi];
+                            bool ownerOk = !gsOwn.RemoteOwned || now >= gsOwn.Until || gsOwn.RemoteOwner == origin;
                             int n = GroupFloatCount(g);
-                            if (len == o + 4 * n)
+                            if (ownerOk && len == o + 4 * n)
                             {
                                 bool ok = true;
                                 for (int i = 0; i < n; i++) { float f = GetFloat(a, ref o); if (!Finite(f)) { ok = false; break; } _tmpGroup[i] = f; }
@@ -636,8 +642,10 @@ namespace IronNestVR
                     if (len < 9) return;
                     int id = GetInt(a, ref o);
                     float v = GetFloat(a, ref o);
-                    if (_byId.TryGetValue(id, out var c)) { c.RemoteVal = v; c.HasRemoteVal = true; c.RemoteUntil = now + StaleSec; }
-                    else _pendingVal[id] = v;
+                    // Only the control's current owner may move it. A non-owner's late value (simultaneous-grab
+                    // contention at N>2) must not drag a control another origin already won (REVIEW-fix P1a).
+                    if (_byId.TryGetValue(id, out var c)) { if (c.RemoteOwner == origin) { c.RemoteVal = v; c.HasRemoteVal = true; c.RemoteUntil = now + StaleSec; } }
+                    else _pendingVal[id] = (origin, v);   // arrived before the control registered — adopt only if this origin becomes owner
                     break;
                 }
                 case MSG_GROUP:
@@ -646,6 +654,10 @@ namespace IronNestVR
                     Group g = (Group)a[o++];
                     int gi = (int)g;
                     if (gi <= 0 || gi >= _grp.Length) return;
+                    var gsOwn = _grp[gi];
+                    // Only the group's current owner may stream it. Reject a non-owner's contention frame (N>2);
+                    // accept if nobody owns it yet (stream beat the grab) — matches the pre-cap behavior. (P1a)
+                    if (gsOwn.RemoteOwned && now < gsOwn.Until && gsOwn.RemoteOwner != origin) return;
                     int n = GroupFloatCount(g);
                     if (len != o + 4 * n) return;                 // strict framing: exactly n floats, no more/less
                     for (int i = 0; i < n; i++) { float f = GetFloat(a, ref o); if (!Finite(f)) return; _tmpGroup[i] = f; }
@@ -697,11 +709,14 @@ namespace IronNestVR
                     // Other co-op subsystems share the same P2P channel; forward by type.
                     if (type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL) CoopClipboard.OnPacket(type, a, len);
                     else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN || type == CoopEntities.MSG_MOVE) CoopEntities.OnPacket(type, a, len);
-                    else if (type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY) CoopScene.OnPacket(type, a, len);
+                    else if (type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY) CoopScene.OnPacket(type, origin, a, len);
                     else if (type == CoopOrders.MSG_ORDER) CoopOrders.OnPacket(type, a, len);
                     else if (type == CoopCards.MSG_CARD) CoopCards.OnPacket(type, a, len);
                     else if (type == CoopScore.MSG_OUTCOME || type == CoopScore.MSG_OPSTATE) CoopScore.OnPacket(type, a, len);
                     else if (type == CoopImpact.MSG_IMPACT) CoopImpact.OnPacket(type, a, len);
+                    else if (type == CoopPunchcards.MSG_PUNCH_DECK || type == CoopPunchcards.MSG_PUNCH_REDEEM
+                             || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
+                             || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_CONSUME) CoopPunchcards.OnPacket(type, origin, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
                     else CoopMap.OnPacket(type, origin, a, len);
                     break;
@@ -923,7 +938,7 @@ namespace IronNestVR
             if (_turretIid != iid)   // new turret = new scene: drop the stale registry + group state
             {
                 _byId.Clear();
-                for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].Has = false; }
+                for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].RemoteOwner = 0; _grp[i].Has = false; }
             }
             _turret = turret; _turretIid = iid;
             ResolveGuns(turret);
@@ -957,8 +972,8 @@ namespace IronNestVR
                 var c = new Ctrl { NetId = id, T = tr, Dial = d, Slider = s, Grp = Classify(PathOf(tr)) };
 
                 // Apply anything that arrived for this control before it existed.
-                if (_pendingGrab.TryGetValue(id, out var pgOrigin)) { c.RemoteOwner = pgOrigin; c.RemoteUntil = Time.unscaledTime + StaleSec; MarkGroupRemote(c.Grp, Time.unscaledTime); _pendingGrab.Remove(id); }
-                if (_pendingVal.TryGetValue(id, out var pv)) { c.RemoteVal = pv; c.HasRemoteVal = true; _pendingVal.Remove(id); }
+                if (_pendingGrab.TryGetValue(id, out var pgOrigin)) { c.RemoteOwner = pgOrigin; c.RemoteUntil = Time.unscaledTime + StaleSec; MarkGroupRemote(c.Grp, pgOrigin, Time.unscaledTime); _pendingGrab.Remove(id); }
+                if (_pendingVal.TryGetValue(id, out var pv)) { if (c.RemoteOwner == pv.Origin) { c.RemoteVal = pv.V; c.HasRemoteVal = true; } _pendingVal.Remove(id); }
 
                 _byId[id] = c;
                 added++;
@@ -1035,24 +1050,35 @@ namespace IronNestVR
 
         // ---------------- ownership bookkeeping ----------------
 
-        private static void MarkGroupRemote(Group g, float now)
+        private static void MarkGroupRemote(Group g, ulong origin, float now)
         {
             int gi = (int)g; if (gi <= 0 || gi >= _grp.Length) return;
-            _grp[gi].RemoteOwned = true; _grp[gi].Until = now + StaleSec;
+            var gs = _grp[gi];
+            // Adopt the new origin as the group's owner unless a fresher, higher-priority owner already holds it
+            // (deterministic GrabBeats tie-break, same as control-level ownership). At N=2 there's only one remote.
+            if (!gs.RemoteOwned || now >= gs.Until || gs.RemoteOwner == origin || CoopP2P.GrabBeats(origin, gs.RemoteOwner))
+                gs.RemoteOwner = origin;
+            gs.RemoteOwned = true; gs.Until = now + StaleSec;
         }
 
         private static void RecomputeGroupRemote(Group g)
         {
             int gi = (int)g; if (gi <= 0 || gi >= _grp.Length) return;
-            bool any = false;
-            foreach (var c in _byId.Values) if (c.Grp == g && c.RemoteOwner != 0) { any = true; break; }
-            _grp[gi].RemoteOwned = any;
+            // Recompute owner from the surviving remote-owned controls: the highest-priority owner wins the group.
+            ulong owner = 0;
+            foreach (var c in _byId.Values)
+            {
+                if (c.Grp != g || c.RemoteOwner == 0) continue;
+                if (owner == 0 || CoopP2P.GrabBeats(c.RemoteOwner, owner)) owner = c.RemoteOwner;
+            }
+            _grp[gi].RemoteOwned = owner != 0;
+            _grp[gi].RemoteOwner = owner;
         }
 
         private static void ClearOwnership()
         {
             foreach (var c in _byId.Values) { c.LocalOwned = false; c.RemoteOwner = 0; c.PrevDragging = false; c.PrevClicked = false; c.HasRemoteVal = false; }
-            for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].Has = false; }
+            for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].RemoteOwner = 0; _grp[i].Has = false; }
             _pendingGrab.Clear(); _pendingVal.Clear(); _echoUntil.Clear();
             _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
             RestoreGunDrive();   // hand gun-elevation control back to the local turret controller on link-down

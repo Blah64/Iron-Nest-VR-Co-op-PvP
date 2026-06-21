@@ -114,6 +114,24 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[sim] card patch: " + e.Message); }
 
+            // PUNCHCARD REDEMPTION (Layer 3, host-authoritative routing — gated by Config.CoopPunchcardRedeemSync).
+            // The AttemptRequisition PREFIX is a pure pass-through for solo + host (so the slot behaves exactly like
+            // stock — the earlier "prefix breaks the submit" was the base-game scout-plane rejection, which happens
+            // solo where this prefix never acts). It only diverts a CLIENT-with-peer redemption to the host. The
+            // OnCardUsed PRE/POST captures the real success (AttemptRequisition returns void) so the host broadcasts
+            // an authoritative consume. See CoopPunchcards.
+            try
+            {
+                var ar = AccessTools.Method(typeof(RequisitionSlot), "AttemptRequisition");
+                if (ar != null) { _harmony.Patch(ar, prefix: new HarmonyMethod(typeof(CoopPunchcards), nameof(CoopPunchcards.OnAttemptRequisition))); Log.LogInfo("[sim] punchcard redeem routing patched (RequisitionSlot.AttemptRequisition prefix)"); }
+                else Log.LogWarning("[sim] RequisitionSlot.AttemptRequisition not found — client punchcard redemptions won't route");
+
+                var oc = AccessTools.Method(typeof(PunchcardRuntime), "OnCardUsed");
+                if (oc != null) { _harmony.Patch(oc, prefix: new HarmonyMethod(typeof(CoopPunchcards), nameof(CoopPunchcards.OnCardUsedPre)), postfix: new HarmonyMethod(typeof(CoopPunchcards), nameof(CoopPunchcards.OnCardUsedPost))); Log.LogInfo("[sim] punchcard consume capture patched (PunchcardRuntime.OnCardUsed pre/post)"); }
+                else Log.LogWarning("[sim] PunchcardRuntime.OnCardUsed not found — punchcard consume won't sync");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] punchcard redeem patch: " + e.Message); }
+
             // IMPACT RESULT (4c map hit-markers): capture the host's authoritative per-shell adjudication so the
             // client's ImpactIndicators light up on the map even though the client's own shell locally "missed" a
             // target the host already destroyed. Postfix reads the returned hit list; CoopImpact broadcasts HITS only.

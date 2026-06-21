@@ -127,6 +127,38 @@ namespace IronNestVR
         // host-destroyed). Misses aren't replicated (client keeps its own fall-of-shot). See CoopImpact.
         public static bool CoopImpactSync = true;
 
+        // Phase 4 co-op: host-authoritative REQUISITION PUNCHCARDS (the loadout/ability cards in the RequisitionSlot —
+        // NOT the FireMissionCard slip, see CoopCardSync). The host broadcasts its deck (card ids + remaining uses) so
+        // the client's deck matches instead of being built from its own save; a client redemption sends an intent
+        // (card + chosen variables) to the host, which runs the card's PunchcardGraph authoritatively so the effect
+        // matches (entity/impact/score replication carries the result). See CoopPunchcards.
+        // 2026-06-21: now gates the PHYSICAL CARD MOVEMENT layer — each card is grab/own/stream/place synced like a
+        // CoopMap token but keyed by Fnv(CurrentDefinition.ID) (clones share a name, so a transform-path hash collides
+        // and cross-wired them) and positioned console-relative (survives a drag reparenting the card). The host sends
+        // an authoritative layout snapshot on join. Redemption sync (effects/uses) is still deferred (Layer 3) — the
+        // AttemptRequisition prefix stays UNREGISTERED, so a redemption runs locally exactly as stock. The earlier
+        // wrong abstraction (deck CATALOG/uses overlay) lives under CoopPunchcardDeckSync below and stays off.
+        public static bool CoopPunchcardSync = true;
+
+        // Punchcard REDEMPTION routing (Layer 3, the "results from using a card don't match" half). When a CLIENT
+        // pulls the requisition lever, a prefix on RequisitionSlot.AttemptRequisition forwards the card ID + the
+        // player's chosen PunchcardVariable values to the host instead of running locally (the client's enemy-spawn
+        // node is gated, so a local run spawns nothing). The host runs the graph authoritatively → revealed
+        // units/entities spawn on the host → replicate via CoopEntities. PunchcardRuntime.OnCardUsed (the real
+        // success signal — AttemptRequisition returns void) drives a host→client MSG_PUNCH_CONSUME so each client
+        // drops its matching card in lockstep. Solo + host redemptions are UNCHANGED (the prefix passes through).
+        // Separate flag so it can be disabled without touching the working card-movement layer.
+        public static bool CoopPunchcardRedeemSync = true;
+
+        // Punchcard DECK-COMPOSITION/uses sync (the host-authoritative "make the client's deck match the host's"
+        // overlay). DEFAULT OFF (2026-06-21): the punchcard CATALOG is already identical on both machines, and
+        // overlaying the host's per-save RemainingUses onto the client can ZERO a card the client could otherwise
+        // use (the test decks were near-empty), and the destructive RebuildDeck variant broke card placement. The
+        // real "cards don't match / don't move together" need is PHYSICAL card movement + slot sync (DraggableItem,
+        // like CoopMap tokens) — built separately. Re-enable only with the non-destructive overlay + a clear
+        // deck-authority model. See CoopPunchcards.
+        public static bool CoopPunchcardDeckSync = false;
+
         // REVIEW-fix (P3): turret CURRENT-state reconcile. Both machines slew their turret locally toward the shared
         // DESIRED aim so they normally converge — but a lost reliable packet or framerate-dependent slew can leave
         // CurrentAngle/CurrentElevation drifting. The HOST periodically broadcasts its current turret/gun state; the

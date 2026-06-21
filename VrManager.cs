@@ -62,9 +62,16 @@ namespace IronNestVR
         private bool _lookFrozen;
         private void LateUpdate()
         {
-            bool flat = LobbyGui.Shown && !_xrReady;
-            LobbyGui.FlatInteractive = flat;
-            if (flat)
+            bool lobbyFlat = LobbyGui.Shown && !_xrReady;
+            LobbyGui.FlatInteractive = lobbyFlat;
+            // Local two-window co-op testing. By DEFAULT we touch nothing, so the game's normal mouselook/camera
+            // works. When you need the OS cursor — to click UI or move the mouse to the OTHER window (an
+            // in-mission FPS otherwise locks it to the focused window's centre and hides it) — either HOLD LEFT
+            // ALT (momentary) or press Ctrl+F5 (sticky, LoopbackTransport.FreeCursor). While free we drop FPS
+            // look so the camera doesn't spin. Gated to CoopLoopback + an Active link → shipped play is untouched.
+            bool testLink = !_xrReady && Config.CoopLoopback && LoopbackTransport.Active;
+            bool freeCursor = lobbyFlat || (testLink && (LoopbackTransport.FreeCursor || AltHeld()));
+            if (freeCursor)
             {
                 try { UnityEngine.Cursor.lockState = UnityEngine.CursorLockMode.None; UnityEngine.Cursor.visible = true; } catch { }
                 SetFpsLook(false);
@@ -72,6 +79,10 @@ namespace IronNestVR
             }
             else if (_lookFrozen)
             {
+                // Back to gameplay: re-lock + hide the cursor ourselves so mouselook resumes. The game may lock
+                // the cursor only once on entering a mission, so after we forced it unlocked it might not re-lock
+                // on its own — leaving the camera frozen. Re-asserting it here makes the camera reliably move.
+                try { UnityEngine.Cursor.lockState = UnityEngine.CursorLockMode.Locked; UnityEngine.Cursor.visible = false; } catch { }
                 SetFpsLook(true);   // hand control back to the game
                 _lookFrozen = false;
             }
@@ -81,6 +92,7 @@ namespace IronNestVR
             // rotating cockpit matches. Map token positions are applied here too (after the game's drag logic).
             CoopControls.LateApply();
             CoopMap.LateApply();
+            CoopPunchcards.LateApply();   // apply peer-owned punchcard poses after the game's drag logic
 
             // Same-machine test: the game pauses its SCALED-time sim/animations on an UNFOCUSED window
             // (Time.timeScale → 0) even though the player loop keeps running (runInBackground). Our net layer
@@ -210,6 +222,7 @@ namespace IronNestVR
             CoopEntities.Tick(Time.unscaledDeltaTime);   // Phase 4: replicate host mission entities to the client
             CoopScene.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate mission/scene transitions (host drives)
             CoopScore.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate score/requisition (host-authoritative, applied out-of-mission)
+            CoopPunchcards.Tick(Time.unscaledDeltaTime); // Phase 4: host-authoritative punchcard deck + redemption
             CoopNetDiag.Tick(Time.unscaledDeltaTime);    // REVIEW-fix: cross-machine desync detector (diagnostic only)
             if (!_xrReady)
             {
@@ -534,6 +547,17 @@ namespace IronNestVR
 
         private static bool KeyDown(UnityEngine.InputSystem.Key k)
         { try { var kb = UnityEngine.InputSystem.Keyboard.current; return kb != null && kb[k].wasPressedThisFrame; } catch { return false; } }
+
+        // Held-state (not edge): hold Left/Right Alt for a momentary free cursor during local two-window testing.
+        private static bool AltHeld()
+        {
+            try
+            {
+                var kb = UnityEngine.InputSystem.Keyboard.current;
+                return kb != null && (kb[UnityEngine.InputSystem.Key.LeftAlt].isPressed || kb[UnityEngine.InputSystem.Key.RightAlt].isPressed);
+            }
+            catch { return false; }
+        }
 
         private static bool RecenterPressed()
         {

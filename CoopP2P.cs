@@ -364,8 +364,24 @@ namespace IronNestVR
                 try { CoopMap.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot map: " + e.Message); }
                 try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
                 try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
+                try { CoopPunchcards.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot punch: " + e.Message); }
             }
             finally { _snapActive = false; }
+        }
+
+        // Host-only: run a subsystem snapshot send targeted to ONE peer instead of broadcast, by reusing the JIP
+        // unicast latch. A MISSION_READY resync must reach only the joiner that asked, not re-burst every existing
+        // client (REVIEW-fix P2a). At the 2-player cap the lone peer is the target, so this is identical to the old
+        // broadcast; in loopback (single peer) targeting is moot. Re-entrancy-safe via save/restore.
+        public static void SendSnapshotTo(ulong peer, Action sendAction)
+        {
+            if (!IsHost || sendAction == null) return;
+            var prevTarget = _snapTarget; bool prevActive = _snapActive;
+            _snapTarget = new CSteamID { m_SteamID = peer };
+            _snapActive = true;
+            try { sendAction(); }
+            catch (Exception e) { Log.LogWarning("[p2p] targeted snapshot: " + e.Message); }
+            finally { _snapActive = prevActive; _snapTarget = prevTarget; }
         }
 
         public static void SendPose(Vector3 hp, Quaternion hr, bool hasHands, Vector3 lp, Quaternion lr, Vector3 rp, Quaternion rr,

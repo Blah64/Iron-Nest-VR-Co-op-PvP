@@ -141,7 +141,7 @@ namespace IronNestVR
 
         // ---------------- receive ----------------
 
-        public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
+        public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
             int o = 1;
             switch (type)
@@ -174,8 +174,10 @@ namespace IronNestVR
                 case MSG_MISSION_READY:
                 {
                     if (!CoopP2P.IsHost) return;   // only the host answers a joiner's readiness
-                    Log.LogInfo("[scene] MISSION_READY <- peer — re-sending entity snapshot");
-                    try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[scene] ready->snapshot: " + e.Message); }
+                    Log.LogInfo($"[scene] MISSION_READY <- {origin} — re-sending entity snapshot to that peer");
+                    // Target the resync to the joiner that asked — don't re-burst the entity snapshot onto every
+                    // existing client each time someone reports ready (REVIEW-fix P2a).
+                    try { CoopP2P.SendSnapshotTo(origin, () => CoopEntities.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->snapshot: " + e.Message); }
                     break;
                 }
             }
