@@ -267,10 +267,70 @@ namespace IronNestVR
                 && origin != null && rig.TryGetHeadPose(out var hp, out var hr))
             {
                 CaptureOffset(_grabbed, hp, hr, origin); // remember the new spot in both frames
+                PersistPlacement(_grabbed);              // and save it to disk so it survives the session
             }
             if (_grabbed != null) Log.LogInfo($"[grab] released '{_grabbed.Name}'.");
             _grabbed = null;
             _hand = 0;
+        }
+
+        // ---------------- placement persistence (HUD clipboard + watch) ----------------
+
+        // Apply a previously-saved drag position to a freshly-discovered HUD prop so it re-appears where the
+        // player last left it (instead of the game's authored default). Both follow frames are restored;
+        // HasOffset=true makes DriveFollowers use them straight away and skip CaptureInitial.
+        private static void RestorePlacement(Item it, bool isClip)
+        {
+            if (it == null) return;
+            bool saved = isClip ? Config.ClipPlacementSaved : Config.WatchPlacementSaved;
+            if (!saved) return;
+            if (isClip)
+            {
+                it.HeadOffPos = Config.ClipHeadOffPos; it.HeadOffRot = Quaternion.Euler(Config.ClipHeadOffEul);
+                it.OriginOffPos = Config.ClipOriginOffPos; it.OriginOffRot = Quaternion.Euler(Config.ClipOriginOffEul);
+            }
+            else
+            {
+                it.HeadOffPos = Config.WatchHeadOffPos; it.HeadOffRot = Quaternion.Euler(Config.WatchHeadOffEul);
+                it.OriginOffPos = Config.WatchOriginOffPos; it.OriginOffRot = Quaternion.Euler(Config.WatchOriginOffEul);
+            }
+            it.HasOffset = true;
+            Log.LogInfo($"[grab] restored saved placement for {it.Name}.");
+        }
+
+        // Mirror the just-captured offset into Config and write the settings file immediately (releases are
+        // user-paced, so a disk write here is fine). Only the two head-locked HUD props are persisted.
+        private void PersistPlacement(Item it)
+        {
+            bool isClip = it == _hud;
+            bool isWatch = it == _watch;
+            if (!isClip && !isWatch) return;
+            if (isClip)
+            {
+                Config.ClipHeadOffPos = it.HeadOffPos; Config.ClipHeadOffEul = it.HeadOffRot.eulerAngles;
+                Config.ClipOriginOffPos = it.OriginOffPos; Config.ClipOriginOffEul = it.OriginOffRot.eulerAngles;
+                Config.ClipPlacementSaved = true;
+            }
+            else
+            {
+                Config.WatchHeadOffPos = it.HeadOffPos; Config.WatchHeadOffEul = it.HeadOffRot.eulerAngles;
+                Config.WatchOriginOffPos = it.OriginOffPos; Config.WatchOriginOffEul = it.OriginOffRot.eulerAngles;
+                Config.WatchPlacementSaved = true;
+            }
+            try { Config.Save(); } catch (Exception e) { Log.LogWarning("[grab] save placement: " + e.Message); }
+            Log.LogInfo($"[grab] saved placement for {it.Name}.");
+        }
+
+        // Forget the saved HUD placements: clears the persisted flags and re-runs the authored default placement
+        // on the next frame. Exposed for a menu "Reset HUD Positions" action. NOTE: re-default works because the
+        // game re-creates the clipboard/watch at their authored pose on a scene/mission reload — so for an
+        // immediate reset in the current scene, drop & re-acquire (or reload) to pick the authored pose back up.
+        public void ResetHudPlacement()
+        {
+            Config.ClipPlacementSaved = false;
+            Config.WatchPlacementSaved = false;
+            try { Config.Save(); } catch { }
+            Log.LogInfo("[grab] HUD placements reset (clipboard + watch will use authored default on next (re)spawn).");
         }
 
         // ---------------- discovery ----------------
@@ -315,6 +375,7 @@ namespace IronNestVR
                             _appliedScale = 1f;
                             if (!_fadersOff) { DisablePositionFaders(); _fadersOff = true; }
                             ReconcileScale();
+                            RestorePlacement(it, true);   // re-appear where you last dragged it (if saved)
                         }
                         Log.LogInfo($"[grab] tracking {it.Name} ({it.Mode}).");
                     }
@@ -337,6 +398,7 @@ namespace IronNestVR
                         _appliedWatchScale = 1f;
                         DisableWatchAnimators(watch); // stop the wrist-raise Animator re-posing it each frame
                         ReconcileScale();
+                        RestorePlacement(it, false);  // re-appear where you last dragged it (if saved)
                         Log.LogInfo($"[grab] tracking watch '{watch.name}' (HeadLocked).");
                     }
                 }

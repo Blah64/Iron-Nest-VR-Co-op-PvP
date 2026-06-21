@@ -59,6 +59,7 @@ namespace IronNestVR
         private TMP_FontAsset _font;
         private CameraRig _rig;
         internal HandVisuals Hands;   // for the in-menu hand Calibrate tool
+        internal GrabManager Grab;    // for the "Reset HUD Positions" action
         private bool _open;
         private int _hoverIndex = -1;
         private bool _prevTrigger;
@@ -344,6 +345,9 @@ namespace IronNestVR
                      d => Config.ClipboardScale = Clamp(Config.ClipboardScale + d * 0.1f, 0.5f, 4f));
             AddFloat("Watch Size", () => Config.WatchScale.ToString("0.0") + "x",
                      d => Config.WatchScale = Clamp(Config.WatchScale + d * 0.1f, 0.3f, 4f));
+            // Grab+drag the HUD clipboard/watch to reposition them; the spot is saved automatically and
+            // restored next session. This forgets those saved spots (authored default on next respawn/reload).
+            AddAction("Reset HUD Positions", () => Grab?.ResetHudPlacement());
             AddFloat("Resolution Scale", () => Mathf.RoundToInt(Config.RenderScale * 100f) + "%",
                      d => Config.RenderScale = Clamp(Config.RenderScale + d * 0.05f, 0.2f, 1f));
             AddToggle("Turn Mode", () => Config.SnapTurn ? "Snap" : "Smooth",

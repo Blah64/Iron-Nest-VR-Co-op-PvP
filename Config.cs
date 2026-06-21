@@ -288,6 +288,16 @@ namespace IronNestVR
         // Same idea for the gun watch (independent knob — it's a different size to start with).
         public static float WatchScale = 2.5f;
 
+        // Persisted grab-dragged placement for the two head-locked HUD props (clipboard + watch). Each resting
+        // pose is captured in BOTH frames the follower can use — head-relative (the "rotate with view" mode) and
+        // seat/rig-origin-relative (the fixed-orientation default mode) — so wherever you drop them is restored
+        // next session in either mode. "Saved" gates restore vs. the game's authored default placement; written
+        // on grab-release. Rotations are euler degrees (same convention as the hand offsets). See GrabManager.
+        public static bool ClipPlacementSaved = false;
+        public static Vector3 ClipHeadOffPos, ClipHeadOffEul, ClipOriginOffPos, ClipOriginOffEul;
+        public static bool WatchPlacementSaved = false;
+        public static Vector3 WatchHeadOffPos, WatchHeadOffEul, WatchOriginOffPos, WatchOriginOffEul;
+
         // --- VR settings menu (click BOTH thumbsticks at once to open/close) ---
         public static bool MenuEnabled = true;
         // Where the panel appears, relative to the head when opened (it then stays put in the world).
@@ -421,6 +431,16 @@ namespace IronNestVR
                 WF(sb, "FingerCurlSign", FingerCurlSign);
                 WB(sb, "SwitchGrabEnabled", SwitchGrabEnabled);
                 WF(sb, "SwitchThrowDistance", SwitchThrowDistance);
+                WB(sb, "ClipPlacementSaved", ClipPlacementSaved);
+                WV(sb, "ClipHeadOffPos", ClipHeadOffPos);
+                WV(sb, "ClipHeadOffEul", ClipHeadOffEul);
+                WV(sb, "ClipOriginOffPos", ClipOriginOffPos);
+                WV(sb, "ClipOriginOffEul", ClipOriginOffEul);
+                WB(sb, "WatchPlacementSaved", WatchPlacementSaved);
+                WV(sb, "WatchHeadOffPos", WatchHeadOffPos);
+                WV(sb, "WatchHeadOffEul", WatchHeadOffEul);
+                WV(sb, "WatchOriginOffPos", WatchOriginOffPos);
+                WV(sb, "WatchOriginOffEul", WatchOriginOffEul);
                 File.WriteAllText(SettingsPath, sb.ToString());
                 Plugin.Logger?.LogInfo("[config] saved settings to " + SettingsPath);
             }
@@ -471,6 +491,16 @@ namespace IronNestVR
                 case "FingerCurlSign": FingerCurlSign = PF(v, FingerCurlSign); break;
                 case "SwitchGrabEnabled": SwitchGrabEnabled = PB(v, SwitchGrabEnabled); break;
                 case "SwitchThrowDistance": SwitchThrowDistance = PF(v, SwitchThrowDistance); break;
+                case "ClipPlacementSaved": ClipPlacementSaved = PB(v, ClipPlacementSaved); break;
+                case "ClipHeadOffPos": ClipHeadOffPos = PV(v, ClipHeadOffPos); break;
+                case "ClipHeadOffEul": ClipHeadOffEul = PV(v, ClipHeadOffEul); break;
+                case "ClipOriginOffPos": ClipOriginOffPos = PV(v, ClipOriginOffPos); break;
+                case "ClipOriginOffEul": ClipOriginOffEul = PV(v, ClipOriginOffEul); break;
+                case "WatchPlacementSaved": WatchPlacementSaved = PB(v, WatchPlacementSaved); break;
+                case "WatchHeadOffPos": WatchHeadOffPos = PV(v, WatchHeadOffPos); break;
+                case "WatchHeadOffEul": WatchHeadOffEul = PV(v, WatchHeadOffEul); break;
+                case "WatchOriginOffPos": WatchOriginOffPos = PV(v, WatchOriginOffPos); break;
+                case "WatchOriginOffEul": WatchOriginOffEul = PV(v, WatchOriginOffEul); break;
             }
         }
 
