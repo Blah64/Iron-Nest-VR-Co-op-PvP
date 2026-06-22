@@ -238,6 +238,83 @@ namespace IronNestVR
             if (main.cullingMask != 0) main.cullingMask = 0;
         }
 
+        private Camera _lbCam;
+        private float _lbNextRender;
+        private float _lbNextSearch;
+        private bool _lbThrottleLogged;
+        // The [cams] dump found 'LeaderboardCam' rendering a full-scene-mask view to a texture EVERY frame
+        // (~3ms / ~20% of the VR render budget) for a scoreboard display. We gate its per-frame render:
+        //   • Config.DisableLeaderboardCam (diagnostic) — hard off.
+        //   • Config.LeaderboardCamThrottle (shipped)   — render only every 1/Hz s (enable for one frame,
+        //     skip the rest); the camera's RT keeps the last frame between updates, so the board still shows.
+        // The camera is (re)acquired on a 1 s search so a scene change / late spawn is picked up; access is
+        // wrapped so a destroyed handle just triggers a re-acquire. Driven from the VR loop ⇒ VR-only.
+        private void ApplyLeaderboardCam()
+        {
+            bool want = Config.DisableLeaderboardCam || Config.LeaderboardCamThrottle;
+            if (!want)
+            {
+                if (_lbCam != null) { try { if (!_lbCam.enabled) _lbCam.enabled = true; } catch { _lbCam = null; } }
+                return;
+            }
+            if (_lbCam == null && Time.unscaledTime >= _lbNextSearch)
+            {
+                _lbNextSearch = Time.unscaledTime + 1f;
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<Camera>(), FindObjectsSortMode.None);
+                for (int i = 0; i < (arr?.Length ?? 0); i++)
+                {
+                    var c = arr[i].TryCast<Camera>();
+                    if (c != null && c.name == "LeaderboardCam") { _lbCam = c; break; }
+                }
+            }
+            if (_lbCam == null) return;
+            try
+            {
+                if (Config.DisableLeaderboardCam)
+                {
+                    if (_lbCam.enabled) { _lbCam.enabled = false; Log.LogInfo("[perf] LeaderboardCam DISABLED (diag)"); }
+                    return;
+                }
+                // Throttle: render this frame only when the interval has elapsed; otherwise skip it.
+                float now = Time.unscaledTime;
+                if (now >= _lbNextRender)
+                {
+                    _lbNextRender = now + 1f / Mathf.Max(Config.LeaderboardCamHz, 1f);
+                    if (!_lbCam.enabled) _lbCam.enabled = true;
+                    if (!_lbThrottleLogged) { _lbThrottleLogged = true; Log.LogInfo($"[perf] LeaderboardCam throttled to {Config.LeaderboardCamHz:0.#} Hz (was every frame)."); }
+                }
+                else if (_lbCam.enabled) _lbCam.enabled = false;
+            }
+            catch { _lbCam = null; } // destroyed (scene change) — re-acquire on the next search
+        }
+
+        private bool _loggedCams;
+        // One-time dump of every active camera and where it renders. Resolves what the desktop is still
+        // drawing after the mirror blank (skybox via clearFlags, vs a SECOND screen camera the eye rig
+        // doesn't replicate) and shows the true render topology — how many full-scene passes per frame.
+        private void LogCamerasOnce()
+        {
+            if (_loggedCams || _rig == null || !_rig.Ready) return;
+            _loggedCams = true;
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<Camera>(), FindObjectsSortMode.None);
+                int n = arr?.Length ?? 0;
+                Log.LogInfo($"[cams] {n} active camera(s) — SCREEN targets render to the monitor, RT targets are our eyes/pointers:");
+                for (int i = 0; i < n; i++)
+                {
+                    var c = arr[i].TryCast<Camera>();
+                    if (c == null) continue;
+                    bool toRt = c.targetTexture != null;
+                    var r = c.rect;
+                    Log.LogInfo($"[cams]  '{c.name}' depth={c.depth} clear={c.clearFlags} mask=0x{(uint)c.cullingMask:X8} " +
+                                $"target={(toRt ? "RT" : "SCREEN")} rect=({r.x:0.##},{r.y:0.##},{r.width:0.##},{r.height:0.##}) " +
+                                $"enabled={c.enabled} tag='{c.tag}'");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[cams] dump failed: " + e.Message); }
+        }
+
         private void Update()
         {
             PerfProbe.UpdateBegin();
@@ -333,6 +410,9 @@ namespace IronNestVR
                 // Blank the wasted full-res desktop mirror render while in VR (cullingMask=0). Runs after the
                 // eyes exist (gated inside) so the headset keeps the real mask. The single biggest GPU/draw win.
                 ApplyDesktopMirror();
+                LogCamerasOnce();
+                if (_rig != null && _rig.Ready) _rig.SetEyeSceneRender(!Config.EyeCullTest); // diag: eyes skybox-only
+                ApplyLeaderboardCam();                                                        // diag: kill the leaderboard cam
 
                 // Runtime-failure fallback. A present-but-broken runtime (e.g. headset not actually streaming)
                 // makes xrWaitFrame block for seconds and return an error EVERY frame — the game freezes at

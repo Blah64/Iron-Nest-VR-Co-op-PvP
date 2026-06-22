@@ -26,6 +26,7 @@ namespace IronNestVR
         // the two aren't ordered — both eyes' copies would read whichever blit landed last (broken/mono image).
         private readonly RenderTexture[] _flipRT = new RenderTexture[2];
         private bool _ready;
+        private int _eyeMask = -1; // captured scene cull mask (for the eye-cull diagnostic)
         private bool _useEnabledFallback;
         private bool _loggedFallback;
         private float _recenterYaw;
@@ -79,6 +80,7 @@ namespace IronNestVR
             var mClear = main.clearFlags;
             var mBg = main.backgroundColor;
             var mMask = main.cullingMask;
+            _eyeMask = mMask;
             var mDepth = main.depth;
             Dbg.Step($"main props ok: clear={mClear} mask={mMask} depth={mDepth}");
 
@@ -240,6 +242,17 @@ namespace IronNestVR
             if (!_useEnabledFallback) return;
             for (int i = 0; i < 2; i++)
                 if (_cam[i] != null && _cam[i].enabled != on) _cam[i].enabled = on;
+        }
+
+        /// <summary>Diagnostic: toggle the eye cameras' SCENE rendering via cullingMask WITHOUT disabling
+        /// them, so the pipeline stays healthy (they still clear to skybox and produce a valid image). Off ⇒
+        /// mask 0 (skybox only) to measure how much of the frame is the per-eye scene draw; on ⇒ the captured
+        /// real mask. Cheap + idempotent (writes only on change).</summary>
+        public void SetEyeSceneRender(bool on)
+        {
+            int m = on ? _eyeMask : 0;
+            for (int i = 0; i < 2; i++)
+                if (_cam[i] != null && _cam[i].cullingMask != m) _cam[i].cullingMask = m;
         }
 
         /// <summary>Builds an OpenGL-convention asymmetric projection from an OpenXR FOV.</summary>

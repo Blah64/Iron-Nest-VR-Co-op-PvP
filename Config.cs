@@ -309,6 +309,23 @@ namespace IronNestVR
         // in flatscreen → parity intact). Set false to keep a live spectator mirror on the monitor.
         public static bool DisableDesktopMirror = true;
 
+        // --- Diagnostic render-cost bisection toggles (default OFF, VR-only, reversible via cfg) ---
+        // EyeCullTest: render the eyes' scene as skybox-only (cullingMask 0) — the headset shows only sky
+        // while on — to measure how much of the frame's render bucket is the per-eye SCENE draw. If the
+        // [probe] render-ms collapses with this on, the two eye renders are the bottleneck.
+        public static bool EyeCullTest = false;
+        // DisableLeaderboardCam: turn off the game's 'LeaderboardCam' (the [cams] dump showed it rendering
+        // with a full scene mask to a texture every frame) to see if it's a hidden full-scene render cost.
+        public static bool DisableLeaderboardCam = false;
+
+        // SHIPPED win: throttle 'LeaderboardCam' to LeaderboardCamHz instead of every frame. It's a full-scene
+        // render to a texture (a scoreboard display) measured at ~20% (~3ms) of the VR render budget on the
+        // dev box. A leaderboard doesn't need 72 fps; rendering it a few times/sec reclaims most of that for
+        // free (its texture holds the last frame between updates). Driven from the VR loop ⇒ VR-only, so a
+        // flatscreen player's leaderboard is untouched (parity). Off = render every frame.
+        public static bool LeaderboardCamThrottle = true;
+        public static float LeaderboardCamHz = 6f;
+
         // --- Diagnostics / quick toggles for live tuning ---
         // Phase 2.5 isolation: render each eye as a flat clear color (no scene) to prove the
         // swapchain copy + projection-layer submission path independent of scene rendering.
@@ -750,6 +767,10 @@ namespace IronNestVR
                 case "PerfProbe": PerfProbe = PB(v, PerfProbe); break;
                 case "PerfProbeIntervalSec": PerfProbeIntervalSec = PF(v, PerfProbeIntervalSec); break;
                 case "DisableDesktopMirror": DisableDesktopMirror = PB(v, DisableDesktopMirror); break;
+                case "EyeCullTest": EyeCullTest = PB(v, EyeCullTest); break;
+                case "DisableLeaderboardCam": DisableLeaderboardCam = PB(v, DisableLeaderboardCam); break;
+                case "LeaderboardCamThrottle": LeaderboardCamThrottle = PB(v, LeaderboardCamThrottle); break;
+                case "LeaderboardCamHz": LeaderboardCamHz = PF(v, LeaderboardCamHz); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;
