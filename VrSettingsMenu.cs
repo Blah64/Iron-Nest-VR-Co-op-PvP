@@ -378,51 +378,48 @@ namespace IronNestVR
             AddAction("Close Menu", Close);
         }
 
-        // HUD layout tab: calibrate the waist-holstered clipboard and the wrist watch by physically placing
-        // them, the same way the hand models are calibrated. Arm a row (tap), then GRIP the prop and move it
-        // to where you want it — release to set. Works with this menu open (the menu uses the trigger; grab
-        // uses the grip). The placed pose is saved to the cfg. Fine angle adjustment helps the watch most.
+        // HUD layout tab: calibrate the clipboard + watch entirely by GRIP-MOVING them (the same gesture the
+        // hand models use) — no sliders. Arm a row (tap), then grip & move; release to set. Works with this
+        // menu open (the menu uses the trigger; grab uses the grip). The placed pose is saved to the cfg.
         private void DefineHudRows()
         {
-            AddToggle("Calibrate Clipboard",
+            AddToggle("Calibrate Clipboard",   // waist resting spot
                       () => (Grab != null && Grab.CalibratingClip) ? "grip & place" : "tap",
-                      () => Grab?.ToggleCalibrate(false));
-            AddToggle("Calibrate Watch",
+                      () => Grab?.ToggleCalibrateClip());
+            AddToggle("Calibrate Watch",       // left wrist
                       () => (Grab != null && Grab.CalibratingWatch) ? "R-grip on wrist" : "tap",
-                      () => Grab?.ToggleCalibrate(true));
-
-            // Angle fine-tune (grab nails position; small wrist jitter makes exact angles hard to grab-set).
-            AddFloat("Clip Tilt", () => Deg(Config.ClipWaistEuler.x),
-                     d => Config.ClipWaistEuler.x = Wrap(Config.ClipWaistEuler.x + d * 5f));
-            AddFloat("Watch Pitch", () => Deg(Config.WatchWristEuler.x),
-                     d => Config.WatchWristEuler.x = Wrap(Config.WatchWristEuler.x + d * 5f));
-            AddFloat("Watch Yaw", () => Deg(Config.WatchWristEuler.y),
-                     d => Config.WatchWristEuler.y = Wrap(Config.WatchWristEuler.y + d * 5f));
-            AddFloat("Watch Roll", () => Deg(Config.WatchWristEuler.z),
-                     d => Config.WatchWristEuler.z = Wrap(Config.WatchWristEuler.z + d * 5f));
+                      () => Grab?.ToggleCalibrateWatch());
+            AddToggle("Calibrate Clip Hold",   // how it sits in the hand: hold it, grip with the OTHER hand to move
+                      () => ClipHoldHint(),    // per-hand: grab with each hand and adjust to set L and R separately
+                      () => Grab?.ToggleCalibrateClipHold());
 
             AddAction("Reset HUD Layout", ResetHudLayout);
             AddAction("Close Menu", Close);
         }
 
-        // Restore the waist/wrist anchors to their built-in defaults (the values baked into Config).
-        private void ResetHudLayout()
+        // "Calibrate Clip Hold" value text: prompt to grab the clipboard, then show which hand's held pose is
+        // being edited (each hand is calibrated separately — grab with the left to set L, the right to set R).
+        private string ClipHoldHint()
         {
-            Config.ClipWaistOffset = new Vector3(0f, -0.45f, 0.33f);
-            Config.ClipWaistEuler = new Vector3(45f, 0f, 0f);
-            Config.WatchWristOffset = new Vector3(0f, 0f, -0.05f);
-            Config.WatchWristEuler = Vector3.zero;
-            try { Config.Save(); } catch { }
-            Log.LogInfo("[menu] HUD layout reset to defaults.");
+            if (Grab == null || !Grab.CalibratingClipHold) return "tap";
+            int h = Grab.ClipboardHoldHand;
+            return h == 2 ? "R: other grip" : h == 1 ? "L: other grip" : "grip clipboard";
         }
 
-        private static string Deg(float deg) => Mathf.RoundToInt(deg) + " deg";
-        private static float Wrap(float deg)
+        // Restore the waist/wrist/held anchors to their built-in defaults (the values baked into Config).
+        private void ResetHudLayout()
         {
-            deg %= 360f;
-            if (deg > 180f) deg -= 360f;
-            else if (deg < -180f) deg += 360f;
-            return deg;
+            Config.ClipWaistOffset = new Vector3(-0.5542615f, -0.26802254f, 0.018041328f);
+            Config.ClipWaistEuler = new Vector3(2.0274513f, 122.143425f, 359.07642f);
+            Config.ClipHeldOffsetR = new Vector3(-0.16269675f, 0.13032103f, 0.42897746f);
+            Config.ClipHeldEulerR = new Vector3(18.389952f, 103.58665f, 117.69442f);
+            Config.ClipHeldOffsetL = new Vector3(0.30866373f, 0.030668717f, 0.40904504f);
+            Config.ClipHeldEulerL = new Vector3(62.616592f, 190.85422f, 198.97607f);
+            Config.ClipHoldCurl = 0.28f;
+            Config.WatchWristOffset = new Vector3(-0.118086986f, -0.03401533f, -0.1825182f);
+            Config.WatchWristEuler = new Vector3(291.49533f, 99.28354f, 78.04213f);
+            try { Config.Save(); } catch { }
+            Log.LogInfo("[menu] HUD layout reset to defaults.");
         }
 
         private void AddFloat(string label, Func<string> value, Action<int> adjust)

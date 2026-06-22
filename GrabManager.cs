@@ -65,26 +65,46 @@ namespace IronNestVR
         private bool _fadersOff;
         private int _lastManualCount = -1;
 
-        // Calibration (menu-armed, like the hand-model Calibrate tool): physically grab the prop and
-        // release — the resting pose is recomputed in the prop's own anchor frame and saved to the cfg.
-        //  • Clipboard: grip-grab it (either hand), place it at your waist, release → waist offset/tilt.
-        //  • Watch: it becomes grabbable; reach your RIGHT hand to your left wrist, grip & place, release
-        //    → offset/orientation in the LEFT-grip (wrist) frame.
+        // Calibration (menu-armed, like the hand-model Calibrate tool). All placement is done by GRIP-MOVING
+        // the prop — no sliders.
+        //  • Clip (waist rest): grip-grab the clipboard (either hand), place it at your waist, release →
+        //    offset/tilt in the body-yaw frame.
+        //  • Watch (wrist): the watch becomes grabbable; reach your RIGHT hand to your left wrist, grip &
+        //    place, release → offset/orientation in the LEFT-grip frame.
+        //  • ClipHold (place in the hand): hold the clipboard with one hand, then grip it with your OTHER
+        //    hand and move/rotate to adjust how it sits in the holding hand; release to set → offset/orient
+        //    in the holding controller's grip frame. (Two-hand, mirrors the hand-model Calibrate gesture.)
         // Stays armed until toggled off. Runs even with the menu open (VrManager calls Tick while armed).
-        private enum CalibTarget { None, Clip, Watch }
+        private enum CalibTarget { None, Clip, Watch, ClipHold }
         private CalibTarget _calib;
         public bool IsCalibrating => _calib != CalibTarget.None;
         public bool CalibratingClip => _calib == CalibTarget.Clip;
         public bool CalibratingWatch => _calib == CalibTarget.Watch;
+        public bool CalibratingClipHold => _calib == CalibTarget.ClipHold;
 
-        public void ToggleCalibrate(bool watch)
+        // ClipHold gesture state: the opposite hand's grip drags the board relative to the holding hand.
+        private bool _holdAdjust, _prevHoldGrip;
+        private Vector3 _holdOppPos, _holdClipPos;
+        private Quaternion _holdOppRot, _holdClipRot;
+
+        // Which hand is currently holding the HUD clipboard (0 = none, 1 = left, 2 = right). The hand-model
+        // renderer reads this to pose that hand as holding a flat object. See HandVisuals.SetClipboardHold.
+        public int ClipboardHoldHand => (_grabbed != null && _grabbed == _hud) ? _hand : 0;
+
+        public void ToggleCalibrateClip() => SetCalib(CalibTarget.Clip);
+        public void ToggleCalibrateWatch() => SetCalib(CalibTarget.Watch);
+        public void ToggleCalibrateClipHold() => SetCalib(CalibTarget.ClipHold);
+
+        private void SetCalib(CalibTarget want)
         {
-            var want = watch ? CalibTarget.Watch : CalibTarget.Clip;
             _calib = (_calib == want) ? CalibTarget.None : want;
+            _holdAdjust = false;
+            _prevHoldGrip = true; // swallow an opposite-grip that's already held as we enter
             if (_calib == CalibTarget.None) { try { Config.Save(); } catch { } } // persist on finish
             Log.LogInfo("[grab] calibrate " + (_calib == CalibTarget.None ? "off."
-                : (watch ? "WATCH — reach your RIGHT hand to your left wrist, grip & place, release."
-                         : "CLIPBOARD — grip it, place it at your waist, release.")));
+                : _calib == CalibTarget.Watch ? "WATCH — reach your RIGHT hand to your left wrist, grip & place."
+                : _calib == CalibTarget.ClipHold ? "CLIP HOLD — hold the clipboard, then grip it with your OTHER hand and move it."
+                : "CLIPBOARD — grip it, place it at your waist, release."));
         }
 
         // ---------------- per-frame ----------------
@@ -98,9 +118,9 @@ namespace IronNestVR
                 var origin = rig.OriginTransform;
                 if (origin == null) return;
 
-                // Grab / drag / release. Right hand: RAY-grab first, because the head-locked watch/clipboard
-                // are always within proximity range and would otherwise hijack every squeeze — so if the
-                // laser is touching a world manual, grab THAT; only fall back to a proximity grab otherwise.
+                // Grab / drag / release. Right hand: RAY-grab first, because the waist clipboard is within
+                // proximity range and would otherwise hijack a squeeze meant for a world manual — so if the
+                // laser is touching a manual, grab THAT; only fall back to a proximity grab otherwise.
                 // Left hand: proximity only (there's no left aim ray).
                 if (_grabbed == null)
                 {
@@ -122,7 +142,20 @@ namespace IronNestVR
                     {
                         Posef p = _hand == 2 ? input.GripPose : input.GripPoseL;
                         GetWorld(origin, p, out var cp, out var cr);
-                        _grabbed.Move.SetPositionAndRotation(cp + cr * _gPos, cr * _gRot);
+                        if (_grabbed.Mode == Mode.WaistLocked)
+                        {
+                            // ClipHold calibration: the OTHER hand's grip drags the held offset before we apply it.
+                            if (_calib == CalibTarget.ClipHold) ClipHoldAdjust(input, origin, cp, cr);
+                            // Clipboard: snap into a FIXED held pose in the grip frame (per holding hand, since
+                            // left/right grips mirror) so it sits flat in the hand and moves rigidly with it.
+                            bool right = _hand == 2;
+                            Vector3 off = right ? Config.ClipHeldOffsetR : Config.ClipHeldOffsetL;
+                            Vector3 eul = right ? Config.ClipHeldEulerR : Config.ClipHeldEulerL;
+                            _grabbed.Move.SetPositionAndRotation(cp + cr * off, cr * Quaternion.Euler(eul));
+                        }
+                        else
+                            // Manuals / watch-during-calibration: keep the relative pose captured at grab time.
+                            _grabbed.Move.SetPositionAndRotation(cp + cr * _gPos, cr * _gRot);
                     }
                 }
 
@@ -330,6 +363,55 @@ namespace IronNestVR
             Config.ClipWaistEuler = (invBody * _hud.Move.rotation * Quaternion.Inverse(_hud.ReadableRot)).eulerAngles;
             try { Config.Save(); } catch { }
             Log.LogInfo($"[grab] clipboard calibrated: offset={Config.ClipWaistOffset}, tilt={Config.ClipWaistEuler}.");
+        }
+
+        // ClipHold calibration: while the clipboard is held by one hand (cp/cr = that grip's world pose), the
+        // OPPOSITE hand's grip rigidly drags the board; we re-express its pose in the holding-grip frame and
+        // store it as ClipHeldOffset/Euler (so it sticks once released). Mirrors HandVisuals.CalibrateTick.
+        private void ClipHoldAdjust(VrInput input, Transform origin, Vector3 hPos, Quaternion hRot)
+        {
+            bool holdRight = _hand == 2;  // which hand HOLDS the clipboard → which per-hand offset we edit
+            bool oppIsRight = !holdRight; // if LEFT holds the clipboard, the opposite (adjusting) hand is RIGHT
+            bool oppValid = oppIsRight ? input.GripValid : input.GripValidL;
+            bool oppGrip = oppIsRight ? input.GrabR : input.GrabL;
+            if (!oppValid) { _prevHoldGrip = oppGrip; return; }
+            GetWorld(origin, oppIsRight ? input.GripPose : input.GripPoseL, out var oPos, out var oRot);
+
+            // Current held pose in world (from the holding hand's offset we're about to edit).
+            Vector3 curOff = holdRight ? Config.ClipHeldOffsetR : Config.ClipHeldOffsetL;
+            Vector3 curEul = holdRight ? Config.ClipHeldEulerR : Config.ClipHeldEulerL;
+            Vector3 clipPos = hPos + hRot * curOff;
+            Quaternion clipRot = hRot * Quaternion.Euler(curEul);
+
+            if (oppGrip && !_prevHoldGrip)
+            {
+                _holdOppPos = oPos; _holdOppRot = oRot;
+                _holdClipPos = clipPos; _holdClipRot = clipRot;
+                _holdAdjust = true;
+                input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
+            }
+            else if (!oppGrip && _prevHoldGrip && _holdAdjust)
+            {
+                _holdAdjust = false;
+                try { Config.Save(); } catch { }
+                input.Haptic(Config.DetentHapticAmplitude, 0.03f);
+                Log.LogInfo($"[grab] clip-hold calibrated ({(holdRight ? "right" : "left")} hand): "
+                            + $"offset={(holdRight ? Config.ClipHeldOffsetR : Config.ClipHeldOffsetL)}, "
+                            + $"euler={(holdRight ? Config.ClipHeldEulerR : Config.ClipHeldEulerL)}.");
+            }
+
+            if (_holdAdjust)
+            {
+                Quaternion dq = oRot * Quaternion.Inverse(_holdOppRot);
+                Vector3 newPos = oPos + dq * (_holdClipPos - _holdOppPos);
+                Quaternion newRot = dq * _holdClipRot;
+                Quaternion invH = Quaternion.Inverse(hRot);
+                Vector3 newOff = invH * (newPos - hPos);
+                Vector3 newEul = (invH * newRot).eulerAngles;
+                if (holdRight) { Config.ClipHeldOffsetR = newOff; Config.ClipHeldEulerR = newEul; }
+                else { Config.ClipHeldOffsetL = newOff; Config.ClipHeldEulerL = newEul; }
+            }
+            _prevHoldGrip = oppGrip;
         }
 
         // Recompute the watch offset + orientation from where it was placed, expressed in the LEFT grip
@@ -570,6 +652,7 @@ namespace IronNestVR
         {
             if (_calib == CalibTarget.None) return;
             _calib = CalibTarget.None;
+            _holdAdjust = false;
             try { Config.Save(); } catch { }
         }
 
@@ -581,6 +664,7 @@ namespace IronNestVR
             _lastManualCount = -1;
             _nextScan = 0f;
             _calib = CalibTarget.None;
+            _holdAdjust = false; _prevHoldGrip = false;
         }
     }
 }

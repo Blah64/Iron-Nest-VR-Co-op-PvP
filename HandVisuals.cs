@@ -75,6 +75,12 @@ namespace IronNestVR
         public bool Calibrating => _calib != Calib.None;
         public bool CalibratingRight => _calib == Calib.Right;
 
+        // Which hand is holding the HUD clipboard (0 none, 1 left, 2 right). That hand poses as holding a
+        // flat object (a fixed finger curl) instead of fisting the controller. Set each frame by VrManager
+        // from GrabManager.ClipboardHoldHand, before Tick.
+        private int _clipHoldHand;
+        public void SetClipboardHold(int hand) { _clipHoldHand = hand; }
+
         // Current smoothed finger-curl amounts (0..1), streamed to the peer so the remote avatar's hands curl
         // too (index follows the trigger, "other" follows the grip). See CoopP2P / RemoteAvatar.
         public float RightCurlIndex => _right.CurlIndex;
@@ -174,6 +180,13 @@ namespace IronNestVR
             // Fingers close fully as the hand reaches the grabbed control (Blend -> 1).
             float idx = Mathf.Lerp(trigger, 1f, h.Blend);
             float oth = Mathf.Lerp(grip, 1f, h.Blend);
+            // Holding the HUD clipboard: pose this hand as cradling a flat object (fixed curl), regardless of
+            // how hard the grip is squeezed, so it reads as "holding the board" rather than a clenched fist.
+            if (_clipHoldHand != 0 && _clipHoldHand == (h == _right ? 2 : 1))
+            {
+                idx = Config.ClipHoldCurl;
+                oth = Config.ClipHoldCurl;
+            }
             // Ease the on/off grip so the fist doesn't pop (trigger is already analog).
             float k = Config.FingerCurlSmooth > 0f ? 1f - Mathf.Exp(-Config.FingerCurlSmooth * dt) : 1f;
             h.CurlIndex = Mathf.Lerp(h.CurlIndex, idx, k);

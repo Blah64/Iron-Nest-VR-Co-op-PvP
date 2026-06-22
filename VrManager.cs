@@ -354,6 +354,7 @@ namespace IronNestVR
                         }
                     }
                     _grab.ReconcileScale(); // live clipboard size, even with the menu open
+                    _hands.SetClipboardHold(_grab.ClipboardHoldHand); // pose the holding hand as cradling the board
                     _hands.Tick(_xr.Input, _rig, active); // pose hand models (after manip sets overrides)
 
                     // Co-op: stream our head + hand world poses (and finger curl) to the peer (mirrored as

@@ -385,15 +385,29 @@ namespace IronNestVR
         // and it returns here. Offset is metres in the body-yaw frame (x=right, y=up so negative drops it,
         // z=forward). ClipWaistEuler tilts the readable face up toward your downward gaze (degrees, applied on
         // top of the clipboard's captured authored facing). Tune live on the menu's HUD tab.
-        public static Vector3 ClipWaistOffset = new Vector3(0f, -0.45f, 0.33f);
-        public static Vector3 ClipWaistEuler = new Vector3(45f, 0f, 0f);
+        // Defaults are a real in-headset calibration (baked so a fresh install sits right out of the box);
+        // re-calibrate for your own setup on the menu's HUD tab, or Reset HUD Layout.
+        public static Vector3 ClipWaistOffset = new Vector3(-0.5542615f, -0.26802254f, 0.018041328f);
+        public static Vector3 ClipWaistEuler = new Vector3(2.0274513f, 122.143425f, 359.07642f);
+
+        // While the clipboard is GRABBED off the waist it snaps to this fixed pose in the holding controller's
+        // grip frame, so it sits "held" in the hand and moves rigidly with it (instead of keeping whatever
+        // angle it happened to have when grabbed). PER-HAND because the left/right grip frames are mirror
+        // images — calibrating the right hand can't double for the left. Offset is metres in the grip frame;
+        // Euler is grip-frame orientation (degrees). Set each by holding the clipboard in that hand and using
+        // "Calibrate Clip Hold". ClipHoldCurl is the holding hand's finger curl (0 = flat/open .. 1 = fist).
+        public static Vector3 ClipHeldOffsetR = new Vector3(-0.16269675f, 0.13032103f, 0.42897746f);
+        public static Vector3 ClipHeldEulerR = new Vector3(18.389952f, 103.58665f, 117.69442f);
+        public static Vector3 ClipHeldOffsetL = new Vector3(0.30866373f, 0.030668717f, 0.40904504f);
+        public static Vector3 ClipHeldEulerL = new Vector3(62.616592f, 190.85422f, 198.97607f);
+        public static float ClipHoldCurl = 0.28f;
 
         // --- Gun watch wristband ---
         // The watch rides the LEFT controller like a wristwatch (it can't be grabbed). Offset is metres in the
         // left grip frame; WatchWristEuler orients the dial on the back of the wrist (degrees). The grip-frame
         // axes aren't obvious, so expect to dial these in on the menu's HUD tab the first time.
-        public static Vector3 WatchWristOffset = new Vector3(0f, 0f, -0.05f);
-        public static Vector3 WatchWristEuler = new Vector3(0f, 0f, 0f);
+        public static Vector3 WatchWristOffset = new Vector3(-0.118086986f, -0.03401533f, -0.1825182f);
+        public static Vector3 WatchWristEuler = new Vector3(291.49533f, 99.28354f, 78.04213f);
 
         // --- VR settings menu (click BOTH thumbsticks at once to open/close) ---
         public static bool MenuEnabled = true;
@@ -542,6 +556,11 @@ namespace IronNestVR
                 WB(sb, "PopupVrEnabled", PopupVrEnabled);
                 WV(sb, "ClipWaistOffset", ClipWaistOffset);
                 WV(sb, "ClipWaistEuler", ClipWaistEuler);
+                WV(sb, "ClipHeldOffsetR", ClipHeldOffsetR);
+                WV(sb, "ClipHeldEulerR", ClipHeldEulerR);
+                WV(sb, "ClipHeldOffsetL", ClipHeldOffsetL);
+                WV(sb, "ClipHeldEulerL", ClipHeldEulerL);
+                WF(sb, "ClipHoldCurl", ClipHoldCurl);
                 WV(sb, "WatchWristOffset", WatchWristOffset);
                 WV(sb, "WatchWristEuler", WatchWristEuler);
                 WB(sb, "CoopGasMask", CoopGasMask);
@@ -637,6 +656,11 @@ namespace IronNestVR
                 case "SwitchThrowDistance": SwitchThrowDistance = PF(v, SwitchThrowDistance); break;
                 case "ClipWaistOffset": ClipWaistOffset = PV(v, ClipWaistOffset); break;
                 case "ClipWaistEuler": ClipWaistEuler = PV(v, ClipWaistEuler); break;
+                case "ClipHeldOffsetR": ClipHeldOffsetR = PV(v, ClipHeldOffsetR); break;
+                case "ClipHeldEulerR": ClipHeldEulerR = PV(v, ClipHeldEulerR); break;
+                case "ClipHeldOffsetL": ClipHeldOffsetL = PV(v, ClipHeldOffsetL); break;
+                case "ClipHeldEulerL": ClipHeldEulerL = PV(v, ClipHeldEulerL); break;
+                case "ClipHoldCurl": ClipHoldCurl = PF(v, ClipHoldCurl); break;
                 case "WatchWristOffset": WatchWristOffset = PV(v, WatchWristOffset); break;
                 case "WatchWristEuler": WatchWristEuler = PV(v, WatchWristEuler); break;
                 case "CoopGasMask": CoopGasMask = PB(v, CoopGasMask); break;
