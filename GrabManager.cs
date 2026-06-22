@@ -46,6 +46,9 @@ namespace IronNestVR
             // placement then = body-yaw * configTilt * ReadableRot, positioned at the configured waist offset.
             public Quaternion ReadableRot;
             public bool HasReadable;
+            // WorldLocked only: the world pose captured when first tracked, used to put the prop back on release
+            // IF it has no PickUpZoomTarget (manuals restore via the game's own original-state record instead).
+            public Vector3 HomePos; public Quaternion HomeRot; public bool HasHome;
         }
 
         private readonly Dictionary<int, Item> _items = new Dictionary<int, Item>();
@@ -87,9 +90,11 @@ namespace IronNestVR
         private Vector3 _holdOppPos, _holdClipPos;
         private Quaternion _holdOppRot, _holdClipRot;
 
-        // Which hand is currently holding the HUD clipboard (0 = none, 1 = left, 2 = right). The hand-model
-        // renderer reads this to pose that hand as holding a flat object. See HandVisuals.SetClipboardHold.
-        public int ClipboardHoldHand => (_grabbed != null && _grabbed == _hud) ? _hand : 0;
+        // Which hand is currently holding a clipboard-posed prop (the HUD clipboard OR a world manual)
+        // (0 = none, 1 = left, 2 = right). The hand-model renderer reads this to pose that hand as holding a
+        // flat object. See HandVisuals.SetClipboardHold. (The watch during calibration is excluded.)
+        public int ClipboardHoldHand =>
+            (_grabbed != null && (_grabbed.Mode == Mode.WaistLocked || _grabbed.Mode == Mode.WorldLocked)) ? _hand : 0;
 
         public void ToggleCalibrateClip() => SetCalib(CalibTarget.Clip);
         public void ToggleCalibrateWatch() => SetCalib(CalibTarget.Watch);
@@ -142,19 +147,21 @@ namespace IronNestVR
                     {
                         Posef p = _hand == 2 ? input.GripPose : input.GripPoseL;
                         GetWorld(origin, p, out var cp, out var cr);
-                        if (_grabbed.Mode == Mode.WaistLocked)
+                        if (_grabbed.Mode == Mode.WaistLocked || _grabbed.Mode == Mode.WorldLocked)
                         {
-                            // ClipHold calibration: the OTHER hand's grip drags the held offset before we apply it.
-                            if (_calib == CalibTarget.ClipHold) ClipHoldAdjust(input, origin, cp, cr);
-                            // Clipboard: snap into a FIXED held pose in the grip frame (per holding hand, since
-                            // left/right grips mirror) so it sits flat in the hand and moves rigidly with it.
+                            // ClipHold calibration only adjusts the HUD clipboard's held offset.
+                            if (_calib == CalibTarget.ClipHold && _grabbed.Mode == Mode.WaistLocked)
+                                ClipHoldAdjust(input, origin, cp, cr);
+                            // Clipboard AND world manuals: snap into the SAME fixed held pose in the grip frame
+                            // (per holding hand, since left/right grips mirror) so the prop sits flat in the
+                            // hand and moves rigidly with it. Manuals snap back to their world spot on release.
                             bool right = _hand == 2;
                             Vector3 off = right ? Config.ClipHeldOffsetR : Config.ClipHeldOffsetL;
                             Vector3 eul = right ? Config.ClipHeldEulerR : Config.ClipHeldEulerL;
                             _grabbed.Move.SetPositionAndRotation(cp + cr * off, cr * Quaternion.Euler(eul));
                         }
                         else
-                            // Manuals / watch-during-calibration: keep the relative pose captured at grab time.
+                            // Watch during calibration: keep the relative pose captured at grab time.
                             _grabbed.Move.SetPositionAndRotation(cp + cr * _gPos, cr * _gRot);
                     }
                 }
@@ -338,17 +345,38 @@ namespace IronNestVR
 
         // Drop whatever's held. If we're calibrating the released prop, the spot it was placed becomes its new
         // resting offset (saved to disk). Otherwise the waist clipboard returns to its holster next frame
-        // (DriveFollowers) and a world manual stays at the world pose it was released in.
+        // (DriveFollowers) and a world manual snaps back to where it was originally placed in the world.
         private void Release(CameraRig rig, VrInput input)
         {
             if (_grabbed != null)
             {
                 if (_calib == CalibTarget.Clip && _grabbed == _hud) CaptureClipCalibration(rig);
                 else if (_calib == CalibTarget.Watch && _grabbed == _watch) CaptureWatchCalibration(rig, input);
+                else if (_grabbed.Mode == Mode.WorldLocked) ReturnManualHome(_grabbed);
                 Log.LogInfo($"[grab] released '{_grabbed.Name}'.");
             }
             _grabbed = null;
             _hand = 0;
+        }
+
+        // Put a world manual back where it was originally placed. Manuals use the game's own original-state
+        // record (ResetToOriginalImmediate / Release) so they return under their original parent — correct
+        // even for props mounted on the rotating turret. Non-zoom world props fall back to our captured Home.
+        private static void ReturnManualHome(Item it)
+        {
+            try
+            {
+                if (it.Zoom != null)
+                {
+                    if (it.Zoom.isHeld) it.Zoom.Release();        // was floated-up to read: proper close + state reset
+                    else it.Zoom.ResetToOriginalImmediate();      // wasn't zoomed: snap straight back to its spot
+                }
+                else if (it.HasHome && it.Move != null)
+                {
+                    it.Move.SetPositionAndRotation(it.HomePos, it.HomeRot);
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[grab] return manual home: " + e.Message); }
         }
 
         // Recompute the waist offset + tilt from where the clipboard was just placed, expressed in the
@@ -463,7 +491,8 @@ namespace IronNestVR
                             Move = move, Prox = clip,
                             Rend = move.GetComponentInChildren<Renderer>(true),
                             Mode = hud ? Mode.WaistLocked : Mode.WorldLocked,
-                            IsHudClip = hud
+                            IsHudClip = hud,
+                            HomePos = move.position, HomeRot = move.rotation, HasHome = !hud  // world props return here on release
                         };
                         _items[id] = it;
                         if (hud)
@@ -500,8 +529,10 @@ namespace IronNestVR
             }
 
             // Operating-manual / instruction clipboards scattered in the world (PickUpZoomTarget props):
-            // grip-grab to reposition them in 3D, world-locked (no camera rotate). Tracked even while
-            // inactive (so there's no add/remove churn) but only grabbable while resting + visible.
+            // grip-grab brings one into your hand in the SAME held clipboard pose; releasing snaps it back to
+            // where it was originally placed (via the game's own original-state record). Trigger still does the
+            // game's click-to-zoom-and-read. Tracked even while inactive (no add/remove churn); only grabbable
+            // while resting/floated + visible.
             if (Config.ManualGrabEnabled)
             {
                 var marr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PickUpZoomTarget>(), FindObjectsInactive.Include, FindObjectsSortMode.None);
@@ -523,7 +554,8 @@ namespace IronNestVR
                                 Move = t, Prox = t,
                                 Rend = t.GetComponentInChildren<Renderer>(true),
                                 Mode = Mode.WorldLocked,
-                                Zoom = pz
+                                Zoom = pz,
+                                HomePos = t.position, HomeRot = t.rotation, HasHome = true  // fallback if the game's reset fails
                             };
                         }
                     }
