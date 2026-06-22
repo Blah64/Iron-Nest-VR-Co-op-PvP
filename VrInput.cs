@@ -33,8 +33,9 @@ namespace IronNestVR
         private XrAction _aMenu;     // left menu button -> ESC
         private XrAction _aMove;     // left thumbstick -> locomotion
         private XrAction _aTurn;     // right thumbstick -> view turn
-        private XrAction _aInteract; // right A button -> [E] interact
+        private XrAction _aInteract; // right A button -> [E] interact (also map-tools toggle while right-holding clipboard)
         private XrAction _aMapDelete; // right B button -> map line delete (secondary click)
+        private XrAction _aMapToolsL; // left X button -> map-tools palette toggle (while left-holding clipboard)
         private XrAction _aStickL;   // left thumbstick click  \ both at once -> open VR menu
         private XrAction _aStickR;   // right thumbstick click /
         private XrAction _aHaptic;   // vibration output
@@ -51,6 +52,7 @@ namespace IronNestVR
         private float _turnX, _turnY;
         private bool _interact;
         private bool _mapDelete;
+        private bool _mapToolsL;
         private bool _stickL, _stickR;
 
         public Posef AimPose => _aimPose;
@@ -71,6 +73,7 @@ namespace IronNestVR
         public float TurnX => _turnX;
         public bool InteractHeld => _interact;
         public bool MapDeleteHeld => _mapDelete;
+        public bool MapToolsLHeld => _mapToolsL;
         public bool MenuHeld => _menu;
         public bool StickClickL => _stickL;
         public bool StickClickR => _stickR;
@@ -102,6 +105,7 @@ namespace IronNestVR
             if (!MakeAction("turn", "Turn", ActionType.Vector2fInput, out _aTurn, out error)) return false;
             if (!MakeAction("interact", "Use Key", ActionType.BooleanInput, out _aInteract, out error)) return false;
             if (!MakeAction("map_delete", "Map Delete", ActionType.BooleanInput, out _aMapDelete, out error)) return false;
+            if (!MakeAction("map_tools_l", "Map Tools L", ActionType.BooleanInput, out _aMapToolsL, out error)) return false;
             if (!MakeAction("stick_l", "Menu Open L", ActionType.BooleanInput, out _aStickL, out error)) return false;
             if (!MakeAction("stick_r", "Menu Open R", ActionType.BooleanInput, out _aStickR, out error)) return false;
             if (!MakeAction("haptic", "Haptic", ActionType.VibrationOutput, out _aHaptic, out error)) return false;
@@ -119,6 +123,7 @@ namespace IronNestVR
                 (_aGrabR, "/user/hand/right/input/squeeze/value"),
                 (_aFire, "/user/hand/right/input/trigger/value"),
                 (_aRecenter, "/user/hand/left/input/y/click"),
+                (_aMapToolsL, "/user/hand/left/input/x/click"),
                 (_aMenu, "/user/hand/left/input/menu/click"),
                 (_aMove, "/user/hand/left/input/thumbstick"),
                 (_aTurn, "/user/hand/right/input/thumbstick"),
@@ -250,6 +255,7 @@ namespace IronNestVR
             _menu = GetBool(_aMenu);
             _interact = GetBool(_aInteract);
             _mapDelete = GetBool(_aMapDelete);
+            _mapToolsL = GetBool(_aMapToolsL);
             _stickL = GetBool(_aStickL);
             _stickR = GetBool(_aStickR);
             GetVector2(_aMove, out _moveX, out _moveY);

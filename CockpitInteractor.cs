@@ -46,6 +46,7 @@ namespace IronNestVR
         private LineRenderer _laserL;
         private bool _hoverColorL;
         internal HandManipulator Manip;   // set by VrManager; queried for the left-held control
+        internal GrabManager Grab;        // set by VrManager; queried so A->[E] yields to the map-tools toggle while right-holding the clipboard
         internal Camera LeftPointerCam => _camL;   // HandManipulator pins a left-held control to this on grab
 
         private bool _triggerWasHeld;
@@ -389,7 +390,11 @@ namespace IronNestVR
         private void HandleInteract(VrInput input)
         {
             bool held = input.InteractHeld;
-            if (held && !_interactWasHeld)
+            // While the RIGHT hand holds the HUD clipboard, the A button is the map-tools palette toggle
+            // (MapTools), not [E] — suppress the synthesized E down-edge so the two don't both fire. The up-edge
+            // still releases any E already sent, so a press made before grabbing can't get stuck down.
+            bool rightHoldsClip = Grab != null && Grab.HudClipboardHoldHand == 2;
+            if (held && !_interactWasHeld && !rightHoldsClip)
             {
                 Win32Input.SendKey(Win32Input.VK_E, true);
                 input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);

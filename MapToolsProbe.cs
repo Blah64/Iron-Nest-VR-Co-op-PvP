@@ -32,12 +32,6 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        // Live-toggle state (Shift+F1).
-        private static bool _shown;
-        private static uint _tok;
-        private static ClipboardToolSelector _sel;
-        private static ClipboardStateController _ctrl;
-
         public static void Tick()
         {
             try
@@ -47,7 +41,7 @@ namespace IronNestVR
                 if (!kb[UnityEngine.InputSystem.Key.F1].wasPressedThisFrame) return;
 
                 bool shift = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
-                if (shift) ToggleLive();
+                if (shift) { Log.LogInfo("[maptools] Shift+F1 -> MapTools.Toggle() (same path as the A/X controller binding)"); MapTools.Toggle(); }
                 else Probe();
             }
             catch (Exception e) { Log.LogWarning("[maptools] tick: " + e.Message); }
@@ -146,37 +140,6 @@ namespace IronNestVR
             try { Log.LogInfo($"[maptools] CinemachineFocusService.HasInstance={FocusSystem.CinemachineFocusService.HasInstance}"); } catch { }
 
             Log.LogInfo("[maptools] ===== end probe (now press Shift+F1 to live-test palette WITHOUT the camera move) =====");
-        }
-
-        // ------------------------------------------------------------------ live decouple test (Shift+F1)
-        private static void ToggleLive()
-        {
-            EnsureRefs();
-            if (_sel == null) { Log.LogWarning("[maptools] live: no ClipboardToolSelector in memory — run F1 in the map scene first"); return; }
-
-            if (!_shown)
-            {
-                // Enable the selector's own GameObject. NOTE: if the probe shows the palette is toggled by a PARENT
-                // (inactive ancestor), enabling this child alone won't make it activeInHierarchy — switch this to the
-                // ancestor the F1 dump identifies. Big duration + cancel-by-token => persists until we reverse it.
-                try { _sel.gameObject.SetActive(true); } catch (Exception e) { Log.LogWarning("[maptools] live show: " + e.Message); }
-                if (_ctrl != null) { try { _tok = _ctrl.PushOverrideState(true, true, false, 3600f); } catch (Exception e) { Log.LogWarning("[maptools] live raise: " + e.Message); } }
-                _shown = true;
-                Log.LogInfo($"[maptools] LIVE ON: selector '{PathOf(_sel.transform)}' active={_sel.gameObject.activeInHierarchy}, clipboard raised+focused (token={_tok}) — camera NOT requested. If the palette didn't appear, the toggle target is a parent (see F1 'ancestors').");
-            }
-            else
-            {
-                if (_ctrl != null) { try { _ctrl.CancelOverride(_tok); } catch (Exception e) { Log.LogWarning("[maptools] live cancel: " + e.Message); } }
-                try { _sel.gameObject.SetActive(false); } catch (Exception e) { Log.LogWarning("[maptools] live hide: " + e.Message); }
-                _shown = false;
-                Log.LogInfo("[maptools] LIVE OFF: override cancelled, selector GameObject inactive again.");
-            }
-        }
-
-        private static void EnsureRefs()
-        {
-            try { if (_sel == null) { var s = AllOf<ClipboardToolSelector>(); if (s.Count > 0) _sel = s[0]; } } catch { }
-            try { if (_ctrl == null) { var c = AllOf<ClipboardStateController>(); if (c.Count > 0) _ctrl = c[0]; } } catch { }
         }
 
         // ------------------------------------------------------------------ helpers

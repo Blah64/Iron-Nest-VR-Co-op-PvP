@@ -370,7 +370,7 @@ namespace IronNestVR
                             // Gravity-glove dial/lever grab runs first; while it holds a control it owns the
                             // right grip, so the prop GrabManager stands down to avoid fighting over it.
                             _handManip.Tick(_xr.Input, _rig, _hands, true);
-                            if (!_handManip.Active) _grab.Tick(_xr.Input, _rig, active);
+                            if (!_handManip.Active) { _grab.Tick(_xr.Input, _rig, active); MapTools.Tick(_xr.Input, _grab); }
                         }
                     }
                     _grab.ReconcileScale(); // live clipboard size, even with the menu open
@@ -455,6 +455,7 @@ namespace IronNestVR
                 _hands = new HandVisuals();
                 _handManip = new HandManipulator();
                 _interactor.Manip = _handManip; // so the interactor can pin a left-held control to the left pointer cam
+                _interactor.Grab = _grab; // so A->[E] yields to the map-tools toggle while the right hand holds the clipboard
                 _handManip.Cockpit = _interactor; // so a left-hand dial/lever grab reads the left pointer cam immediately
                 _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab };
                 _popup = new VrPopup();

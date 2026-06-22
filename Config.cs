@@ -517,6 +517,10 @@ namespace IronNestVR
         // game's flat cameras alone.
         public static bool MapVrEnabled = true;
 
+        // On-demand map-tools palette: pop the pencil colours + compass (and raise the HUD clipboard) WITHOUT the
+        // focus-camera move. Trigger = A (right) / X (left) while that hand holds the HUD clipboard. See MapTools.
+        public static bool MapToolsOnDemand = true;
+
         // --- Interaction diagnostics ---
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).
         public static bool LogInteractGeometry = true;
