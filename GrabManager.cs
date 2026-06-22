@@ -4,6 +4,7 @@ using BepInEx.Logging;
 using Il2CppInterop.Runtime;
 using Silk.NET.OpenXR;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace IronNestVR
 {
@@ -52,6 +53,17 @@ namespace IronNestVR
             // WorldLocked only: stable hierarchy-path key (captured at discovery) for the PER-MANUAL held pose
             // in Config.ManualHolds — manuals differ in size/orientation so each calibrates independently.
             public string Key;
+            // HUD clipboard only: the game's ClipboardStateController drives an Animator that re-poses the
+            // clip transform (which is Prox, the CHILD of Move) to raise/focus the board for its menu. We pin
+            // that child to its idle local pose every frame so the game can't physically move the board — our
+            // grab + waist placement is the ONLY movement. The Animator stays enabled, so the menu's content /
+            // fade still animates; only the transform motion is cancelled. Captured at discovery (idle state).
+            public bool PinChild;
+            public Vector3 ChildRestPos; public Quaternion ChildRestRot;
+            // Last world pose we drove this prop to (cached so the beginCameraRendering callback can re-assert
+            // it right before the eye cameras render — after the game's Cinemachine brain has moved Main Camera,
+            // which would otherwise drag the Main-Camera-child HUD props ahead of the world-fixed hand).
+            public Vector3 LastPos; public Quaternion LastRot; public bool LastValid;
         }
 
         private readonly Dictionary<int, Item> _items = new Dictionary<int, Item>();
@@ -126,7 +138,9 @@ namespace IronNestVR
             try
             {
                 if (!Config.ClipboardGrabEnabled || !active) { _hand = 0; return; }
+                HookRenderCallback();   // idempotent; ensures the end-of-frame HUD re-assert is live
                 Scan();
+                ReparentHudOnce();      // lift the clipboard holder out of Main Camera so the notes can't drift
                 var origin = rig.OriginTransform;
                 if (origin == null) return;
 
@@ -164,11 +178,12 @@ namespace IronNestVR
                             // Snap into the fixed held pose in the grip frame (per holding hand, since left/right
                             // grips mirror) — clipboard uses ClipHeld*, each manual uses its own per-manual entry.
                             GetHeld(_grabbed, _hand == 2, out var off, out var eul);
-                            _grabbed.Move.SetPositionAndRotation(cp + cr * off, cr * Quaternion.Euler(eul));
+                            Place(_grabbed, cp + cr * off, cr * Quaternion.Euler(eul));
+                            PinChild(_grabbed); // keep the game's menu Animator from shoving the board out of the grip
                         }
                         else
                             // Watch during calibration: keep the relative pose captured at grab time.
-                            _grabbed.Move.SetPositionAndRotation(cp + cr * _gPos, cr * _gRot);
+                            Place(_grabbed, cp + cr * _gPos, cr * _gRot);
                     }
                 }
 
@@ -179,6 +194,37 @@ namespace IronNestVR
                 Log.LogWarning("[grab] " + e.Message);
                 _items.Clear(); _hud = null; _grabbed = null; _hand = 0;
             }
+        }
+
+        // Re-assert the HUD clipboard + watch poses from LateUpdate. CRITICAL: the eye cameras auto-render at
+        // END of frame (Config.UseEnabledCameras), which is AFTER the game's menu Animator runs (it re-poses
+        // the clip child → "pulled out of hand for the menu") and AFTER Main Camera moves (the clipboard/watch
+        // holders are children of Main Camera, so locomotion drags them → "disconnects from hand when moving").
+        // Our Update-phase placement is therefore stale by render time. Re-applying here — after the animation
+        // phase and the game's camera motion — makes the eye render see them where WE put them. The origin is
+        // unchanged since Update, so the grip-derived board pose lands exactly on the (Update-placed) hand. World
+        // manuals don't need this: their parent isn't Main Camera and they carry no Animator. Mirrors
+        // CoopControls/CoopMap.LateApply (the established "win the frame in LateUpdate" pattern).
+        public void LateApply(CameraRig rig, VrInput input)
+        {
+            if (!Config.ClipboardGrabEnabled || rig == null) return;
+            try
+            {
+                var origin = rig.OriginTransform;
+                if (origin == null) return;
+                // Grabbed HUD clipboard → re-stick it into the holding hand (same grip-frame held pose as Tick).
+                if (_grabbed != null && _grabbed == _hud && _grabbed.Move != null)
+                {
+                    Posef p = _hand == 2 ? input.GripPose : input.GripPoseL;
+                    GetWorld(origin, p, out var cp, out var cr);
+                    GetHeld(_grabbed, _hand == 2, out var off, out var eul);
+                    Place(_grabbed, cp + cr * off, cr * Quaternion.Euler(eul));
+                    PinChild(_grabbed);
+                }
+                // Waist clipboard (when not grabbed) + wrist watch.
+                DriveFollowers(rig, input);
+            }
+            catch (Exception e) { Log.LogWarning("[grab] lateapply: " + e.Message); }
         }
 
         // Re-anchor the always-on HUD props each frame (except the one being grabbed):
@@ -205,14 +251,15 @@ namespace IronNestVR
                     if (!it.HasReadable) CaptureReadable(it, cam); // lock in the readable facing before we take over
                     Vector3 pos = hp + body * Config.ClipWaistOffset;
                     Quaternion rot = body * Quaternion.Euler(Config.ClipWaistEuler) * it.ReadableRot;
-                    it.Move.SetPositionAndRotation(pos, rot);
+                    Place(it, pos, rot);
+                    PinChild(it); // cancel the game's raise/focus Animator so the board stays at the waist
                 }
                 else if (it.Mode == Mode.WristLocked)
                 {
                     if (!hasLeft) continue; // left controller dropped tracking: leave the watch put
                     Vector3 pos = lwp + lwr * Config.WatchWristOffset;
                     Quaternion rot = lwr * Quaternion.Euler(Config.WatchWristEuler);
-                    it.Move.SetPositionAndRotation(pos, rot);
+                    Place(it, pos, rot);
                 }
             }
         }
@@ -235,6 +282,111 @@ namespace IronNestVR
             Quaternion camRot = cam != null ? cam.transform.rotation : Quaternion.identity;
             it.ReadableRot = Quaternion.Inverse(camRot) * it.Move.rotation;
             it.HasReadable = true;
+        }
+
+        // Re-pin the HUD clipboard's child (the ClipboardStateController transform = Prox, under the Move
+        // parent we drive) to its idle local pose. The game's menu Animator otherwise re-poses this child to
+        // raise/focus the board; cancelling it here — in Update, BEFORE the eye render — means the headset only
+        // ever sees the board where WE place it (waist or in-hand). No-op for props that don't pin (manuals,
+        // or a clip with no parent).
+        private static void PinChild(Item it)
+        {
+            if (it == null || !it.PinChild || it.Prox == null) return;
+            it.Prox.localPosition = it.ChildRestPos;
+            it.Prox.localRotation = it.ChildRestRot;
+        }
+
+        // Drive a prop to a world pose AND cache it, so the render callback can re-assert it after the game's
+        // late camera motion. Use this everywhere we place a tracked prop.
+        private static void Place(Item it, Vector3 pos, Quaternion rot)
+        {
+            it.Move.SetPositionAndRotation(pos, rot);
+            it.LastPos = pos; it.LastRot = rot; it.LastValid = true;
+        }
+
+        // --- end-of-frame re-assert (URP render callback) ---
+        // The gun-watch holder is a child of Main Camera (the clipboard holder used to be too, but we now lift it
+        // out — see ReparentHudOnce). The game's Cinemachine brain moves Main Camera AFTER our Update/LateUpdate
+        // placement, so a Main-Camera-child prop gets dragged "ahead of the hand in the direction of movement."
+        // We re-assert its cached world pose in beginCameraRendering — right before each of OUR eye cameras renders,
+        // after all the game's camera motion — so the headset only ever sees the watch where WE put it. The watch is
+        // mesh-based (drawn with its live transform), so this render-time fix is sufficient for it. World manuals
+        // aren't Main-Camera children, so they're skipped (LastValid is only set for the always-on HUD props).
+        private bool _cbHooked;
+        private bool _cbTried;
+        private Il2CppSystem.Action<ScriptableRenderContext, Camera> _beginCamCb;
+
+        // HUD clipboard reparent state. The notes are a WORLD-SPACE Canvas that bakes its geometry in PostLateUpdate,
+        // after the game's Cinemachine camera move and after every render hook we can reach — so while the holder is a
+        // child of Main Camera the baked notes always render dragged "ahead of the hand" (the board MESH could be
+        // fixed at render time, but the canvas could not). Lifting the holder out from under Main Camera (it's a scene
+        // object, so to the active-scene root) means locomotion can't drag it; we drive its world pose every frame and
+        // it stays put through the bake. Original parent saved for restore on Reset.
+        private bool _hudReparented;
+        private Transform _hudOrigParent;
+
+        private void HookRenderCallback()
+        {
+            if (_cbHooked || _cbTried) return;
+            _cbTried = true;
+            try
+            {
+                _beginCamCb = DelegateSupport.ConvertDelegate<Il2CppSystem.Action<ScriptableRenderContext, Camera>>(
+                    (Action<ScriptableRenderContext, Camera>)OnBeginCameraRendering);
+                RenderPipelineManager.add_beginCameraRendering(_beginCamCb);
+                _cbHooked = true;
+                Log.LogInfo("[grab] hooked beginCameraRendering for end-of-frame HUD re-assert.");
+            }
+            catch (Exception e) { Log.LogWarning("[grab] render hook failed (HUD may lag in motion): " + e.Message); }
+        }
+
+        private void UnhookRenderCallback()
+        {
+            if (_cbHooked) { try { RenderPipelineManager.remove_beginCameraRendering(_beginCamCb); } catch { } }
+            _cbHooked = false; _cbTried = false; _beginCamCb = null;
+        }
+
+        private void OnBeginCameraRendering(ScriptableRenderContext ctx, Camera cam)
+        {
+            try
+            {
+                if (cam == null) return;
+                string n = cam.name;
+                if (n == null || !n.StartsWith("IronNestVR_Eye", StringComparison.Ordinal)) return; // only our eye cams
+                ReassertHud();
+            }
+            catch { }
+        }
+
+        // Re-apply each always-on HUD prop's cached world pose + re-pin the clipboard child, right before our eye
+        // cameras render (after the game's late camera motion). Mainly keeps the Main-Camera-child watch on the wrist;
+        // the reparented clipboard is already frame-stable, so re-asserting it here is just belt-and-suspenders.
+        private void ReassertHud()
+        {
+            foreach (var it in _items.Values)
+            {
+                if (it == null || it.Move == null || !it.LastValid) continue;
+                if (it.Mode == Mode.WaistLocked || it.Mode == Mode.WristLocked)
+                {
+                    it.Move.SetPositionAndRotation(it.LastPos, it.LastRot);
+                    PinChild(it);
+                }
+            }
+        }
+
+        // Lift the HUD clipboard holder out from under Main Camera, exactly once, preserving its world transform.
+        // See the _hudReparented field note for why. A no-op until the HUD clipboard has been discovered.
+        private void ReparentHudOnce()
+        {
+            if (_hudReparented || _hud == null || _hud.Move == null) return;
+            _hudReparented = true; // set regardless so a failure doesn't retry every frame
+            try
+            {
+                _hudOrigParent = _hud.Move.parent;
+                _hud.Move.SetParent(null, true); // active-scene root, world pose preserved
+                Log.LogInfo("[grab] lifted HUD clipboard holder out of Main Camera (notes anti-drift via reparent).");
+            }
+            catch (Exception e) { Log.LogWarning("[grab] HUD reparent failed: " + e.Message); }
         }
 
         private bool TryGrab(int hand, Transform origin, Posef pose, VrInput input)
@@ -529,6 +681,10 @@ namespace IronNestVR
                     if (c == null) continue;
                     Transform clip = c.transform;
                     if (clip == null) continue;
+                    // Already tracking this as the HUD clipboard? Once we've lifted its holder out of Main Camera,
+                    // IsUnder() below would misclassify it as a world manual and re-register it — keep the existing
+                    // item and just mark it seen.
+                    if (_hud != null && _hud.Prox == clip && _hud.Move != null) { seen.Add(_hud.Move.GetInstanceID()); continue; }
                     bool hud = IsUnder(clip, camT);
                     Transform move = hud ? (clip.parent != null ? clip.parent : clip) : clip;
                     int id = move.GetInstanceID();
@@ -543,7 +699,11 @@ namespace IronNestVR
                             Mode = hud ? Mode.WaistLocked : Mode.WorldLocked,
                             IsHudClip = hud,
                             HomePos = move.position, HomeRot = move.rotation, HasHome = !hud,  // world props return here on release
-                            Key = hud ? null : ManualKey(move)
+                            Key = hud ? null : ManualKey(move),
+                            // HUD clip: pin its child (clip) to its idle local pose so the game's menu Animator
+                            // can't move the board. Only when clip actually has a parent we drive (move != clip).
+                            PinChild = hud && move != clip,
+                            ChildRestPos = clip.localPosition, ChildRestRot = clip.localRotation
                         };
                         _items[id] = it;
                         if (hud)
@@ -622,7 +782,7 @@ namespace IronNestVR
                 foreach (var id in dead)
                 {
                     if (_grabbed != null && _items[id] == _grabbed) { _grabbed = null; _hand = 0; }
-                    if (_hud != null && _items[id] == _hud) { _hud = null; }
+                    if (_hud != null && _items[id] == _hud) { _hud = null; _hudReparented = false; _hudOrigParent = null; }
                     if (_watch != null && _items[id] == _watch) { _watch = null; }
                     _items.Remove(id);
                 }
@@ -742,6 +902,14 @@ namespace IronNestVR
 
         public void Reset()
         {
+            UnhookRenderCallback();
+            // Put the clipboard holder back under its original parent (it was lifted out of Main Camera) before we
+            // forget it — so a VR-exit / scene teardown leaves the hierarchy as we found it. No-op if destroyed.
+            if (_hudReparented && _hud != null && _hud.Move != null)
+            {
+                try { _hud.Move.SetParent(_hudOrigParent, true); } catch { }
+            }
+            _hudReparented = false; _hudOrigParent = null;
             _items.Clear();
             _hud = null; _watch = null; _grabbed = null; _hand = 0;
             _appliedScale = 1f; _appliedWatchScale = 1f; _fadersOff = false;

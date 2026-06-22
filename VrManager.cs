@@ -33,6 +33,7 @@ namespace IronNestVR
         private bool _prevChord;
         private float _appliedRenderScale;
         private bool _xrReady;
+        private bool _frameActive;   // this frame's input-active state, cached for LateUpdate re-application
         private float _nextXrTry;
         private int _frameFailStreak;   // consecutive failing frames (xrWaitFrame runtime error)
         private bool _vrAbandoned;      // VR came up but the runtime kept erroring per-frame → flatscreen for the rest of this session
@@ -94,6 +95,15 @@ namespace IronNestVR
             CoopControls.LateApply();
             CoopMap.LateApply();
             CoopPunchcards.LateApply();   // apply peer-owned punchcard poses after the game's drag logic
+
+            // Re-assert the HUD clipboard + watch poses HERE (after the game's menu Animator + Main Camera
+            // motion this frame), so the end-of-frame eye render sees them attached to the hand/waist instead
+            // of dragged away. Their holders are children of Main Camera, so an Update-phase placement is stale
+            // by render time; world manuals (not Main-Camera children, no Animator) don't need this.
+            if (_xrReady && _frameActive && _grab != null && _rig != null)
+            {
+                try { _grab.LateApply(_rig, _xr.Input); } catch { }
+            }
 
             // Same-machine test: the game pauses its SCALED-time sim/animations on an UNFOCUSED window
             // (Time.timeScale → 0) even though the player loop keeps running (runInBackground). Our net layer
@@ -207,6 +217,7 @@ namespace IronNestVR
             PerfTick();
             ScanSceneOnce();
             Diagnostics.Tick();
+            MapToolsProbe.Tick();  // F1 dump / Shift+F1 live-test: decouple map-tools palette from the focus camera
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
 
@@ -314,11 +325,19 @@ namespace IronNestVR
                 // ticked EVERY frame (even unfocused) so it restores the game's cursor when we step away.
                 float dt = Time.unscaledDeltaTime;
                 bool active = _xr.IsFocused && _xr.InputReady;
+                _frameActive = active;   // cached so LateUpdate can re-assert held-prop poses after the game's animator + camera move
                 if (active)
                 {
                     _xr.Input.Sync();
                     _xr.Input.LocatePoses(_xr.LocalSpace, _xr.PredictedDisplayTime);
                     if (_xr.Input.RecenterEdge) _rig.Recenter();
+
+                    // Snap the rig origin to the game camera NOW — BEFORE we place the held clipboard + hands —
+                    // so they're positioned with the exact origin the eyes render from this frame. The origin
+                    // used to be updated only late (interactor + RenderAndSubmit), one frame behind placement,
+                    // which made the held board + hands lag the world during locomotion. (Re-applied after
+                    // _locomotion.Tick below, which may add this frame's view-turn yaw.)
+                    _rig.UpdateOrigin();
 
                     // Click BOTH thumbsticks at once to open/close the VR settings menu.
                     bool chord = _xr.Input.StickClickL && _xr.Input.StickClickR;
@@ -347,6 +366,7 @@ namespace IronNestVR
                         {
                             HandleMenuEsc(_xr.Input);
                             _locomotion.Tick(_xr.Input, _rig, dt);
+                            _rig.UpdateOrigin(); // re-freeze the origin AFTER this frame's move + view-turn, so held props match the render
                             // Gravity-glove dial/lever grab runs first; while it holds a control it owns the
                             // right grip, so the prop GrabManager stands down to avoid fighting over it.
                             _handManip.Tick(_xr.Input, _rig, _hands, true);
