@@ -575,9 +575,15 @@ namespace IronNestVR
             if (activeCursor) { try { hovering = _mgr.CurrentHover != null; } catch { } }
             if (hovering != _hoverColor) { _hoverColor = hovering; ApplyLaserColor(hovering); }
             // Always-on draws it constantly; force-on while the VR menu is open; otherwise only when
-            // aimed at an interactable (CurrentHover).
-            ShowLaser(Config.LaserAlwaysOn || hovering || _forceLaser);
+            // aimed at an interactable (CurrentHover). But hide it whenever the RIGHT hand is busy grip-
+            // holding something (clipboard/manual/dial/lever/switch) — a laser from a full hand is just noise.
+            ShowLaser(!HandGripping(2) && (Config.LaserAlwaysOn || hovering || _forceLaser));
         }
+
+        // True when the given hand (1 left, 2 right) is currently grip-holding a prop (GrabManager) or
+        // operating a control (HandManipulator) — i.e. it's not free to point.
+        private bool HandGripping(int hand)
+            => (Grab != null && Grab.GrabbingHand == hand) || (Manip != null && Manip.HeldHand == hand);
 
         private void GeometryLog(Vector3 wp, Quaternion wr)
         {
@@ -655,7 +661,9 @@ namespace IronNestVR
             _laserL.SetPosition(0, origin);
             _laserL.SetPosition(1, origin + dir * len);
             if (hovering != _hoverColorL) { _hoverColorL = hovering; SetLaserColor(_laserL, hovering); }
-            ShowLaserL(Config.LaserAlwaysOn || hovering || _forceLaser || activeCursor);
+            // Hide whenever the LEFT hand is busy grip-holding something, even if it's nominally the active
+            // cursor (e.g. it grabbed a dial) — a laser from a full hand is just noise.
+            ShowLaserL(!HandGripping(1) && (Config.LaserAlwaysOn || hovering || _forceLaser || activeCursor));
         }
 
         // Nearest grabbable (dial/lever/switch/manual) under the left ray → green + laser ends there; else the

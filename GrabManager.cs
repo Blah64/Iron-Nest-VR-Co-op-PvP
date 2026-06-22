@@ -119,6 +119,11 @@ namespace IronNestVR
         public int HudClipboardHoldHand =>
             (_grabbed != null && _grabbed.Mode == Mode.WaistLocked) ? _hand : 0;
 
+        // Which hand is currently grip-holding ANY prop (clipboard, world manual, or the watch during
+        // calibration) — 0 none, 1 left, 2 right. CockpitInteractor reads this to hide that hand's pointing
+        // laser while it's busy holding something.
+        public int GrabbingHand => _grabbed != null ? _hand : 0;
+
         public void ToggleCalibrateClip() => SetCalib(CalibTarget.Clip);
         public void ToggleCalibrateWatch() => SetCalib(CalibTarget.Watch);
         public void ToggleCalibrateClipHold() => SetCalib(CalibTarget.ClipHold);

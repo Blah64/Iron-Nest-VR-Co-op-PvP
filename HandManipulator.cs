@@ -63,6 +63,10 @@ namespace IronNestVR
 
         public bool Active => _kind != Kind.None;
 
+        // Which hand currently holds a control (dial/lever/switch) — 0 none, 1 left, 2 right. CockpitInteractor
+        // reads this to hide that hand's pointing laser while it's operating something.
+        public int HeldHand => _kind != Kind.None ? _hand : 0;
+
         // The dial/lever currently held by the LEFT hand (else null). CockpitInteractor pins this control's
         // own raycast camera to the LEFT pointer cam each frame so its native drag follows the left controller
         // (the periodic repoint otherwise pins every control to the right cam). Switches don't need it (their
