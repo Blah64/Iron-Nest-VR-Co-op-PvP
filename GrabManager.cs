@@ -201,21 +201,22 @@ namespace IronNestVR
         {
             GetWorld(origin, aimPose, out var ao, out var ar);
             Vector3 dir = ar * Vector3.forward;
-            if (!Physics.Raycast(ao, dir, out RaycastHit hit, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide))
-                return false;
-            var col = hit.collider;
-            var it = FindItemForCollider(col != null ? col.transform : null);
-            if (it == null || it.Zoom == null || !Grabbable(it))
+            // Grab the nearest grabbable manual the ray passes through — not just the single closest collider.
+            // A plain Physics.Raycast stops at the first collider on any layer, so a trigger volume (or other
+            // non-manual prop) in front of a manual silently blocks the grab even though the laser visually
+            // lands on the manual. Scanning all hits sees through those and grabs the closest actual manual.
+            var it = RayGrabTarget(ao, dir, out float hitDist);
+            if (it == null)
             {
                 if (Time.unscaledTime >= _nextRayLog)
                 {
                     _nextRayLog = Time.unscaledTime + 0.5f;
-                    Log.LogInfo($"[grab] ray hit '{(col != null ? col.name : "null")}' @ {hit.distance:0.0}m — not a grabbable manual.");
+                    Log.LogInfo("[grab] ray found no grabbable manual under the laser.");
                 }
                 return false;
             }
             GetWorld(origin, gripPose, out var cp, out var cr);
-            Attach(it, hand, cp, cr, input, "ray@" + hit.distance.ToString("0.0") + "m");
+            Attach(it, hand, cp, cr, input, "ray@" + hitDist.ToString("0.0") + "m");
             return true;
         }
 
@@ -225,6 +226,28 @@ namespace IronNestVR
             for (Transform p = t; p != null; p = p.parent)
                 if (_items.TryGetValue(p.GetInstanceID(), out var it)) return it;
             return null;
+        }
+
+        // Nearest tracked, grabbable manual under the ray. Like the trigger-click and the laser visual, it
+        // sees through intervening trigger volumes / non-manual colliders that a single Physics.Raycast would
+        // stop at. Triggers are included in the query because a manual's own collider may be a trigger.
+        private Item RayGrabTarget(Vector3 ao, Vector3 dir, out float dist)
+        {
+            dist = 0f;
+            var hits = Physics.RaycastAll(ao, dir, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide);
+            if (hits == null) return null;
+            Item best = null;
+            float bestDist = float.MaxValue;
+            for (int i = 0; i < hits.Length; i++)
+            {
+                var h = hits[i];
+                var col = h.collider;
+                if (col == null) continue;
+                var item = FindItemForCollider(col.transform);
+                if (item == null || item.Zoom == null || !Grabbable(item)) continue;
+                if (h.distance < bestDist) { bestDist = h.distance; best = item; dist = h.distance; }
+            }
+            return best;
         }
 
         private void Attach(Item it, int hand, Vector3 cp, Quaternion cr, VrInput input, string how)

@@ -91,10 +91,14 @@ namespace IronNestVR
         {
             GetWorld(origin, input.AimPose, out Vector3 ao, out Quaternion ar);
             Vector3 dir = ar * Vector3.forward;
-            if (!Physics.Raycast(ao, dir, out RaycastHit hit, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide))
+            // Pick the nearest CONTROL the ray passes through, not just the single closest collider. A plain
+            // Physics.Raycast stops at the first collider on any layer — so an invisible trigger volume (or any
+            // other non-control collider) in front of a dial/lever/switch silently blocks the grab, even though
+            // the laser visual (ignores triggers) and the trigger-click (game's layer-filtered interaction
+            // raycast) both reach the control. Scanning all hits for the nearest grabbable control restores
+            // parity with the trigger; a closer pick-up manual still yields to GrabManager's reposition grab.
+            if (!RaycastControl(ao, dir, out RaycastHit hit, out Transform t))
                 return;
-            Transform t = hit.collider != null ? hit.collider.transform : null;
-            if (t == null) return;
 
             var dial = FindUp<DialInteractable>(t);
             if (dial != null)
@@ -266,6 +270,42 @@ namespace IronNestVR
                 if (c != null) return c;
             }
             return null;
+        }
+
+        // Nearest hit along the ray whose hierarchy carries a grabbable control (dial/lever, or — when
+        // switch-grab is on — a click switch that isn't a pick-up manual). Intervening trigger volumes and
+        // other non-control colliders are transparent (matching the trigger-click, which uses the game's
+        // layer-filtered interaction raycast); a pick-up manual that's closer than any control wins, so it
+        // stays GrabManager's reposition grab. Returns false if no control is reachable.
+        private static bool RaycastControl(Vector3 ao, Vector3 dir, out RaycastHit hit, out Transform t)
+        {
+            hit = default; t = null;
+            var hits = Physics.RaycastAll(ao, dir, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide);
+            if (hits == null) return false;
+            float ctrlDist = float.MaxValue;
+            float manualDist = float.MaxValue;   // nearest pick-up manual — yields to GrabManager
+            for (int i = 0; i < hits.Length; i++)
+            {
+                var h = hits[i];
+                var col = h.collider;
+                if (col == null) continue;
+                var ht = col.transform;
+                if (ht == null) continue;
+                bool isControl =
+                    FindUp<DialInteractable>(ht) != null ||
+                    FindUp<LinearSliderInteractable>(ht) != null ||
+                    (Config.SwitchGrabEnabled && FindUp<PickUpZoomTarget>(ht) == null && FindUp<LookAtTarget>(ht) != null);
+                if (isControl)
+                {
+                    if (h.distance < ctrlDist) { ctrlDist = h.distance; hit = h; t = ht; }
+                }
+                else if (FindUp<PickUpZoomTarget>(ht) != null && h.distance < manualDist)
+                {
+                    manualDist = h.distance;
+                }
+            }
+            if (t == null || ctrlDist > manualDist) { t = null; return false; }
+            return true;
         }
 
         private static void GetWorld(Transform origin, Posef pose, out Vector3 pos, out Quaternion rot)
