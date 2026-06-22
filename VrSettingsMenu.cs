@@ -367,6 +367,13 @@ namespace IronNestVR
             AddFloat("Switch Throw", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
                      d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.02f, 0.15f));
 
+            // Mirror the game's screen-space UI into VR: the "[E] interact" hover tooltip, and confirmation
+            // popups ("I understand", exit-mission, …) which are otherwise invisible AND block input.
+            AddToggle("Show Tooltips", () => Config.TooltipVrEnabled ? "On" : "Off",
+                      () => Config.TooltipVrEnabled = !Config.TooltipVrEnabled);
+            AddToggle("Show Popups", () => Config.PopupVrEnabled ? "On" : "Off",
+                      () => Config.PopupVrEnabled = !Config.PopupVrEnabled);
+
             // --- Hand tuning (live) ---
             AddToggle("Hands", () => Config.HandsEnabled ? "On" : "Off",
                       () => Config.HandsEnabled = !Config.HandsEnabled);

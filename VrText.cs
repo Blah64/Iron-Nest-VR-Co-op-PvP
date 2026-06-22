@@ -101,6 +101,24 @@ namespace IronNestVR
             return go;
         }
 
+        // Strip TMP rich-text / sprite markup (<b>, <sprite=...>, <color=...> …) from a game UI string so
+        // it renders cleanly in our 3D TMP (which we keep richText off). The game's tooltip/popup text can
+        // carry key-glyph sprites and colour tags that would otherwise show as literal "<…>" gibberish.
+        public static string Strip(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+            var sb = new System.Text.StringBuilder(s.Length);
+            bool inTag = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '<') { inTag = true; continue; }
+                if (c == '>') { inTag = false; continue; }
+                if (!inTag) sb.Append(c);
+            }
+            return sb.ToString().Trim();
+        }
+
         // Face a world-space label toward the viewer. Yaw-only (flatten Y) keeps the label upright instead of
         // tilting when the viewer is above/below it.
         public static Quaternion FaceViewer(Vector3 labelPos, Vector3 viewerPos, bool yawOnly = true)

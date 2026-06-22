@@ -29,6 +29,8 @@ namespace IronNestVR
         private HandVisuals _hands;
         private HandManipulator _handManip;
         private VrSettingsMenu _menu;
+        private VrPopup _popup;
+        private VrTooltip _tooltip;
         private bool _prevChord;
         private float _appliedRenderScale;
         private bool _xrReady;
@@ -331,12 +333,23 @@ namespace IronNestVR
                     }
                     else
                     {
-                        HandleMenuEsc(_xr.Input);
-                        _locomotion.Tick(_xr.Input, _rig, dt);
-                        // Gravity-glove dial/lever grab runs first; while it holds a control it owns the
-                        // right grip, so the prop GrabManager stands down to avoid fighting over it.
-                        _handManip.Tick(_xr.Input, _rig, _hands, true);
-                        if (!_handManip.Active) _grab.Tick(_xr.Input, _rig, active);
+                        // Screen-space confirmation popups ("I understand", exit-mission, …) are modal and
+                        // invisible in VR; mirror + operate them here. While one is up it owns the trigger
+                        // (like the settings menu), so locomotion/grab/cockpit clicks stand down.
+                        _popup.Tick(_xr.Input, _rig);
+                        if (_popup.Active)
+                        {
+                            _handManip.Tick(_xr.Input, _rig, _hands, false); // release any held control
+                        }
+                        else
+                        {
+                            HandleMenuEsc(_xr.Input);
+                            _locomotion.Tick(_xr.Input, _rig, dt);
+                            // Gravity-glove dial/lever grab runs first; while it holds a control it owns the
+                            // right grip, so the prop GrabManager stands down to avoid fighting over it.
+                            _handManip.Tick(_xr.Input, _rig, _hands, true);
+                            if (!_handManip.Active) _grab.Tick(_xr.Input, _rig, active);
+                        }
                     }
                     _grab.ReconcileScale(); // live clipboard size, even with the menu open
                     _hands.Tick(_xr.Input, _rig, active); // pose hand models (after manip sets overrides)
@@ -363,7 +376,8 @@ namespace IronNestVR
                         SendLocalPose(coHp, coHr, true, lp, lr, rp, rr, curl, lci, lco, rci, rco);
                     }
                 }
-                _interactor.Apply(_xr.Input, _rig, dt, active, active && (_menu.IsOpen || _handManip.Active), _menu.IsOpen);
+                bool uiModal = _menu.IsOpen || _popup.Active;
+                _interactor.Apply(_xr.Input, _rig, dt, active, active && (uiModal || _handManip.Active), uiModal);
 
                 if (shouldRender) _xr.RenderAndSubmit(_rig, _bridge);
                 else { Dbg.Beat("endFrame(noRender)"); _xr.EndFrame(); }
@@ -372,6 +386,10 @@ namespace IronNestVR
                 Dbg.Beat("hud");
                 _hud.Tick(_rig, active);
                 Notify.TickVr(_rig);   // world-space "X joined" toast in front of the head
+                // World-space mirror of the game's screen-space "[E] interact" hover tooltip (invisible in
+                // VR otherwise). Hidden while a modal VR panel owns the view to avoid clutter.
+                if (!_menu.IsOpen && (_popup == null || !_popup.Active)) _tooltip.Tick(_rig);
+                else _tooltip.Hide();
                 Dbg.Beat("loopEnd");
 
                 if (shouldRender && _xr.ViewsValid && Time.unscaledTime >= _nextPoseLog)
@@ -418,6 +436,8 @@ namespace IronNestVR
                 _hands = new HandVisuals();
                 _handManip = new HandManipulator();
                 _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab };
+                _popup = new VrPopup();
+                _tooltip = new VrTooltip();
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
                 _frameFailStreak = 0;
@@ -472,6 +492,10 @@ namespace IronNestVR
             _hands = null;
             try { _menu?.Dispose(); } catch { }
             _menu = null;
+            try { _popup?.Dispose(); } catch { }
+            _popup = null;
+            try { _tooltip?.Dispose(); } catch { }
+            _tooltip = null;
             try { Notify.DisposeVr(); } catch { }
             try { _rig?.Destroy(); } catch { }
             _rig = null;
