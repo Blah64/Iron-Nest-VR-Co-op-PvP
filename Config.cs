@@ -282,6 +282,15 @@ namespace IronNestVR
         // 0.7 keeps quality high while cutting pixel count to ~half. Lower if unstable, raise later.
         public static float RenderScale = 0.4f;
 
+        // Set true once a RenderScale value is read from the saved cfg (the user/menu pinned it), so
+        // AutoTuneRenderScale() leaves an explicit choice alone and only auto-lowers a fresh install.
+        public static bool RenderScaleExplicit = false;
+
+        // Eye cameras render LDR (RGBA8) regardless of the game main camera's HDR setting. The eye RTs are
+        // 8-bit anyway, so inheriting HDR only cost intermediate-buffer bandwidth for no in-headset gain.
+        // Force-off is a free win on weak GPUs; set true to match the game's HDR if you ever see banding.
+        public static bool EyeAllowHDR = false;
+
         // --- Diagnostics / quick toggles for live tuning ---
         // Phase 2.5 isolation: render each eye as a flat clear color (no scene) to prove the
         // swapchain copy + projection-layer submission path independent of scene rendering.
@@ -559,13 +568,46 @@ namespace IronNestVR
             catch (Exception e) { Plugin.Logger?.LogWarning("[config] load failed: " + e.Message); }
         }
 
+        /// <summary>
+        /// Lower the default eye render scale on weak GPUs (integrated / low-VRAM) so a fresh install isn't
+        /// stuck at single-digit fps before the user can reach the in-VR menu to lower it themselves. No-op
+        /// when the cfg already pins RenderScale (an explicit choice wins) or the GPU looks capable. Only
+        /// ever lowers, never raises. Call once after the graphics device is up (first Update) and BEFORE
+        /// the eye swapchains are sized in XR bring-up.
+        /// </summary>
+        public static void AutoTuneRenderScale()
+        {
+            if (RenderScaleExplicit) return; // user/menu pinned it — respect their value
+            try
+            {
+                int vram = SystemInfo.graphicsMemorySize; // MB (0 if the driver doesn't report it)
+                string gpu = (SystemInfo.graphicsDeviceName ?? "").ToLowerInvariant();
+                bool integrated = gpu.Contains("intel") || gpu.Contains("uhd") || gpu.Contains("hd graphics")
+                                  || gpu.Contains("iris") || gpu.Contains("radeon(tm) graphics")
+                                  || gpu.Contains("radeon graphics") || gpu.Contains("vega") || gpu.Contains("apple");
+
+                float scale = RenderScale;
+                if (integrated || (vram > 0 && vram <= 2048)) scale = 0.30f;
+                else if (vram > 0 && vram <= 4096) scale = 0.35f;
+
+                if (scale < RenderScale)
+                {
+                    Plugin.Logger?.LogInfo($"[perf] auto-lowered RenderScale {RenderScale:0.00} -> {scale:0.00} " +
+                                           $"(gpu='{SystemInfo.graphicsDeviceName}' vram={vram}MB). " +
+                                           "Override with RenderScale= in IronNestVR.cfg or the in-VR menu.");
+                    RenderScale = scale;
+                }
+            }
+            catch (Exception e) { Plugin.Logger?.LogWarning("[perf] auto render-scale failed: " + e.Message); }
+        }
+
         private static void Apply(string k, string v)
         {
             switch (k)
             {
                 case "ClipboardScale": ClipboardScale = PF(v, ClipboardScale); break;
                 case "WatchScale": WatchScale = PF(v, WatchScale); break;
-                case "RenderScale": RenderScale = PF(v, RenderScale); break;
+                case "RenderScale": RenderScale = PF(v, RenderScale); RenderScaleExplicit = true; break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;

@@ -188,9 +188,21 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[env] dump failed: " + e.Message); }
         }
 
+        private bool _autoTuned;
+        // Pick a weak-GPU-friendly default render scale once, from the first Update (graphics device up,
+        // SystemInfo populated) and before XR bring-up sizes the eye swapchains. Respects an explicit
+        // cfg/menu value; only lowers a fresh install. See Config.AutoTuneRenderScale.
+        private void AutoTuneOnce()
+        {
+            if (_autoTuned) return;
+            _autoTuned = true;
+            Config.AutoTuneRenderScale();
+        }
+
         private void Update()
         {
             LogEnvironmentOnce();
+            AutoTuneOnce();
             PerfTick();
             ScanSceneOnce();
             Diagnostics.Tick();
@@ -270,6 +282,11 @@ namespace IronNestVR
 
                 bool shouldRender = _xr.BeginFrameLocateViews();
                 Dbg.Beat($"begin shouldRender={shouldRender} focused={_xr.IsFocused}");
+
+                // Stop the two auto-render eye cameras from drawing the full scene while the runtime says we
+                // shouldn't render (dashboard up / headset off) — otherwise they keep rendering every Unity
+                // frame for nothing. No-op in render-request mode.
+                _rig.SetEyeCamerasEnabled(shouldRender);
 
                 // Runtime-failure fallback. A present-but-broken runtime (e.g. headset not actually streaming)
                 // makes xrWaitFrame block for seconds and return an error EVERY frame — the game freezes at

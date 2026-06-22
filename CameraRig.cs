@@ -21,6 +21,9 @@ namespace IronNestVR
         private GameObject _origin;
         private readonly Camera[] _cam = new Camera[2];
         private readonly RenderTexture[] _rt = new RenderTexture[2];
+        // One flip buffer PER EYE. A single shared buffer is NOT safe here: Graphics.Blit is deferred into
+        // Unity's render phase while the raw CopyResource runs immediately on the D3D11 immediate context, so
+        // the two aren't ordered — both eyes' copies would read whichever blit landed last (broken/mono image).
         private readonly RenderTexture[] _flipRT = new RenderTexture[2];
         private bool _ready;
         private bool _useEnabledFallback;
@@ -76,7 +79,6 @@ namespace IronNestVR
             var mClear = main.clearFlags;
             var mBg = main.backgroundColor;
             var mMask = main.cullingMask;
-            var mHdr = main.allowHDR;
             var mDepth = main.depth;
             Dbg.Step($"main props ok: clear={mClear} mask={mMask} depth={mDepth}");
 
@@ -115,7 +117,7 @@ namespace IronNestVR
                 Dbg.Step($"eye{i}: set cullingMask");
                 c.cullingMask = mMask;
                 Dbg.Step($"eye{i}: set allowHDR");
-                c.allowHDR = mHdr;
+                c.allowHDR = Config.EyeAllowHDR; // force LDR on the eye cameras (the RTs are RGBA8 anyway)
                 // NOTE: do NOT set camera.stereoTargetEye here — it pokes Unity's stereo/XR subsystem
                 // (uninitialized in this no-XR IL2CPP build) and hard-crashes. We render via target
                 // texture anyway, so it isn't needed.
@@ -220,6 +222,21 @@ namespace IronNestVR
             _useEnabledFallback = true;
             for (int i = 0; i < 2; i++) if (_cam[i] != null) _cam[i].enabled = true;
             if (!_loggedFallback) { _loggedFallback = true; Log.LogInfo("Using enabled-camera rendering fallback."); }
+        }
+
+        /// <summary>
+        /// In enabled-camera (auto-render) mode, toggle whether the two eye cameras render this frame.
+        /// They otherwise auto-render the full scene EVERY Unity frame regardless of whether anything is
+        /// submitted — pure wasted GPU while the runtime says we shouldn't render (SteamVR dashboard up,
+        /// headset off the face). Drive it from the per-frame OpenXR <c>ShouldRender</c> flag. No-op in
+        /// render-request mode, where the cameras stay disabled and are rendered explicitly only when we
+        /// submit. Cheap and idempotent (only writes on a state change).
+        /// </summary>
+        public void SetEyeCamerasEnabled(bool on)
+        {
+            if (!_useEnabledFallback) return;
+            for (int i = 0; i < 2; i++)
+                if (_cam[i] != null && _cam[i].enabled != on) _cam[i].enabled = on;
         }
 
         /// <summary>Builds an OpenGL-convention asymmetric projection from an OpenXR FOV.</summary>
