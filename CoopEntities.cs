@@ -359,10 +359,7 @@ namespace IronNestVR
 
             _mirrors[key] = new Mirror { Key = key, ID = id, Go = go, Loc = loc, Entity = e, IsClone = true, LastState = state };
             bool hasIcon = false; try { hasIcon = e.IconRaw != null; } catch { }
-            Vector3 wp = Vector3.zero; Vector2 lp = Vector2.zero;
-            try { wp = go.transform.position; } catch { }
-            try { lp = loc.LocalPosition; } catch { }
-            Log.LogInfo($"[ent] cloned remote entity '{id}' <- peer (role={role} hp={hp}/{maxHp} iconKey='{icon}' iconRaw={hasIcon} parent={(parent != null ? parent.name : "<none>")} lp=({lp.x:0.0},{lp.y:0.0}) wp=({wp.x:0.0},{wp.y:0.0},{wp.z:0.0}))");
+            Log.LogInfo($"[ent] cloned remote entity '{id}' <- peer (role={role} hp={hp}/{maxHp} iconKey='{icon}' iconRaw={hasIcon} parent={(parent != null ? parent.name : "<none>")})");
         }
 
         // ---------------- icon resolution (IconRaw isn't serializable) ----------------
@@ -499,7 +496,7 @@ namespace IronNestVR
             o = PutInt(o, maxHp); o = PutInt(o, armour); o = PutInt(o, stars); o = PutInt(o, scale);
             o = PutV(o, lpos);
             CoopP2P.Send(_buf, o, true);
-            Log.LogInfo($"[ent] spawn '{id}' -> peer (role={role} hp={hp}/{maxHp} state={state} lpos=({lpos.x:0.00},{lpos.y:0.00},{lpos.z:0.00}))");
+            Log.LogInfo($"[ent] spawn '{id}' -> peer (role={role} hp={hp}/{maxHp} state={state})");
         }
 
         // Discrete state/hp change OR periodic position keyframe — ALWAYS reliable (and Steam-ordered), so it can't
