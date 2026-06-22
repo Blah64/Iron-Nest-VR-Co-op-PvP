@@ -374,8 +374,8 @@ namespace IronNestVR
         // Hand must be within this distance (m) of the clipboard to grab it with the grip button.
         public static float GrabRadius = 0.4f;
         // Scale the clipboard up for VR: it was authored for the flat ~60° FOV; the VR view is ~94°,
-        // so the same object looks ~half size. 1 = no change.
-        public static float ClipboardScale = 2.5f;
+        // so the same object looks ~half size. 1 = no change. (Baked from a real in-headset calibration.)
+        public static float ClipboardScale = 2.8999996f;
         // Same idea for the gun watch (independent knob — it's a different size to start with).
         public static float WatchScale = 2.5f;
 
@@ -403,12 +403,66 @@ namespace IronNestVR
         public static float ClipHoldCurl = 0.28f;
 
         // World "operating manual" props get their OWN held pose — their pivots differ from the clipboard's,
-        // so the clipboard's offset would float them too far out. Per-hand (grip frames mirror). Calibrate by
-        // grabbing a manual and using "Calibrate Manual Hold". (Holding-hand finger curl reuses ClipHoldCurl.)
+        // so the clipboard's offset would float them too far out. These are the FALLBACK defaults used until a
+        // given manual is individually calibrated. Per-hand (grip frames mirror). (Holding-hand finger curl
+        // reuses ClipHoldCurl.)
         public static Vector3 ManualHeldOffsetR = new Vector3(0f, 0.02f, 0.06f);
         public static Vector3 ManualHeldEulerR = new Vector3(0f, 0f, 0f);
-        public static Vector3 ManualHeldOffsetL = new Vector3(0f, 0.02f, 0.06f);
-        public static Vector3 ManualHeldEulerL = new Vector3(0f, 0f, 0f);
+        public static Vector3 ManualHeldOffsetL = new Vector3(0.22605929f, -0.13960384f, 0.19686727f);
+        public static Vector3 ManualHeldEulerL = new Vector3(355.05295f, 171.15569f, 31.060148f);
+
+        // PER-MANUAL held pose, keyed by the manual's stable hierarchy path (manuals have different sizes +
+        // orientations, so each needs its own). Written by "Calibrate Manual Hold" for whichever manual you're
+        // holding; a manual with no entry falls back to the ManualHeld* defaults above. Persisted as
+        // "ManualHold.<key>=offR|eulR|offL|eulL" lines.
+        public struct HeldPose { public Vector3 OffR, EulR, OffL, EulL; }
+        public static readonly System.Collections.Generic.Dictionary<string, HeldPose> ManualHolds
+            = new System.Collections.Generic.Dictionary<string, HeldPose>();
+
+        // Seed the demo's manuals with a real in-headset per-manual calibration so a fresh install fits
+        // each one out of the box. Runs at static init; a matching "ManualHold.<key>" line in the cfg
+        // overrides its manual on Load, and Reset HUD Layout re-seeds these. Keys are the manual's stable
+        // hierarchy path (name#siblingIndex per segment) — see GrabManager.ManualKey.
+        static Config() { SeedDefaultManualHolds(); }
+        public static void SeedDefaultManualHolds()
+        {
+            void M(string key, Vector3 offR, Vector3 eulR, Vector3 offL, Vector3 eulL)
+                => ManualHolds[key] = new HeldPose { OffR = offR, EulR = eulR, OffL = offL, EulL = eulL };
+
+            M("Demo Clipboards#0/Operating Manual_DEMO_DISCORD_USERS_THANK_YOU#1",
+              new Vector3(-0.11541189f, -0.0892292f, 0.056623038f), new Vector3(331.67905f, 182.5019f, 322.96124f),
+              new Vector3(0.10399865f, -0.0777165f, 0.09193912f), new Vector3(332.3466f, 169.48822f, 32.29955f));
+            M("Tactical Map#0/Operating Manual_Map symbols#4",
+              new Vector3(-0.21009326f, -0.22266315f, 0.06336311f), new Vector3(339.57245f, 183.44394f, 314.34204f),
+              new Vector3(0.24165058f, -0.15688677f, 0.16448794f), new Vector3(332.79736f, 163.13924f, 27.89729f));
+            M("Turret#0/Operating Manual_Balistic Calculator Variant#7",
+              new Vector3(-0.19930892f, -0.13886064f, 0.07948214f), new Vector3(340.1966f, 173.06294f, 328.24564f),
+              new Vector3(0.1802647f, -0.09726821f, 0.11332237f), new Vector3(333.99887f, 165.41183f, 26.151455f));
+            M("Turret#0/Operating Manual_Loading Variant#8",
+              new Vector3(-0.08664952f, -0.11174311f, 0.085335955f), new Vector3(336.5429f, 191.22154f, 309.28915f),
+              new Vector3(0.09012378f, -0.07075207f, 0.11441536f), new Vector3(337.6898f, 164.60387f, 30.673191f));
+            M("Aiming Console#0/Operating Manual_Gun Elevation#27",
+              new Vector3(-0.14259519f, -0.1317488f, 0.07267477f), new Vector3(339.22852f, 182.95189f, 318.49908f),
+              new Vector3(0.13609396f, -0.10953365f, 0.14262313f), new Vector3(335.13306f, 164.90367f, 30.67949f));
+            M("Aiming Console#0/Operating Manual_Rotation#26",
+              new Vector3(-0.12720032f, -0.13661543f, 0.067164f), new Vector3(337.82483f, 186.31432f, 312.50824f),
+              new Vector3(0.119141236f, -0.09711851f, 0.13358216f), new Vector3(332.58337f, 157.80801f, 32.299328f));
+            M("Tactical Map#0/Operating Manual_Map Instructions#5",
+              new Vector3(-0.16335231f, -0.16117266f, 0.115745634f), new Vector3(340.966f, 180.0113f, 319.62366f),
+              new Vector3(0.124467835f, -0.13195425f, 0.17058633f), new Vector3(335.63538f, 154.74919f, 36.081123f));
+            M("Trigger Console#0/.Trigger Console Floor#8/.Review Console Parent#0/Trigger tutorial board parent #33/Operating Manual_Trigger#0",
+              new Vector3(-0.11010395f, -0.115091145f, 0.11564128f), new Vector3(340.12683f, 188.40689f, 320.7328f),
+              new Vector3(0.099025555f, -0.11144035f, 0.15614794f), new Vector3(343.17368f, 159.55869f, 39.035328f));
+            M("Barbet#0/Operating Manual_DEMO_PROVE_IT_TO_RECORN_PHOTOGRAPHS#14",
+              new Vector3(-0.10242175f, -0.07849707f, 0.10015318f), new Vector3(347.63004f, 192.34871f, 322.98627f),
+              new Vector3(0.047751114f, -0.065900184f, 0.15076871f), new Vector3(349.52322f, 151.35466f, 38.528553f));
+            M("Barbet#0/Operating Manual_Espresso machine (2)#13",
+              new Vector3(-0.10038768f, -0.11942622f, 0.06257877f), new Vector3(347.25034f, 187.10902f, 306.40363f),
+              new Vector3(0.22605929f, -0.13960384f, 0.19686727f), new Vector3(355.05295f, 171.15569f, 31.060148f));
+            M("Barbet#0/Expresso Machine#11/Operating Manual_Espresso machine (1)#9",
+              new Vector3(-0.11172036f, -0.12009663f, 0.12324132f), new Vector3(349.295f, 183.26625f, 311.82645f),
+              new Vector3(0.22605929f, -0.13960384f, 0.19686727f), new Vector3(355.05295f, 171.15569f, 31.060148f));
+        }
 
         // --- Gun watch wristband ---
         // The watch rides the LEFT controller like a wristwatch (it can't be grabbed). Offset is metres in the
@@ -583,6 +637,11 @@ namespace IronNestVR
                 WF(sb, "CoopFlagScale", CoopFlagScale);
                 WV(sb, "CoopFlagOffset", CoopFlagOffset);
                 WV(sb, "CoopFlagEuler", CoopFlagEuler);
+                foreach (var kv in ManualHolds)
+                {
+                    var h = kv.Value;
+                    sb.AppendLine("ManualHold." + kv.Key + "=" + VS(h.OffR) + "|" + VS(h.EulR) + "|" + VS(h.OffL) + "|" + VS(h.EulL));
+                }
                 File.WriteAllText(SettingsPath, sb.ToString());
                 Plugin.Logger?.LogInfo("[config] saved settings to " + SettingsPath);
             }
@@ -643,6 +702,19 @@ namespace IronNestVR
 
         private static void Apply(string k, string v)
         {
+            // Per-manual held poses: "ManualHold.<key>=offR|eulR|offL|eulL" (key may contain '.').
+            if (k.StartsWith("ManualHold.", StringComparison.Ordinal))
+            {
+                string mkey = k.Substring("ManualHold.".Length);
+                var parts = v.Split('|');
+                if (mkey.Length > 0 && parts.Length == 4)
+                    ManualHolds[mkey] = new HeldPose
+                    {
+                        OffR = PV(parts[0], Vector3.zero), EulR = PV(parts[1], Vector3.zero),
+                        OffL = PV(parts[2], Vector3.zero), EulL = PV(parts[3], Vector3.zero)
+                    };
+                return;
+            }
             switch (k)
             {
                 case "ClipboardScale": ClipboardScale = PF(v, ClipboardScale); break;
@@ -694,8 +766,8 @@ namespace IronNestVR
         private static void WF(StringBuilder sb, string k, float v) => sb.AppendLine(k + "=" + v.ToString("R", Inv));
         private static void WI(StringBuilder sb, string k, int v) => sb.AppendLine(k + "=" + v.ToString(Inv));
         private static void WB(StringBuilder sb, string k, bool v) => sb.AppendLine(k + "=" + (v ? "true" : "false"));
-        private static void WV(StringBuilder sb, string k, Vector3 v) =>
-            sb.AppendLine(k + "=" + v.x.ToString("R", Inv) + " " + v.y.ToString("R", Inv) + " " + v.z.ToString("R", Inv));
+        private static void WV(StringBuilder sb, string k, Vector3 v) => sb.AppendLine(k + "=" + VS(v));
+        private static string VS(Vector3 v) => v.x.ToString("R", Inv) + " " + v.y.ToString("R", Inv) + " " + v.z.ToString("R", Inv);
         private static float PF(string v, float def) => float.TryParse(v, NumberStyles.Float, Inv, out var r) ? r : def;
         private static int PI(string v, int def) => int.TryParse(v, NumberStyles.Integer, Inv, out var r) ? r : def;
         private static bool PB(string v, bool def) => bool.TryParse(v, out var r) ? r : def;

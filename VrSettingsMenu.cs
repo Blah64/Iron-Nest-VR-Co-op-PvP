@@ -421,8 +421,10 @@ namespace IronNestVR
             Config.ClipHoldCurl = 0.28f;
             Config.ManualHeldOffsetR = new Vector3(0f, 0.02f, 0.06f);
             Config.ManualHeldEulerR = Vector3.zero;
-            Config.ManualHeldOffsetL = new Vector3(0f, 0.02f, 0.06f);
-            Config.ManualHeldEulerL = Vector3.zero;
+            Config.ManualHeldOffsetL = new Vector3(0.22605929f, -0.13960384f, 0.19686727f);
+            Config.ManualHeldEulerL = new Vector3(355.05295f, 171.15569f, 31.060148f);
+            Config.ManualHolds.Clear();
+            Config.SeedDefaultManualHolds();   // back to the baked per-manual calibration
             Config.WatchWristOffset = new Vector3(-0.118086986f, -0.03401533f, -0.1825182f);
             Config.WatchWristEuler = new Vector3(291.49533f, 99.28354f, 78.04213f);
             try { Config.Save(); } catch { }

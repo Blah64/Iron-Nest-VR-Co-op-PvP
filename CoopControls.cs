@@ -993,9 +993,17 @@ namespace IronNestVR
                 int id = Fnv(path);
                 if (_byId.TryGetValue(id, out var exist))
                 {
-                    // DIAGNOSTIC: a path-hash collision — two controls map to the same NetId, so the peer can't tell
-                    // them apart (the recon-console vs gun targeting dial cross-wire). The second is dropped here.
-                    if (_dialCollisions < 12) { _dialCollisions++; Log.LogWarning($"[ctrl] dial NetId COLLISION: '{tr.name}' (grp={Classify(path)}) hashes to id={id}, already held by '{SafeName(exist)}' (grp={exist.Grp}) — DROPPED. path='{path}'"); }
+                    // The periodic rescan (every 3s) does NOT clear _byId (it must preserve live ownership/value
+                    // state), so an already-registered control re-appears here every scan — that's NOT a collision,
+                    // just a re-find of the SAME transform; skip it silently. Only warn on a TRUE id clash (two
+                    // DIFFERENT transforms hashing to one NetId — the peer couldn't tell them apart).
+                    bool sameControl = false;
+                    try { sameControl = exist.T != null && exist.T.GetInstanceID() == tr.GetInstanceID(); } catch { }
+                    if (!sameControl && _dialCollisions < 12)
+                    {
+                        _dialCollisions++;
+                        Log.LogWarning($"[ctrl] dial NetId COLLISION: '{tr.name}' (grp={Classify(path)}) hashes to id={id}, already held by '{SafeName(exist)}' (grp={exist.Grp}) — DROPPED. path='{path}'");
+                    }
                     continue;
                 }
                 var c = new Ctrl { NetId = id, T = tr, Dial = d, Slider = s, Grp = Classify(path) };

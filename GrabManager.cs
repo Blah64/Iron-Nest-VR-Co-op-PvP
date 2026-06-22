@@ -49,6 +49,9 @@ namespace IronNestVR
             // WorldLocked only: the world pose captured when first tracked, used to put the prop back on release
             // IF it has no PickUpZoomTarget (manuals restore via the game's own original-state record instead).
             public Vector3 HomePos; public Quaternion HomeRot; public bool HasHome;
+            // WorldLocked only: stable hierarchy-path key (captured at discovery) for the PER-MANUAL held pose
+            // in Config.ManualHolds — manuals differ in size/orientation so each calibrates independently.
+            public string Key;
         }
 
         private readonly Dictionary<int, Item> _items = new Dictionary<int, Item>();
@@ -155,16 +158,12 @@ namespace IronNestVR
                         {
                             bool manual = _grabbed.Mode == Mode.WorldLocked;
                             // Two-hand hold calibration: the OTHER hand drags the held offset before we apply it
-                            // (ClipHold edits the clipboard's, ManualHold edits the manuals').
+                            // (ClipHold edits the clipboard's, ManualHold edits the held manual's own entry).
                             if ((_calib == CalibTarget.ClipHold && !manual) || (_calib == CalibTarget.ManualHold && manual))
-                                HeldPoseAdjust(input, origin, cp, cr, manual);
+                                HeldPoseAdjust(input, origin, cp, cr);
                             // Snap into the fixed held pose in the grip frame (per holding hand, since left/right
-                            // grips mirror) — the clipboard uses ClipHeld*, world manuals use their own ManualHeld*.
-                            bool right = _hand == 2;
-                            Vector3 off = manual ? (right ? Config.ManualHeldOffsetR : Config.ManualHeldOffsetL)
-                                                 : (right ? Config.ClipHeldOffsetR : Config.ClipHeldOffsetL);
-                            Vector3 eul = manual ? (right ? Config.ManualHeldEulerR : Config.ManualHeldEulerL)
-                                                 : (right ? Config.ClipHeldEulerR : Config.ClipHeldEulerL);
+                            // grips mirror) — clipboard uses ClipHeld*, each manual uses its own per-manual entry.
+                            GetHeld(_grabbed, _hand == 2, out var off, out var eul);
                             _grabbed.Move.SetPositionAndRotation(cp + cr * off, cr * Quaternion.Euler(eul));
                         }
                         else
@@ -402,10 +401,11 @@ namespace IronNestVR
 
         // Hold calibration (clipboard OR manual): while the prop is held by one hand (hPos/hRot = that grip's
         // world pose), the OPPOSITE hand's grip rigidly drags the prop; we re-express its pose in the holding-
-        // grip frame and store it as the holding hand's Clip/ManualHeld offset/euler (so it sticks once
-        // released). Mirrors HandVisuals.CalibrateTick. `manual` picks which config set to read/write.
-        private void HeldPoseAdjust(VrInput input, Transform origin, Vector3 hPos, Quaternion hRot, bool manual)
+        // grip frame and store it as the holding hand's held offset/euler (so it sticks once released). For a
+        // manual that writes its OWN per-manual entry. Mirrors HandVisuals.CalibrateTick.
+        private void HeldPoseAdjust(VrInput input, Transform origin, Vector3 hPos, Quaternion hRot)
         {
+            if (_grabbed == null) return;
             bool holdRight = _hand == 2;  // which hand HOLDS the prop → which per-hand offset we edit
             bool oppIsRight = !holdRight; // the opposite (adjusting) hand
             bool oppValid = oppIsRight ? input.GripValid : input.GripValidL;
@@ -413,7 +413,7 @@ namespace IronNestVR
             if (!oppValid) { _prevHoldGrip = oppGrip; return; }
             GetWorld(origin, oppIsRight ? input.GripPose : input.GripPoseL, out var oPos, out var oRot);
 
-            GetHeld(manual, holdRight, out Vector3 curOff, out Vector3 curEul);
+            GetHeld(_grabbed, holdRight, out Vector3 curOff, out Vector3 curEul);
             Vector3 clipPos = hPos + hRot * curOff;
             Quaternion clipRot = hRot * Quaternion.Euler(curEul);
 
@@ -429,8 +429,9 @@ namespace IronNestVR
                 _holdAdjust = false;
                 try { Config.Save(); } catch { }
                 input.Haptic(Config.DetentHapticAmplitude, 0.03f);
-                GetHeld(manual, holdRight, out Vector3 o, out Vector3 e);
-                Log.LogInfo($"[grab] {(manual ? "manual" : "clip")}-hold calibrated ({(holdRight ? "right" : "left")} hand): offset={o}, euler={e}.");
+                bool manual = _grabbed.Mode == Mode.WorldLocked;
+                GetHeld(_grabbed, holdRight, out Vector3 o, out Vector3 e);
+                Log.LogInfo($"[grab] {(manual ? "manual" : "clip")}-hold calibrated ({(holdRight ? "right" : "left")} hand, key='{(manual ? _grabbed.Key : "clip")}'): offset={o}, euler={e}.");
             }
 
             if (_holdAdjust)
@@ -439,21 +440,56 @@ namespace IronNestVR
                 Vector3 newPos = oPos + dq * (_holdClipPos - _holdOppPos);
                 Quaternion newRot = dq * _holdClipRot;
                 Quaternion invH = Quaternion.Inverse(hRot);
-                SetHeld(manual, holdRight, invH * (newPos - hPos), (invH * newRot).eulerAngles);
+                SetHeld(_grabbed, holdRight, invH * (newPos - hPos), (invH * newRot).eulerAngles);
             }
             _prevHoldGrip = oppGrip;
         }
 
-        private static void GetHeld(bool manual, bool right, out Vector3 off, out Vector3 eul)
+        // The held pose for a grabbed prop, per holding hand. The HUD clipboard uses the shared ClipHeld*; a
+        // world manual uses its OWN entry in Config.ManualHolds (keyed by Item.Key), falling back to the shared
+        // ManualHeld* default until that specific manual has been calibrated.
+        private static void GetHeld(Item it, bool right, out Vector3 off, out Vector3 eul)
         {
-            if (manual) { off = right ? Config.ManualHeldOffsetR : Config.ManualHeldOffsetL; eul = right ? Config.ManualHeldEulerR : Config.ManualHeldEulerL; }
+            if (it.Mode == Mode.WorldLocked)
+            {
+                if (it.Key != null && Config.ManualHolds.TryGetValue(it.Key, out var h))
+                { off = right ? h.OffR : h.OffL; eul = right ? h.EulR : h.EulL; return; }
+                off = right ? Config.ManualHeldOffsetR : Config.ManualHeldOffsetL;
+                eul = right ? Config.ManualHeldEulerR : Config.ManualHeldEulerL;
+            }
             else { off = right ? Config.ClipHeldOffsetR : Config.ClipHeldOffsetL; eul = right ? Config.ClipHeldEulerR : Config.ClipHeldEulerL; }
         }
 
-        private static void SetHeld(bool manual, bool right, Vector3 off, Vector3 eul)
+        private static void SetHeld(Item it, bool right, Vector3 off, Vector3 eul)
         {
-            if (manual) { if (right) { Config.ManualHeldOffsetR = off; Config.ManualHeldEulerR = eul; } else { Config.ManualHeldOffsetL = off; Config.ManualHeldEulerL = eul; } }
+            if (it.Mode == Mode.WorldLocked)
+            {
+                if (it.Key == null) return;
+                // Seed a fresh entry from the shared default so calibrating ONE hand doesn't zero the other.
+                if (!Config.ManualHolds.TryGetValue(it.Key, out var h))
+                {
+                    h.OffR = Config.ManualHeldOffsetR; h.EulR = Config.ManualHeldEulerR;
+                    h.OffL = Config.ManualHeldOffsetL; h.EulL = Config.ManualHeldEulerL;
+                }
+                if (right) { h.OffR = off; h.EulR = eul; } else { h.OffL = off; h.EulL = eul; }
+                Config.ManualHolds[it.Key] = h;
+            }
             else { if (right) { Config.ClipHeldOffsetR = off; Config.ClipHeldEulerR = eul; } else { Config.ClipHeldOffsetL = off; Config.ClipHeldEulerL = eul; } }
+        }
+
+        // Stable hierarchy-path key for a manual (name#siblingIndex per segment, deterministic across sessions),
+        // captured at discovery before the game's zoom can reparent it. Matches CoopControls.PathOf's scheme.
+        private static string ManualKey(Transform t)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (Transform p = t; p != null; p = p.parent)
+            {
+                string n; try { n = p.name; } catch { n = "?"; }
+                int idx; try { idx = p.GetSiblingIndex(); } catch { idx = 0; }
+                if (sb.Length > 0) sb.Insert(0, "/");
+                sb.Insert(0, (string.IsNullOrEmpty(n) ? "?" : n) + "#" + idx);
+            }
+            return sb.ToString().Replace('=', '_').Replace('|', '_').Replace('\n', '_').Replace('\r', '_');
         }
 
         // Recompute the watch offset + orientation from where it was placed, expressed in the LEFT grip
@@ -506,7 +542,8 @@ namespace IronNestVR
                             Rend = move.GetComponentInChildren<Renderer>(true),
                             Mode = hud ? Mode.WaistLocked : Mode.WorldLocked,
                             IsHudClip = hud,
-                            HomePos = move.position, HomeRot = move.rotation, HasHome = !hud  // world props return here on release
+                            HomePos = move.position, HomeRot = move.rotation, HasHome = !hud,  // world props return here on release
+                            Key = hud ? null : ManualKey(move)
                         };
                         _items[id] = it;
                         if (hud)
@@ -569,7 +606,8 @@ namespace IronNestVR
                                 Rend = t.GetComponentInChildren<Renderer>(true),
                                 Mode = Mode.WorldLocked,
                                 Zoom = pz,
-                                HomePos = t.position, HomeRot = t.rotation, HasHome = true  // fallback if the game's reset fails
+                                HomePos = t.position, HomeRot = t.rotation, HasHome = true,  // fallback if the game's reset fails
+                                Key = ManualKey(t)   // per-manual held-pose key
                             };
                         }
                     }
