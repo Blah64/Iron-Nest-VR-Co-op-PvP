@@ -329,6 +329,9 @@ namespace IronNestVR
                     {
                         _menu.Tick(_xr.Input, _rig); // menu owns the trigger while open
                         _handManip.Tick(_xr.Input, _rig, _hands, false); // release any held control
+                        // Grab-to-place calibration runs with the menu open (the menu uses the trigger, grab
+                        // uses the grip), so you can arm it on the HUD tab and immediately place the prop.
+                        if (_grab.IsCalibrating) _grab.Tick(_xr.Input, _rig, active);
                     }
                     else
                     {

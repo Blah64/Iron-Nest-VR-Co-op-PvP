@@ -59,13 +59,13 @@ namespace IronNestVR
         private TMP_FontAsset _font;
         private CameraRig _rig;
         internal HandVisuals Hands;   // for the in-menu hand Calibrate tool
-        internal GrabManager Grab;    // for the "Reset HUD Positions" action
+        internal GrabManager Grab;    // for the clipboard/watch Calibrate tools on the HUD tab
         private bool _open;
         private int _hoverIndex = -1;
         private bool _prevTrigger;
         private int _layer;
 
-        private enum Page { Settings, Lobbies }
+        private enum Page { Settings, Hud, Lobbies }
         private Page _page = Page.Settings;
         private int _scroll;                       // lobby-list scroll offset (windowed view)
         private const int LOBBY_VISIBLE = 6;       // join slots shown at once on the Lobbies tab
@@ -105,6 +105,7 @@ namespace IronNestVR
         {
             if (!_open) return;
             try { Hands?.CancelCalibration(); } catch { } // don't leave a grip hijacked after the menu shuts
+            try { Grab?.CancelCalibrate(); } catch { }     // disarm clipboard/watch calibration on close
             try { Config.Save(); } catch { }               // persist menu edits + hand calibration for next session
             Destroy();
             _open = false;
@@ -303,6 +304,7 @@ namespace IronNestVR
             _rows.Clear();
             _idToRow.Clear();
             if (_page == Page.Lobbies) DefineLobbyRows();
+            else if (_page == Page.Hud) DefineHudRows();
             else DefineSettingsRows();
         }
 
@@ -345,9 +347,6 @@ namespace IronNestVR
                      d => Config.ClipboardScale = Clamp(Config.ClipboardScale + d * 0.1f, 0.5f, 4f));
             AddFloat("Watch Size", () => Config.WatchScale.ToString("0.0") + "x",
                      d => Config.WatchScale = Clamp(Config.WatchScale + d * 0.1f, 0.3f, 4f));
-            // Grab+drag the HUD clipboard/watch to reposition them; the spot is saved automatically and
-            // restored next session. This forgets those saved spots (authored default on next respawn/reload).
-            AddAction("Reset HUD Positions", () => Grab?.ResetHudPlacement());
             AddFloat("Resolution Scale", () => Mathf.RoundToInt(Config.RenderScale * 100f) + "%",
                      d => Config.RenderScale = Clamp(Config.RenderScale + d * 0.05f, 0.2f, 1f));
             AddToggle("Turn Mode", () => Config.SnapTurn ? "Snap" : "Smooth",
@@ -358,27 +357,15 @@ namespace IronNestVR
                      d => Config.SnapTurnAngle = Clamp(Config.SnapTurnAngle + d * 5f, 10f, 90f));
             AddFloat("Move Speed", () => Config.MoveSpeedScale.ToString("0.0") + "x",
                      d => Config.MoveSpeedScale = Clamp(Config.MoveSpeedScale + d * 0.1f, 0.2f, 3f));
-            AddToggle("HUD Rotates w/View", () => Config.HudRotateWithCamera ? "On" : "Off",
-                      () => Config.HudRotateWithCamera = !Config.HudRotateWithCamera);
             AddToggle("Laser Always On", () => Config.LaserAlwaysOn ? "On" : "Off",
                       () => Config.LaserAlwaysOn = !Config.LaserAlwaysOn);
-            AddToggle("Grab Switches", () => Config.SwitchGrabEnabled ? "On" : "Off",
-                      () => Config.SwitchGrabEnabled = !Config.SwitchGrabEnabled);
             AddFloat("Switch Throw", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
                      d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.02f, 0.15f));
 
-            // Mirror the game's screen-space confirmation popups ("I understand", exit-mission, …) into VR;
-            // they're otherwise invisible AND block input.
-            AddToggle("Show Popups", () => Config.PopupVrEnabled ? "On" : "Off",
-                      () => Config.PopupVrEnabled = !Config.PopupVrEnabled);
-
-            // --- Hand tuning (live) ---
-            AddToggle("Hands", () => Config.HandsEnabled ? "On" : "Off",
-                      () => Config.HandsEnabled = !Config.HandsEnabled);
-            AddFloat("Hand Size", () => Config.HandScale.ToString("0.00") + "x",
-                     d => Config.HandScale = Clamp(Config.HandScale + d * 0.05f, 0.3f, 2.5f));
+            // --- Hand calibration (live) ---
             // Calibrate: tap to arm, then hold the OPPOSITE controller's grip and move the hand into
-            // place (like grabbing the clipboard); release to keep, tap again to finish.
+            // place (like grabbing the clipboard); release to keep, tap again to finish. (Hands on/off,
+            // size and finger-curl are fixed at their Config defaults — not player-configurable.)
             AddToggle("Calibrate Right Hand",
                       () => (Hands != null && Hands.CalibratingRight) ? "hold LEFT grip" : "tap",
                       () => Hands?.ToggleCalibration(true));
@@ -386,17 +373,56 @@ namespace IronNestVR
                       () => (Hands != null && Hands.Calibrating && !Hands.CalibratingRight) ? "hold RIGHT grip" : "tap",
                       () => Hands?.ToggleCalibration(false));
             AddAction("Reset Hand Offsets", () => Hands?.ResetOffsets());
-            AddToggle("Finger Curl", () => Config.FingerCurlEnabled ? "On" : "Off",
-                      () => Config.FingerCurlEnabled = !Config.FingerCurlEnabled);
-            AddFloat("Curl Amount", () => Mathf.RoundToInt(Config.FingerCurlMaxDeg) + " deg",
-                     d => Config.FingerCurlMaxDeg = Clamp(Config.FingerCurlMaxDeg + d * 5f, 0f, 120f));
-            AddFloat("Curl Axis", () => Config.FingerCurlAxis == 0 ? "X" : Config.FingerCurlAxis == 1 ? "Y" : "Z",
-                     d => Config.FingerCurlAxis = ((Config.FingerCurlAxis + (d >= 0 ? 1 : 2)) % 3));
-            AddToggle("Curl Direction", () => Config.FingerCurlSign >= 0f ? "+" : "-",
-                      () => Config.FingerCurlSign = -Config.FingerCurlSign);
 
             AddAction("Recenter View", () => { _rig?.Recenter(); });
             AddAction("Close Menu", Close);
+        }
+
+        // HUD layout tab: calibrate the waist-holstered clipboard and the wrist watch by physically placing
+        // them, the same way the hand models are calibrated. Arm a row (tap), then GRIP the prop and move it
+        // to where you want it — release to set. Works with this menu open (the menu uses the trigger; grab
+        // uses the grip). The placed pose is saved to the cfg. Fine angle adjustment helps the watch most.
+        private void DefineHudRows()
+        {
+            AddToggle("Calibrate Clipboard",
+                      () => (Grab != null && Grab.CalibratingClip) ? "grip & place" : "tap",
+                      () => Grab?.ToggleCalibrate(false));
+            AddToggle("Calibrate Watch",
+                      () => (Grab != null && Grab.CalibratingWatch) ? "R-grip on wrist" : "tap",
+                      () => Grab?.ToggleCalibrate(true));
+
+            // Angle fine-tune (grab nails position; small wrist jitter makes exact angles hard to grab-set).
+            AddFloat("Clip Tilt", () => Deg(Config.ClipWaistEuler.x),
+                     d => Config.ClipWaistEuler.x = Wrap(Config.ClipWaistEuler.x + d * 5f));
+            AddFloat("Watch Pitch", () => Deg(Config.WatchWristEuler.x),
+                     d => Config.WatchWristEuler.x = Wrap(Config.WatchWristEuler.x + d * 5f));
+            AddFloat("Watch Yaw", () => Deg(Config.WatchWristEuler.y),
+                     d => Config.WatchWristEuler.y = Wrap(Config.WatchWristEuler.y + d * 5f));
+            AddFloat("Watch Roll", () => Deg(Config.WatchWristEuler.z),
+                     d => Config.WatchWristEuler.z = Wrap(Config.WatchWristEuler.z + d * 5f));
+
+            AddAction("Reset HUD Layout", ResetHudLayout);
+            AddAction("Close Menu", Close);
+        }
+
+        // Restore the waist/wrist anchors to their built-in defaults (the values baked into Config).
+        private void ResetHudLayout()
+        {
+            Config.ClipWaistOffset = new Vector3(0f, -0.45f, 0.33f);
+            Config.ClipWaistEuler = new Vector3(45f, 0f, 0f);
+            Config.WatchWristOffset = new Vector3(0f, 0f, -0.05f);
+            Config.WatchWristEuler = Vector3.zero;
+            try { Config.Save(); } catch { }
+            Log.LogInfo("[menu] HUD layout reset to defaults.");
+        }
+
+        private static string Deg(float deg) => Mathf.RoundToInt(deg) + " deg";
+        private static float Wrap(float deg)
+        {
+            deg %= 360f;
+            if (deg > 180f) deg -= 360f;
+            else if (deg < -180f) deg += 360f;
+            return deg;
         }
 
         private void AddFloat(string label, Func<string> value, Action<int> adjust)
@@ -414,12 +440,13 @@ namespace IronNestVR
         // map to the page index in _idToTab (handled in Tick alongside the row colliders).
         private void BuildTabs(float yTop, float zQuad, float zText)
         {
-            string[] names = { "Settings", "Lobbies" };
+            string[] names = { "Settings", "HUD", "Lobbies" };
+            int count = names.Length;
             float usableW = PANEL_W - 0.04f;
-            float tabW = usableW / 2f;
+            float tabW = usableW / count;
             float startX = -usableW * 0.5f + tabW * 0.5f;
             float cy = yTop - TAB_H * 0.5f;
-            for (int p = 0; p < 2; p++)
+            for (int p = 0; p < count; p++)
             {
                 bool active = (int)_page == p;
                 float tx = startX + p * tabW;

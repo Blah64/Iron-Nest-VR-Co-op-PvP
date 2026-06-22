@@ -355,9 +355,9 @@ namespace IronNestVR
         public static float SnapTurnReArm = 0.3f;     // stick must fall below this before the next snap
 
         // --- HUD follow (legacy) ---
-        // Superseded by GrabManager, which now head-locks BOTH the clipboard and the watch with a
-        // runtime toggle (HudRotateWithCamera). HudFollower reparented the watch under its own anchor
-        // and ALWAYS followed head yaw, which fought GrabManager and ignored the toggle — so it's off.
+        // Superseded by GrabManager, which now anchors the clipboard to a waist holster and the watch to the
+        // left wrist. HudFollower reparented the watch under its own anchor and ALWAYS followed head yaw, which
+        // fought GrabManager — so it's off.
         public static bool HudFollowEnabled = false;
         // Exponential lag time-constant (s): higher = lazier/smoother follow.
         public static float HudFollowPosLag = 0.18f;
@@ -371,9 +371,6 @@ namespace IronNestVR
         // Also let the world "operating manual" clipboard props (PickUpZoomTarget) be grip-grabbed and
         // repositioned in 3D (world-locked). Trigger still does the game's click-to-zoom-and-read.
         public static bool ManualGrabEnabled = true;
-        // Head-locked props (HUD clipboard + watch) rotate WITH the VR camera when true; when false
-        // they keep a fixed orientation and only follow your position (you turn to look at them).
-        public static bool HudRotateWithCamera = false;
         // Hand must be within this distance (m) of the clipboard to grab it with the grip button.
         public static float GrabRadius = 0.4f;
         // Scale the clipboard up for VR: it was authored for the flat ~60° FOV; the VR view is ~94°,
@@ -382,15 +379,21 @@ namespace IronNestVR
         // Same idea for the gun watch (independent knob — it's a different size to start with).
         public static float WatchScale = 2.5f;
 
-        // Persisted grab-dragged placement for the two head-locked HUD props (clipboard + watch). Each resting
-        // pose is captured in BOTH frames the follower can use — head-relative (the "rotate with view" mode) and
-        // seat/rig-origin-relative (the fixed-orientation default mode) — so wherever you drop them is restored
-        // next session in either mode. "Saved" gates restore vs. the game's authored default placement; written
-        // on grab-release. Rotations are euler degrees (same convention as the hand offsets). See GrabManager.
-        public static bool ClipPlacementSaved = false;
-        public static Vector3 ClipHeadOffPos, ClipHeadOffEul, ClipOriginOffPos, ClipOriginOffEul;
-        public static bool WatchPlacementSaved = false;
-        public static Vector3 WatchHeadOffPos, WatchHeadOffEul, WatchOriginOffPos, WatchOriginOffEul;
+        // --- HUD clipboard waist holster ---
+        // When not held, the HUD clipboard rests at a "holster" anchor that follows the head's POSITION and
+        // YAW (not pitch/roll) — so it sits at a fixed spot at your waist/belt. Grab it to raise & read; let go
+        // and it returns here. Offset is metres in the body-yaw frame (x=right, y=up so negative drops it,
+        // z=forward). ClipWaistEuler tilts the readable face up toward your downward gaze (degrees, applied on
+        // top of the clipboard's captured authored facing). Tune live on the menu's HUD tab.
+        public static Vector3 ClipWaistOffset = new Vector3(0f, -0.45f, 0.33f);
+        public static Vector3 ClipWaistEuler = new Vector3(45f, 0f, 0f);
+
+        // --- Gun watch wristband ---
+        // The watch rides the LEFT controller like a wristwatch (it can't be grabbed). Offset is metres in the
+        // left grip frame; WatchWristEuler orients the dial on the back of the wrist (degrees). The grip-frame
+        // axes aren't obvious, so expect to dial these in on the menu's HUD tab the first time.
+        public static Vector3 WatchWristOffset = new Vector3(0f, 0f, -0.05f);
+        public static Vector3 WatchWristEuler = new Vector3(0f, 0f, 0f);
 
         // --- VR settings menu (click BOTH thumbsticks at once to open/close) ---
         public static bool MenuEnabled = true;
@@ -523,7 +526,6 @@ namespace IronNestVR
                 WF(sb, "TurnSpeedDegPerSec", TurnSpeedDegPerSec);
                 WF(sb, "SnapTurnAngle", SnapTurnAngle);
                 WF(sb, "MoveSpeedScale", MoveSpeedScale);
-                WB(sb, "HudRotateWithCamera", HudRotateWithCamera);
                 WB(sb, "LaserAlwaysOn", LaserAlwaysOn);
                 WB(sb, "HandsEnabled", HandsEnabled);
                 WF(sb, "HandScale", HandScale);
@@ -538,16 +540,10 @@ namespace IronNestVR
                 WB(sb, "SwitchGrabEnabled", SwitchGrabEnabled);
                 WF(sb, "SwitchThrowDistance", SwitchThrowDistance);
                 WB(sb, "PopupVrEnabled", PopupVrEnabled);
-                WB(sb, "ClipPlacementSaved", ClipPlacementSaved);
-                WV(sb, "ClipHeadOffPos", ClipHeadOffPos);
-                WV(sb, "ClipHeadOffEul", ClipHeadOffEul);
-                WV(sb, "ClipOriginOffPos", ClipOriginOffPos);
-                WV(sb, "ClipOriginOffEul", ClipOriginOffEul);
-                WB(sb, "WatchPlacementSaved", WatchPlacementSaved);
-                WV(sb, "WatchHeadOffPos", WatchHeadOffPos);
-                WV(sb, "WatchHeadOffEul", WatchHeadOffEul);
-                WV(sb, "WatchOriginOffPos", WatchOriginOffPos);
-                WV(sb, "WatchOriginOffEul", WatchOriginOffEul);
+                WV(sb, "ClipWaistOffset", ClipWaistOffset);
+                WV(sb, "ClipWaistEuler", ClipWaistEuler);
+                WV(sb, "WatchWristOffset", WatchWristOffset);
+                WV(sb, "WatchWristEuler", WatchWristEuler);
                 WB(sb, "CoopGasMask", CoopGasMask);
                 WF(sb, "CoopMaskScale", CoopMaskScale);
                 WV(sb, "CoopMaskOffset", CoopMaskOffset);
@@ -625,7 +621,6 @@ namespace IronNestVR
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;
                 case "MoveSpeedScale": MoveSpeedScale = PF(v, MoveSpeedScale); break;
-                case "HudRotateWithCamera": HudRotateWithCamera = PB(v, HudRotateWithCamera); break;
                 case "LaserAlwaysOn": LaserAlwaysOn = PB(v, LaserAlwaysOn); break;
                 case "HandsEnabled": HandsEnabled = PB(v, HandsEnabled); break;
                 case "HandScale": HandScale = PF(v, HandScale); break;
@@ -640,16 +635,10 @@ namespace IronNestVR
                 case "SwitchGrabEnabled": SwitchGrabEnabled = PB(v, SwitchGrabEnabled); break;
                 case "PopupVrEnabled": PopupVrEnabled = PB(v, PopupVrEnabled); break;
                 case "SwitchThrowDistance": SwitchThrowDistance = PF(v, SwitchThrowDistance); break;
-                case "ClipPlacementSaved": ClipPlacementSaved = PB(v, ClipPlacementSaved); break;
-                case "ClipHeadOffPos": ClipHeadOffPos = PV(v, ClipHeadOffPos); break;
-                case "ClipHeadOffEul": ClipHeadOffEul = PV(v, ClipHeadOffEul); break;
-                case "ClipOriginOffPos": ClipOriginOffPos = PV(v, ClipOriginOffPos); break;
-                case "ClipOriginOffEul": ClipOriginOffEul = PV(v, ClipOriginOffEul); break;
-                case "WatchPlacementSaved": WatchPlacementSaved = PB(v, WatchPlacementSaved); break;
-                case "WatchHeadOffPos": WatchHeadOffPos = PV(v, WatchHeadOffPos); break;
-                case "WatchHeadOffEul": WatchHeadOffEul = PV(v, WatchHeadOffEul); break;
-                case "WatchOriginOffPos": WatchOriginOffPos = PV(v, WatchOriginOffPos); break;
-                case "WatchOriginOffEul": WatchOriginOffEul = PV(v, WatchOriginOffEul); break;
+                case "ClipWaistOffset": ClipWaistOffset = PV(v, ClipWaistOffset); break;
+                case "ClipWaistEuler": ClipWaistEuler = PV(v, ClipWaistEuler); break;
+                case "WatchWristOffset": WatchWristOffset = PV(v, WatchWristOffset); break;
+                case "WatchWristEuler": WatchWristEuler = PV(v, WatchWristEuler); break;
                 case "CoopGasMask": CoopGasMask = PB(v, CoopGasMask); break;
                 case "CoopMaskScale": CoopMaskScale = PF(v, CoopMaskScale); break;
                 case "CoopMaskOffset": CoopMaskOffset = PV(v, CoopMaskOffset); break;

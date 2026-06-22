@@ -9,25 +9,28 @@ namespace IronNestVR
 {
     /// <summary>
     /// Grab-to-place for all the movable cockpit props: the HUD clipboard, the gun watch, and the
-    /// tutorial clipboards. Squeeze the grip on either hand near a prop to grab it; move/rotate your
-    /// hand to position it; release to drop it.
+    /// world "operating manual" clipboards.
     ///
-    /// Two follow modes:
-    ///  • <b>HeadLocked</b> (HUD clipboard + watch): after release they ride the VR head at the
-    ///    grab-set offset — they rotate WITH the camera and stay in the same spot in your view.
-    ///  • <b>WorldLocked</b> (tutorial clipboards): they stay where you drop them in the world and do
-    ///    NOT follow the head.
+    /// Three follow modes:
+    ///  • <b>WaistLocked</b> (HUD clipboard): rests at a waist "holster" anchor — body-yaw-relative to
+    ///    the head — when not held; grip-grab it (either hand) to raise it and read, release and it
+    ///    returns to the waist. Its readable face orientation is captured once so it faces you; a config
+    ///    tilt angles it up toward your downward gaze.
+    ///  • <b>WristLocked</b> (gun watch): rides the LEFT controller like a wristwatch at a fixed offset.
+    ///    It is NOT grabbable — you turn your wrist to read it.
+    ///  • <b>WorldLocked</b> (operating manuals): they stay where you drop them in the world and do NOT
+    ///    follow you; only moved while grabbed.
     ///
     /// We drive each prop's transform by world pose (never re-parent — that breaks the clipboard's
-    /// note-consolidation). The HUD clipboard is the one whose holder lives under Main Camera; tutorial
-    /// clipboards are <c>ClipboardStateController</c>s that aren't. The watch is the Main-Camera child
-    /// whose name contains "Watch".
+    /// note-consolidation). The HUD clipboard is the one whose holder lives under Main Camera; world
+    /// manuals are <c>PickUpZoomTarget</c>s. The watch is the Main-Camera child whose name contains
+    /// "Watch". Waist/wrist offsets are tunable live on the menu's HUD tab (persisted to the cfg).
     /// </summary>
     internal sealed class GrabManager
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        private enum Mode { HeadLocked, WorldLocked }
+        private enum Mode { WaistLocked, WristLocked, WorldLocked }
 
         private sealed class Item
         {
@@ -38,12 +41,11 @@ namespace IronNestVR
             public Mode Mode;
             public bool IsHudClip;     // the one we scale for VR
             public PickUpZoomTarget Zoom; // non-null for world "operating manual" props (the game's pick-up-to-read)
-            // Resting offset captured (on find / grab-release) in two frames so the
-            // "rotate with camera" toggle can switch at runtime: head-relative (rotates with view)
-            // and rig-origin-relative (follows position, fixed orientation).
-            public Vector3 HeadOffPos; public Quaternion HeadOffRot;
-            public Vector3 OriginOffPos; public Quaternion OriginOffRot;
-            public bool HasOffset;
+            // WaistLocked only: the prop's authored orientation in its anchor camera's local frame, captured
+            // once (before we take over its transform) so the readable face keeps pointing at you. The waist
+            // placement then = body-yaw * configTilt * ReadableRot, positioned at the configured waist offset.
+            public Quaternion ReadableRot;
+            public bool HasReadable;
         }
 
         private readonly Dictionary<int, Item> _items = new Dictionary<int, Item>();
@@ -62,6 +64,28 @@ namespace IronNestVR
         private float _appliedWatchScale = 1f;
         private bool _fadersOff;
         private int _lastManualCount = -1;
+
+        // Calibration (menu-armed, like the hand-model Calibrate tool): physically grab the prop and
+        // release — the resting pose is recomputed in the prop's own anchor frame and saved to the cfg.
+        //  • Clipboard: grip-grab it (either hand), place it at your waist, release → waist offset/tilt.
+        //  • Watch: it becomes grabbable; reach your RIGHT hand to your left wrist, grip & place, release
+        //    → offset/orientation in the LEFT-grip (wrist) frame.
+        // Stays armed until toggled off. Runs even with the menu open (VrManager calls Tick while armed).
+        private enum CalibTarget { None, Clip, Watch }
+        private CalibTarget _calib;
+        public bool IsCalibrating => _calib != CalibTarget.None;
+        public bool CalibratingClip => _calib == CalibTarget.Clip;
+        public bool CalibratingWatch => _calib == CalibTarget.Watch;
+
+        public void ToggleCalibrate(bool watch)
+        {
+            var want = watch ? CalibTarget.Watch : CalibTarget.Clip;
+            _calib = (_calib == want) ? CalibTarget.None : want;
+            if (_calib == CalibTarget.None) { try { Config.Save(); } catch { } } // persist on finish
+            Log.LogInfo("[grab] calibrate " + (_calib == CalibTarget.None ? "off."
+                : (watch ? "WATCH — reach your RIGHT hand to your left wrist, grip & place, release."
+                         : "CLIPBOARD — grip it, place it at your waist, release.")));
+        }
 
         // ---------------- per-frame ----------------
 
@@ -93,7 +117,7 @@ namespace IronNestVR
                 else
                 {
                     bool held = _hand == 2 ? (input.GrabR && input.GripValid) : (input.GrabL && input.GripValidL);
-                    if (!held || !Grabbable(_grabbed)) Release(rig); // drop if grip released, destroyed, or a manual started zooming
+                    if (!held || !Grabbable(_grabbed)) Release(rig, input); // drop if grip released, destroyed, or a manual started zooming
                     else
                     {
                         Posef p = _hand == 2 ? input.GripPose : input.GripPoseL;
@@ -102,7 +126,7 @@ namespace IronNestVR
                     }
                 }
 
-                DriveFollowers(rig);
+                DriveFollowers(rig, input);
             }
             catch (Exception e)
             {
@@ -111,68 +135,60 @@ namespace IronNestVR
             }
         }
 
-        // Head-locked props follow the VR head at their resting offset (except the one being grabbed).
-        // Config.HudRotateWithCamera picks the frame: head (rotates with view) or rig origin (follows
-        // position only, fixed orientation — you turn to look at it).
-        private void DriveFollowers(CameraRig rig)
+        // Re-anchor the always-on HUD props each frame (except the one being grabbed):
+        //  • WaistLocked clipboard → a body-yaw "holster" anchor below/in front of the head, tilted up.
+        //  • WristLocked watch     → the LEFT controller, at a fixed wristband offset.
+        private void DriveFollowers(CameraRig rig, VrInput input)
         {
             if (!rig.TryGetHeadPose(out var hp, out var hr)) return;
             var origin = rig.OriginTransform;
             if (origin == null) return;
-            bool rotate = Config.HudRotateWithCamera;
             var cam = Camera.main;
+            Quaternion body = BodyYaw(hr);
+
+            // Left controller world pose (for the wrist watch), if it's tracked this frame.
+            bool hasLeft = input.GripValidL;
+            Vector3 lwp = Vector3.zero; Quaternion lwr = Quaternion.identity;
+            if (hasLeft) GetWorld(origin, input.GripPoseL, out lwp, out lwr);
+
             foreach (var it in _items.Values)
             {
-                if (it == _grabbed || it.Mode != Mode.HeadLocked || it.Move == null) continue;
-                if (!it.HasOffset) CaptureInitial(it, hp, hr, origin, cam); // start it in view, in front of you
-                if (rotate)
-                    it.Move.SetPositionAndRotation(hp + hr * it.HeadOffPos, hr * it.HeadOffRot);
-                else
-                    it.Move.SetPositionAndRotation(origin.TransformPoint(it.OriginOffPos), origin.rotation * it.OriginOffRot);
+                if (it == _grabbed || it.Move == null) continue;
+                if (it.Mode == Mode.WaistLocked)
+                {
+                    if (!it.HasReadable) CaptureReadable(it, cam); // lock in the readable facing before we take over
+                    Vector3 pos = hp + body * Config.ClipWaistOffset;
+                    Quaternion rot = body * Quaternion.Euler(Config.ClipWaistEuler) * it.ReadableRot;
+                    it.Move.SetPositionAndRotation(pos, rot);
+                }
+                else if (it.Mode == Mode.WristLocked)
+                {
+                    if (!hasLeft) continue; // left controller dropped tracking: leave the watch put
+                    Vector3 pos = lwp + lwr * Config.WatchWristOffset;
+                    Quaternion rot = lwr * Quaternion.Euler(Config.WatchWristEuler);
+                    it.Move.SetPositionAndRotation(pos, rot);
+                }
             }
         }
 
-        // Initial placement: a HUD prop is authored in front of MAIN CAMERA, but Main Camera doesn't
-        // track the VR head — so its current world pose can be off-screen/behind in VR. Transplant its
-        // Main-Camera-relative (authored) pose onto the VR head so it starts in front of you, in view.
-        private static void CaptureInitial(Item it, Vector3 hp, Quaternion hr, Transform origin, Camera cam)
+        // Yaw-only "body" frame from the head rotation (head forward flattened to horizontal). Used to
+        // anchor the waist holster so the clipboard follows where the body faces but not head pitch/roll.
+        private static Quaternion BodyYaw(Quaternion hr)
         {
-            Vector3 camLocalPos;
-            Quaternion camLocalRot;
-            if (cam != null)
-            {
-                var ct = cam.transform;
-                camLocalPos = ct.InverseTransformPoint(it.Move.position);
-                camLocalRot = Quaternion.Inverse(ct.rotation) * it.Move.rotation;
-            }
-            else
-            {
-                var invH = Quaternion.Inverse(hr);
-                camLocalPos = invH * (it.Move.position - hp);
-                camLocalRot = invH * it.Move.rotation;
-            }
-
-            it.HeadOffPos = camLocalPos;
-            it.HeadOffRot = camLocalRot;
-
-            // Same world pose, expressed in the rig-origin frame too (for the no-rotate follow mode).
-            Vector3 wpos = hp + hr * camLocalPos;
-            Quaternion wrot = hr * camLocalRot;
-            it.OriginOffPos = origin.InverseTransformPoint(wpos);
-            it.OriginOffRot = Quaternion.Inverse(origin.rotation) * wrot;
-            it.HasOffset = true;
+            Vector3 fwd = hr * Vector3.forward; fwd.y = 0f;
+            if (fwd.sqrMagnitude < 1e-6f) { fwd = hr * Vector3.up; fwd.y = 0f; } // looking straight up/down
+            if (fwd.sqrMagnitude < 1e-6f) fwd = Vector3.forward;
+            return Quaternion.LookRotation(fwd.normalized, Vector3.up);
         }
 
-        private static void CaptureOffset(Item it, Vector3 hp, Quaternion hr, Transform origin)
+        // Capture the prop's authored orientation relative to its (Main) camera, ONCE, before we start
+        // driving its transform — afterwards camera-relative is meaningless (we own its world rotation).
+        // This is the "readable face toward the viewer" base the waist tilt is applied on top of.
+        private static void CaptureReadable(Item it, Camera cam)
         {
-            Vector3 wp = it.Move.position;
-            Quaternion wr = it.Move.rotation;
-            var invH = Quaternion.Inverse(hr);
-            it.HeadOffPos = invH * (wp - hp);
-            it.HeadOffRot = invH * wr;
-            it.OriginOffPos = origin.InverseTransformPoint(wp);
-            it.OriginOffRot = Quaternion.Inverse(origin.rotation) * wr;
-            it.HasOffset = true;
+            Quaternion camRot = cam != null ? cam.transform.rotation : Quaternion.identity;
+            it.ReadableRot = Quaternion.Inverse(camRot) * it.Move.rotation;
+            it.HasReadable = true;
         }
 
         private bool TryGrab(int hand, Transform origin, Posef pose, VrInput input)
@@ -261,13 +277,15 @@ namespace IronNestVR
             Log.LogInfo($"[grab] {how}-grabbed '{it.Name}' ({(hand == 2 ? "right" : "left")}, {it.Mode}).");
         }
 
-        // A prop is grabbable unless it's a world manual that's inactive or mid pick-up/put-back ANIMATION
-        // (the game's coroutine owns the transform then — grabbing would fight the lerp). We DO allow
-        // grabbing while it's floated-up-to-read (isHeld && settled): PickUpZoomTarget has no Update, so
-        // once the move coroutine finishes nothing re-poses it — this is the state the user grabs it in.
-        private static bool Grabbable(Item it)
+        // A prop is grabbable unless it's the wrist watch (fixed to the wrist by design — except while you're
+        // calibrating it) or a world manual that's inactive or mid pick-up/put-back ANIMATION (the game's
+        // coroutine owns the transform then — grabbing would fight the lerp). We DO allow grabbing a manual
+        // while it's floated-up-to-read (isHeld && settled): PickUpZoomTarget has no Update, so once the move
+        // coroutine finishes nothing re-poses it — this is the state the user grabs it in.
+        private bool Grabbable(Item it)
         {
             if (it == null || it.Move == null) return false;
+            if (it.Mode == Mode.WristLocked && _calib != CalibTarget.Watch) return false; // watch only grabbable while calibrating it
             if (it.Zoom != null)
             {
                 if (!it.Move.gameObject.activeInHierarchy) return false;
@@ -285,77 +303,49 @@ namespace IronNestVR
             return it.Move != null ? it.Move.position : Vector3.zero;
         }
 
-        private void Release(CameraRig rig)
+        // Drop whatever's held. If we're calibrating the released prop, the spot it was placed becomes its new
+        // resting offset (saved to disk). Otherwise the waist clipboard returns to its holster next frame
+        // (DriveFollowers) and a world manual stays at the world pose it was released in.
+        private void Release(CameraRig rig, VrInput input)
         {
-            var origin = rig.OriginTransform;
-            if (_grabbed != null && _grabbed.Mode == Mode.HeadLocked && _grabbed.Move != null
-                && origin != null && rig.TryGetHeadPose(out var hp, out var hr))
+            if (_grabbed != null)
             {
-                CaptureOffset(_grabbed, hp, hr, origin); // remember the new spot in both frames
-                PersistPlacement(_grabbed);              // and save it to disk so it survives the session
+                if (_calib == CalibTarget.Clip && _grabbed == _hud) CaptureClipCalibration(rig);
+                else if (_calib == CalibTarget.Watch && _grabbed == _watch) CaptureWatchCalibration(rig, input);
+                Log.LogInfo($"[grab] released '{_grabbed.Name}'.");
             }
-            if (_grabbed != null) Log.LogInfo($"[grab] released '{_grabbed.Name}'.");
             _grabbed = null;
             _hand = 0;
         }
 
-        // ---------------- placement persistence (HUD clipboard + watch) ----------------
-
-        // Apply a previously-saved drag position to a freshly-discovered HUD prop so it re-appears where the
-        // player last left it (instead of the game's authored default). Both follow frames are restored;
-        // HasOffset=true makes DriveFollowers use them straight away and skip CaptureInitial.
-        private static void RestorePlacement(Item it, bool isClip)
+        // Recompute the waist offset + tilt from where the clipboard was just placed, expressed in the
+        // body-yaw anchor frame so it rests there relative to your body. The tilt is stored on top of the
+        // captured readable facing (rot = bodyYaw * Euler(tilt) * ReadableRot), inverting that relation.
+        private void CaptureClipCalibration(CameraRig rig)
         {
-            if (it == null) return;
-            bool saved = isClip ? Config.ClipPlacementSaved : Config.WatchPlacementSaved;
-            if (!saved) return;
-            if (isClip)
-            {
-                it.HeadOffPos = Config.ClipHeadOffPos; it.HeadOffRot = Quaternion.Euler(Config.ClipHeadOffEul);
-                it.OriginOffPos = Config.ClipOriginOffPos; it.OriginOffRot = Quaternion.Euler(Config.ClipOriginOffEul);
-            }
-            else
-            {
-                it.HeadOffPos = Config.WatchHeadOffPos; it.HeadOffRot = Quaternion.Euler(Config.WatchHeadOffEul);
-                it.OriginOffPos = Config.WatchOriginOffPos; it.OriginOffRot = Quaternion.Euler(Config.WatchOriginOffEul);
-            }
-            it.HasOffset = true;
-            Log.LogInfo($"[grab] restored saved placement for {it.Name}.");
-        }
-
-        // Mirror the just-captured offset into Config and write the settings file immediately (releases are
-        // user-paced, so a disk write here is fine). Only the two head-locked HUD props are persisted.
-        private void PersistPlacement(Item it)
-        {
-            bool isClip = it == _hud;
-            bool isWatch = it == _watch;
-            if (!isClip && !isWatch) return;
-            if (isClip)
-            {
-                Config.ClipHeadOffPos = it.HeadOffPos; Config.ClipHeadOffEul = it.HeadOffRot.eulerAngles;
-                Config.ClipOriginOffPos = it.OriginOffPos; Config.ClipOriginOffEul = it.OriginOffRot.eulerAngles;
-                Config.ClipPlacementSaved = true;
-            }
-            else
-            {
-                Config.WatchHeadOffPos = it.HeadOffPos; Config.WatchHeadOffEul = it.HeadOffRot.eulerAngles;
-                Config.WatchOriginOffPos = it.OriginOffPos; Config.WatchOriginOffEul = it.OriginOffRot.eulerAngles;
-                Config.WatchPlacementSaved = true;
-            }
-            try { Config.Save(); } catch (Exception e) { Log.LogWarning("[grab] save placement: " + e.Message); }
-            Log.LogInfo($"[grab] saved placement for {it.Name}.");
-        }
-
-        // Forget the saved HUD placements: clears the persisted flags and re-runs the authored default placement
-        // on the next frame. Exposed for a menu "Reset HUD Positions" action. NOTE: re-default works because the
-        // game re-creates the clipboard/watch at their authored pose on a scene/mission reload — so for an
-        // immediate reset in the current scene, drop & re-acquire (or reload) to pick the authored pose back up.
-        public void ResetHudPlacement()
-        {
-            Config.ClipPlacementSaved = false;
-            Config.WatchPlacementSaved = false;
+            if (_hud == null || _hud.Move == null || !rig.TryGetHeadPose(out var hp, out var hr)) return;
+            if (!_hud.HasReadable) CaptureReadable(_hud, Camera.main);
+            Quaternion invBody = Quaternion.Inverse(BodyYaw(hr));
+            Config.ClipWaistOffset = invBody * (_hud.Move.position - hp);
+            Config.ClipWaistEuler = (invBody * _hud.Move.rotation * Quaternion.Inverse(_hud.ReadableRot)).eulerAngles;
             try { Config.Save(); } catch { }
-            Log.LogInfo("[grab] HUD placements reset (clipboard + watch will use authored default on next (re)spawn).");
+            Log.LogInfo($"[grab] clipboard calibrated: offset={Config.ClipWaistOffset}, tilt={Config.ClipWaistEuler}.");
+        }
+
+        // Recompute the watch offset + orientation from where it was placed, expressed in the LEFT grip
+        // (wrist) frame, so it rides the wrist there. Needs the left controller tracked at release.
+        private void CaptureWatchCalibration(CameraRig rig, VrInput input)
+        {
+            if (_watch == null || _watch.Move == null) return;
+            var origin = rig.OriginTransform;
+            if (origin == null) return;
+            if (!input.GripValidL) { Log.LogWarning("[grab] watch calibrate skipped: left controller not tracked at release."); return; }
+            GetWorld(origin, input.GripPoseL, out var lwp, out var lwr);
+            Quaternion invL = Quaternion.Inverse(lwr);
+            Config.WatchWristOffset = invL * (_watch.Move.position - lwp);
+            Config.WatchWristEuler = (invL * _watch.Move.rotation).eulerAngles;
+            try { Config.Save(); } catch { }
+            Log.LogInfo($"[grab] watch calibrated: offset={Config.WatchWristOffset}, euler={Config.WatchWristEuler}.");
         }
 
         // ---------------- discovery ----------------
@@ -369,7 +359,7 @@ namespace IronNestVR
             var cam = Camera.main;
             Transform camT = cam != null ? cam.transform : null;
 
-            // Clipboards: HUD (holder under Main Camera) vs tutorial (everything else).
+            // Clipboards: HUD (holder under Main Camera → waist holster) vs world manuals (everything else).
             var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<ClipboardStateController>(), FindObjectsSortMode.None);
             if (arr != null)
             {
@@ -390,7 +380,7 @@ namespace IronNestVR
                             Name = hud ? "HUD clipboard" : ("tutorial clipboard '" + clip.name + "'"),
                             Move = move, Prox = clip,
                             Rend = move.GetComponentInChildren<Renderer>(true),
-                            Mode = hud ? Mode.HeadLocked : Mode.WorldLocked,
+                            Mode = hud ? Mode.WaistLocked : Mode.WorldLocked,
                             IsHudClip = hud
                         };
                         _items[id] = it;
@@ -400,14 +390,13 @@ namespace IronNestVR
                             _appliedScale = 1f;
                             if (!_fadersOff) { DisablePositionFaders(); _fadersOff = true; }
                             ReconcileScale();
-                            RestorePlacement(it, true);   // re-appear where you last dragged it (if saved)
                         }
                         Log.LogInfo($"[grab] tracking {it.Name} ({it.Mode}).");
                     }
                 }
             }
 
-            // Watch: the Main-Camera child whose name contains "Watch".
+            // Watch: the Main-Camera child whose name contains "Watch" → rides the LEFT wrist (not grabbable).
             if (camT != null)
             {
                 var watch = FindByNameContains(camT, "watch");
@@ -417,14 +406,13 @@ namespace IronNestVR
                     seen.Add(id);
                     if (!_items.ContainsKey(id))
                     {
-                        var it = new Item { Name = "watch '" + watch.name + "'", Move = watch, Prox = watch, Rend = watch.GetComponentInChildren<Renderer>(true), Mode = Mode.HeadLocked };
+                        var it = new Item { Name = "watch '" + watch.name + "'", Move = watch, Prox = watch, Rend = watch.GetComponentInChildren<Renderer>(true), Mode = Mode.WristLocked };
                         _items[id] = it;
                         _watch = it;
                         _appliedWatchScale = 1f;
                         DisableWatchAnimators(watch); // stop the wrist-raise Animator re-posing it each frame
                         ReconcileScale();
-                        RestorePlacement(it, false);  // re-appear where you last dragged it (if saved)
-                        Log.LogInfo($"[grab] tracking watch '{watch.name}' (HeadLocked).");
+                        Log.LogInfo($"[grab] tracking watch '{watch.name}' (WristLocked).");
                     }
                 }
             }
@@ -576,6 +564,15 @@ namespace IronNestVR
             rot = origin.rotation * lr;
         }
 
+        // Disarm calibration without changing offsets (called when the settings menu closes, like the hand
+        // Calibrate tool). The placed offset was already captured + saved on release.
+        public void CancelCalibrate()
+        {
+            if (_calib == CalibTarget.None) return;
+            _calib = CalibTarget.None;
+            try { Config.Save(); } catch { }
+        }
+
         public void Reset()
         {
             _items.Clear();
@@ -583,6 +580,7 @@ namespace IronNestVR
             _appliedScale = 1f; _appliedWatchScale = 1f; _fadersOff = false;
             _lastManualCount = -1;
             _nextScan = 0f;
+            _calib = CalibTarget.None;
         }
     }
 }
