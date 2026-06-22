@@ -18,6 +18,15 @@ namespace IronNestVR
         // How often (seconds) to emit a frame-rate / worst-frame line to the log.
         public const float PerfLogIntervalSec = 5f;
 
+        // --- Perf probe: CPU-vs-GPU bound diagnostic for the VR frame loop ---
+        // When on, wall-clock-times the VR frame loop and attributes each frame to (a) our CPU work,
+        // (b) time BLOCKED in the OpenXR runtime waits (xrWaitFrame / xrWaitSwapchainImage / xrEndFrame =
+        // parked on the compositor/GPU), and (c) the residual (Unity's own render phase + present). Logs a
+        // [probe] verdict every PerfProbeIntervalSec. Pure Stopwatch timing, no GPU queries; the VR loop
+        // never runs in flatscreen so parity is untouched. Off = inert. See PerfProbe.
+        public static bool PerfProbe = true;
+        public static float PerfProbeIntervalSec = 3f;
+
         // How often (seconds) to retry OpenXR init while no headset/runtime is available yet.
         public const float XrRetryIntervalSec = 5f;
 
@@ -290,6 +299,15 @@ namespace IronNestVR
         // 8-bit anyway, so inheriting HDR only cost intermediate-buffer bandwidth for no in-headset gain.
         // Force-off is a free win on weak GPUs; set true to match the game's HDR if you ever see banding.
         public static bool EyeAllowHDR = false;
+
+        // While VR is active, stop the DESKTOP MIRROR (the game's Camera.main, rendered to the monitor
+        // window) from drawing the scene — set its cullingMask to 0 so it submits zero draws. The headset
+        // is unaffected: the eye cameras have their own captured cullingMask + RenderTextures. The probe
+        // shows the VR frame is ~100% render-phase and resolution-INDEPENDENT (draw submission, not fill),
+        // and the scene is rendered 3x/frame (mirror + 2 eyes), so dropping a whole 3rd scene render is the
+        // single highest-value lever. The monitor shows an empty window while in VR. VR-only (never touched
+        // in flatscreen → parity intact). Set false to keep a live spectator mirror on the monitor.
+        public static bool DisableDesktopMirror = true;
 
         // --- Diagnostics / quick toggles for live tuning ---
         // Phase 2.5 isolation: render each eye as a flat clear color (no scene) to prove the
@@ -729,6 +747,9 @@ namespace IronNestVR
                 case "ClipboardScale": ClipboardScale = PF(v, ClipboardScale); break;
                 case "WatchScale": WatchScale = PF(v, WatchScale); break;
                 case "RenderScale": RenderScale = PF(v, RenderScale); RenderScaleExplicit = true; break;
+                case "PerfProbe": PerfProbe = PB(v, PerfProbe); break;
+                case "PerfProbeIntervalSec": PerfProbeIntervalSec = PF(v, PerfProbeIntervalSec); break;
+                case "DisableDesktopMirror": DisableDesktopMirror = PB(v, DisableDesktopMirror); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;

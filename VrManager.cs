@@ -210,8 +210,37 @@ namespace IronNestVR
             Config.AutoTuneRenderScale();
         }
 
+        private bool _mirrorBlanked;
+        private int _mirrorSavedMask;
+        // Blank the desktop mirror (Camera.main) while VR is active: it's a full 3rd scene render the
+        // headset user never sees. Setting cullingMask=0 keeps the camera ENABLED — so Camera.main still
+        // resolves and the rig keeps reading its transform — but it submits no draws. Only after the eye
+        // cameras exist: they copy main.cullingMask at creation (EnsureCameras), so zeroing it earlier would
+        // blank the headset too. Re-asserted each frame (the game may reset the mask on a scene change).
+        // Restored in TeardownVr. VR-only → flatscreen rendering is never touched.
+        private void ApplyDesktopMirror()
+        {
+            var main = Camera.main;
+            if (!Config.DisableDesktopMirror)
+            {
+                if (_mirrorBlanked && main != null) main.cullingMask = _mirrorSavedMask;
+                _mirrorBlanked = false;
+                return;
+            }
+            if (main == null || _rig == null || !_rig.Ready) return; // wait until the eyes captured the real mask
+            if (!_mirrorBlanked)
+            {
+                _mirrorSavedMask = main.cullingMask;
+                _mirrorBlanked = true;
+                Log.LogInfo($"[perf] desktop mirror blanked while in VR (saved cullingMask 0x{_mirrorSavedMask:X}). " +
+                            "Set DisableDesktopMirror=false in IronNestVR.cfg to keep a monitor spectator view.");
+            }
+            if (main.cullingMask != 0) main.cullingMask = 0;
+        }
+
         private void Update()
         {
+            PerfProbe.UpdateBegin();
             LogEnvironmentOnce();
             AutoTuneOnce();
             PerfTick();
@@ -278,6 +307,7 @@ namespace IronNestVR
             // --- VR frame loop (canonical OpenXR order) ---
             try
             {
+                PerfProbe.FrameBegin();
                 Dbg.Beat("poll");
                 _xr.PollEvents();
                 if (_xr.ExitRequested) { Log.LogWarning("OpenXR requested exit; tearing down VR."); TeardownVr(); return; }
@@ -299,6 +329,10 @@ namespace IronNestVR
                 // shouldn't render (dashboard up / headset off) — otherwise they keep rendering every Unity
                 // frame for nothing. No-op in render-request mode.
                 _rig.SetEyeCamerasEnabled(shouldRender);
+
+                // Blank the wasted full-res desktop mirror render while in VR (cullingMask=0). Runs after the
+                // eyes exist (gated inside) so the headset keeps the real mask. The single biggest GPU/draw win.
+                ApplyDesktopMirror();
 
                 // Runtime-failure fallback. A present-but-broken runtime (e.g. headset not actually streaming)
                 // makes xrWaitFrame block for seconds and return an error EVERY frame — the game freezes at
@@ -416,6 +450,8 @@ namespace IronNestVR
                     _nextPoseLog = Time.unscaledTime + Config.PoseLogIntervalSec;
                     LogHeadPose();
                 }
+
+                PerfProbe.FrameEnd(Time.unscaledDeltaTime);
             }
             catch (Exception e)
             {

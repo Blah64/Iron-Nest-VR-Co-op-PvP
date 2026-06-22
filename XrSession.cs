@@ -285,7 +285,9 @@ namespace IronNestVR
             if (tr) Dbg.Step("WaitFrame >>");
             var fwi = new FrameWaitInfo { Type = StructureType.TypeFrameWaitInfo };
             var fs = new FrameState { Type = StructureType.TypeFrameState };
+            PerfProbe.WaitStart();
             var wfr = _xr.WaitFrame(_session, &fwi, &fs);
+            PerfProbe.WaitStop();
             LastWaitResult = wfr;
             if (wfr != Result.Success) { WarnRc("xrWaitFrame", wfr); return false; }
             if (tr) Dbg.Step("WaitFrame <<");
@@ -342,7 +344,9 @@ namespace IronNestVR
                 LayerCount = layerCount,
                 Layers = layers
             };
+            PerfProbe.WaitStart();
             var efr = _xr.EndFrame(_session, &fei);
+            PerfProbe.WaitStop();
             if (efr != Result.Success) WarnRc("xrEndFrame", efr);
         }
 
@@ -439,6 +443,7 @@ namespace IronNestVR
             // sc==Zero guard); that only happens if the runtime is already wedged, and it's logged loudly.
             var wi = new SwapchainImageWaitInfo { Type = StructureType.TypeSwapchainImageWaitInfo, Timeout = WaitTimeoutNs };
             Result wr = Result.TimeoutExpired;
+            PerfProbe.WaitStart();
             for (int t = 0; t < WaitMaxTries; t++)
             {
                 if (tr) Dbg.Step($"  acq{eye}: idx={idx} WaitSwapchainImage(try {t}, 1s)");
@@ -446,6 +451,7 @@ namespace IronNestVR
                 if (wr != Result.TimeoutExpired) break;
                 Dbg.Beat($"eye{eye} wait TIMEOUT (try {t})");
             }
+            PerfProbe.WaitStop();
             if (tr) Dbg.Step($"  acq{eye}: wait result={wr}");
             if (wr != Result.Success) { WarnRc($"xrWaitSwapchainImage(eye{eye})", wr); return IntPtr.Zero; }
             return _imageTex[eye][idx];

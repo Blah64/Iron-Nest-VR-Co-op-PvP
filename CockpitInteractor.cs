@@ -68,6 +68,13 @@ namespace IronNestVR
         private readonly Dictionary<int, Camera> _origCanvasCam = new Dictionary<int, Camera>();
         private int _mapObjCount = -1;
 
+        // Teleprinter (fire-mission line selector): its hit-test camera is the flat Main Camera out of the box,
+        // so the hovered line is projected from the head gaze (stuck on a default/last line) instead of the
+        // laser. Retarget hitTestCamera to our pointer cam, same as the map placer. Originals per instance id.
+        private readonly Dictionary<int, TeleprinterLineRangeSelector3D> _teleprinters = new Dictionary<int, TeleprinterLineRangeSelector3D>();
+        private readonly Dictionary<int, Camera> _origTeleCam = new Dictionary<int, Camera>();
+        private int _teleCount = -1;
+
         /// <param name="active">true only when the session is focused and input is ready.</param>
         /// <param name="suppressClick">true while the VR settings menu owns the trigger: keep the
         /// laser/hover alive but don't synthesize clicks/keys into the game.</param>
@@ -122,6 +129,7 @@ namespace IronNestVR
                     _nextRepoint = Time.unscaledTime + 0.5f;
                     RepointInteractionCameras(activeCam);
                     RepointMapCameras(activeCam);
+                    RepointTeleprinters(activeCam);
                 }
 
                 // Menus flip the cursor manager to FreeMouse (cursor follows the OS mouse, off-centre),
@@ -213,6 +221,7 @@ namespace IronNestVR
             _mgr.maxRayDistance = Mathf.Max(_origMaxDist, Config.LaserMaxDistance);
             RepointInteractionCameras(_cam);
             RepointMapCameras(_cam);
+            RepointTeleprinters(_cam);
             _engaged = true;
             Log.LogInfo($"[interact] ENGAGED (origCam={(_origCam != null ? _origCam.name : "null")}, origMode={_origMode}).");
         }
@@ -305,6 +314,50 @@ namespace IronNestVR
                 _mapObjCount = found;
                 Log.LogInfo($"[map] VR map repoint: {_placers.Count} placer(s), {_mapCanvases.Count} canvas(es) on controller cam.");
             }
+        }
+
+        // Point the teleprinter's line hit-test camera down our controller. The teleprinter reads the cursor
+        // manager's (centre-pinned) SCREEN position and projects it through hitTestCamera onto its 3D printout to
+        // decide which line is hovered; out of the box that camera is the flat Main Camera, so the selection
+        // tracks the head — it sticks on a default/last line and a click "sends" only that. Retarget hitTestCamera
+        // to our pointer cam (and pin its cursor manager to centre) so the hovered line — and the click-drag
+        // range — follow the laser. Originals captured per instance id, restored on disengage.
+        private void RepointTeleprinters(Camera cam)
+        {
+            int found = 0;
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<TeleprinterLineRangeSelector3D>(), FindObjectsSortMode.None);
+                if (arr != null)
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        var tp = arr[i].TryCast<TeleprinterLineRangeSelector3D>();
+                        if (tp == null) continue;
+                        int id = tp.GetInstanceID();
+                        _teleprinters[id] = tp;
+                        found++;
+                        try { if (!_origTeleCam.ContainsKey(id)) _origTeleCam[id] = tp.hitTestCamera; if (tp.hitTestCamera != cam) tp.hitTestCamera = cam; } catch { }
+                        try { var m = tp.cursorManager; if (m != null) PinCursor(m.virtualCursor); } catch { }
+                    }
+            }
+            catch (Exception e) { Log.LogWarning("[teleprinter] repoint: " + e.Message); }
+
+            if (found != _teleCount)
+            {
+                _teleCount = found;
+                Log.LogInfo($"[teleprinter] VR hit-test repoint: {found} selector(s) on controller cam.");
+            }
+        }
+
+        private void RestoreTeleprinters()
+        {
+            foreach (var kv in _teleprinters)
+            {
+                var tp = kv.Value;
+                if (tp == null) continue;
+                try { if (_origTeleCam.TryGetValue(kv.Key, out var c)) tp.hitTestCamera = c; } catch { }
+            }
+            _teleprinters.Clear(); _origTeleCam.Clear(); _teleCount = -1;
         }
 
         // Only world-space canvases are safe to re-aim: their event camera affects input projection, not
@@ -453,6 +506,7 @@ namespace IronNestVR
             {
                 EndAllInput();
                 RestoreMapCameras();
+                RestoreTeleprinters();
                 var restoreCam = _origCam != null ? _origCam : Camera.main;
                 if (_mgr != null)
                 {
