@@ -129,6 +129,12 @@ namespace IronNestVR
                 var oc = AccessTools.Method(typeof(PunchcardRuntime), "OnCardUsed");
                 if (oc != null) { _harmony.Patch(oc, prefix: new HarmonyMethod(typeof(CoopPunchcards), nameof(CoopPunchcards.OnCardUsedPre)), postfix: new HarmonyMethod(typeof(CoopPunchcards), nameof(CoopPunchcards.OnCardUsedPost))); Log.LogInfo("[sim] punchcard consume capture patched (PunchcardRuntime.OnCardUsed pre/post)"); }
                 else Log.LogWarning("[sim] PunchcardRuntime.OnCardUsed not found — punchcard consume won't sync");
+
+                // The validator's synchronous success/fail verdict — lets RunRedeem report the true outcome (point/use
+                // changes are coroutine-delayed). Diagnostic only; no behaviour change.
+                var ft = AccessTools.Method(typeof(RequisitionSlot), "FireRequisitionTrigger");
+                if (ft != null) { _harmony.Patch(ft, postfix: new HarmonyMethod(typeof(CoopPunchcards), nameof(CoopPunchcards.OnRequisitionTrigger))); Log.LogInfo("[sim] punchcard redeem-verdict capture patched (RequisitionSlot.FireRequisitionTrigger)"); }
+                else Log.LogWarning("[sim] RequisitionSlot.FireRequisitionTrigger not found — redeem success signal degraded");
             }
             catch (Exception e) { Log.LogWarning("[sim] punchcard redeem patch: " + e.Message); }
 

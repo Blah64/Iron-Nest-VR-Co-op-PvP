@@ -59,6 +59,13 @@ namespace IronNestVR
         public const byte MSG_PUNCH_POS     = 34;   // owner->peer:  [t][cardKey i32][pos 3f][rot 4f]              unreliable stream while held
         public const byte MSG_PUNCH_PLACE   = 35;   // owner->peer:  [t][cardKey i32][pos 3f][rot 4f][inReqSlot u8] reliable  final drop (+ slot state)
         public const byte MSG_PUNCH_CONSUME = 36;   // host->client: [t][cardId str]                              reliable   authoritative "this card was redeemed — drop yours"
+        public const byte MSG_PUNCH_GRAPH   = 37;   // host->client: [t][cardId str][varCount i32]( var )*        reliable   "host redeemed this — run the card graph locally (visual result + own bookkeeping)"
+        public const byte MSG_PUNCH_DIAL    = 38;   // either->peer: [t][key i32][value f32]                     unreliable stream / reliable on release — live recon-dial turn
+        //   key = Fnv(console-relative path) — addresses ANY of the requisition console's dials (the two Grid-Location
+        //   .Range Dials + gross/fine bearing), collision-free. Synced HERE, not via CoopControls (their full path-hash
+        //   collides with the gun's same-named targeting dials). value = dial.AccumulatedValue; receiver SetDialValue()s
+        //   it (moves value + knob) and fires OnValueChanged (drives bridge→odometer / Coordinate variable). Last-writer-
+        //   wins (either player may turn; whoever moved last is what both see), matching the card-submit value capture.
 
         private const int GridNull = int.MinValue;   // sentinel: VariableCoordinate was null
         private const float StaleSec = 2f;            // remote ownership lease (matches CoopMap)
@@ -68,11 +75,28 @@ namespace IronNestVR
         private static bool _applyingRemote;
         // true while a CLIENT applies a host MSG_PUNCH_CONSUME (so the resulting OnCardUsed doesn't re-broadcast).
         private static bool _consumingMirror;
+        // captures RequisitionSlot.FireRequisitionTrigger(success) — the validator's authoritative, SYNCHRONOUS
+        // success/fail signal (point-spend + use-decrement happen later in coroutines, so they can't be polled
+        // right after AttemptRequisition returns). RunRedeem resets _lastTriggerSet before the call, reads after.
+        private static bool _lastTriggerSet;
+        private static bool _lastTrigger;
+
+        // RESULT replication (MSG_PUNCH_GRAPH): the host stages the card + authoritative vars for the redeem it is
+        // ABOUT to run (set in OnAttemptRequisition for its own redeem, or in RunRedeem for a forwarded one), then
+        // broadcasts them from OnRequisitionTrigger when the validator confirms success — so clients run the same
+        // graph locally. Set→consumed synchronously within one AttemptRequisition call, so no cross-redeem race.
+        private static bool _pgActive;
+        private static string _pgCardId;
+        private static List<VarSnap> _pgVars;
+
+        // --- live recon-dial sync (MSG_PUNCH_DIAL) — registry built in ResolveConsoleDials ---
+        private static float _nextDialSend;
+        private static int _sentDial, _ranDial;
 
         private static string _lastDeckSig;          // host: last-broadcast deck signature (re-send only on change)
         private static float _nextPoll;
         private static List<DeckEntry> _pendingDeck;  // client: a host deck received before our console was ready
-        private static int _sentDeck, _appliedDeck, _sentRedeem, _ranRedeem, _sentConsume, _ranConsume;
+        private static int _sentDeck, _appliedDeck, _sentRedeem, _ranRedeem, _sentConsume, _ranConsume, _sentGraph, _ranGraph;
 
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
@@ -129,6 +153,9 @@ namespace IronNestVR
             EnsureCards();
             DrainPendingPoses();   // apply any PLACEs that arrived before their card registered
             TickMovement();        // grab / own / stream / release — shared pool, either player may drive a card
+            DialSyncTick();        // live recon dial turning (bearing/distance) — collision-free, both directions
+            ReconWatchTick();      // DIAGNOSTIC: sample scene state after a recon redeem to find the reveal mechanism
+            DialProbeTick();       // DIAGNOSTIC: dump dial→bridge→odometer→variable chain to find where value sync breaks
 
             // Deck-composition (uses) overlay — dormant unless CoopPunchcardDeckSync (the catalog already matches;
             // uses only diverge through redemption, which is deferred). Kept wired for the redemption layer.
@@ -521,7 +548,16 @@ namespace IronNestVR
                 if (_applyingRemote) return true;                 // host running a client's intent — run for real
                 if (!Config.CoopPunchcardSync || !Config.CoopPunchcardRedeemSync) return true;
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer) return true;   // solo — stock behavior
-                if (CoopP2P.IsHost) return true;                  // host is authoritative — runs locally
+                if (CoopP2P.IsHost)
+                {
+                    var ownCard = SafeCurrentCard(__instance);
+                    try { ArmReconWatch(ownCard, "host-own"); } catch { }
+                    // Stage this redeem for result replication: capture the card + the host's live (dialed) vars now,
+                    // so OnRequisitionTrigger can broadcast MSG_PUNCH_GRAPH when the game's AttemptRequisition (about
+                    // to run, since we return true) confirms success. CaptureVariables reads the host's own console.
+                    try { StagePendingGraph(ownCard, CaptureVariables()); } catch { }
+                    return true;   // host is authoritative — runs locally
+                }
 
                 // CLIENT: capture the card + the player's chosen variables, send the intent to the host, skip the
                 // local run. Card stays in the slot until the host's MSG_PUNCH_CONSUME confirms success.
@@ -530,6 +566,7 @@ namespace IronNestVR
                 string id = null; try { id = card.CurrentDefinition != null ? card.CurrentDefinition.ID : null; } catch { }
                 if (string.IsNullOrEmpty(id)) return true;
 
+                ArmReconWatch(card, "client-local");
                 var vars = CaptureVariables();
                 SendRedeem(id, vars);
                 Log.LogInfo($"[punch] client redeem intent '{id}' -> host ({vars.Count} var(s)); awaiting host consume");
@@ -557,6 +594,11 @@ namespace IronNestVR
                 if (!Config.CoopPunchcardSync || !Config.CoopPunchcardRedeemSync) return;
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer) return;
                 if (!CoopP2P.IsHost) return;                      // only the host issues authoritative consumes
+                // When RESULT replication is on, the client runs the FULL redeem locally (MSG_PUNCH_GRAPH) and thus
+                // consumes its OWN card + decrements its OWN use — a consume here would double-decrement it. The
+                // graph broadcast (OnRequisitionTrigger) is the lockstep signal instead. Only fall back to consume
+                // when result replication is disabled.
+                if (Config.CoopPunchcardResultSync) return;
                 if (string.IsNullOrEmpty(__state)) return;
                 SendConsume(__state);
             }
@@ -654,6 +696,32 @@ namespace IronNestVR
             _sentRedeem++;
         }
 
+        // Host->clients: "I redeemed this card with these authoritative params — run its graph locally." Same var
+        // wire format as MSG_PUNCH_REDEEM (different type byte), so OnGraphPacket reuses the redeem parse.
+        private static void SendGraph(string cardId, List<VarSnap> vars)
+        {
+            if (!EnsureBuf()) return;
+            vars ??= new List<VarSnap>();
+            int o = 0; _buf[o++] = MSG_PUNCH_GRAPH;
+            o = PutStr(o, cardId);
+            o = PutInt(o, vars.Count);
+            for (int i = 0; i < vars.Count; i++)
+            {
+                var v = vars[i];
+                o = PutStr(o, v.Id);
+                o = PutInt(o, v.Type);
+                o = PutInt(o, v.I);
+                o = PutF(o, v.F);
+                _buf[o++] = (byte)(v.B ? 1 : 0);
+                o = PutInt(o, v.GridLoc); o = PutInt(o, v.GridX); o = PutInt(o, v.GridY);
+                o = PutInt(o, v.Shell);
+                o = PutStr(o, v.Text);
+            }
+            CoopP2P.Send(_buf, o, true);
+            _sentGraph++;
+            Log.LogInfo($"[punch] graph -> clients '{cardId}' ({vars.Count} var(s)) — run result locally");
+        }
+
         // ================= (B) REDEMPTION — host runs it =================
 
         private static void OnRedeemPacket(Il2CppStructArray<byte> a, int len)
@@ -691,40 +759,579 @@ namespace IronNestVR
                 var mgr = Mgr();
                 if (mgr == null) { Log.LogWarning($"[punch] client wants '{cardId}' but host has no requisition console"); return; }
 
-                ApplyVariables(vars);
-
                 var card = FindDeckCard(mgr, cardId);
                 if (card == null) { Log.LogWarning($"[punch] host has no deck card '{cardId}' to run (deck out of sync?)"); return; }
+                ArmReconWatch(card, "host-forwarded");
 
                 RequisitionSlot slot = null; try { slot = mgr.RequisitionSlot; } catch { }
                 if (slot == null) { Log.LogWarning("[punch] host console has no RequisitionSlot"); return; }
 
                 // Diagnostic pre-state: AttemptRequisition is void + validates silently, so capture the inputs that
                 // can make it reject (cost vs the host's points, remaining uses) to reveal WHY a redeem produced nothing.
-                int cost = -1, usesBefore = -1, maxUses = -1, points = -1;
+                int cost = -1, usesBefore = -1, maxUses = -1, pointsBefore = -1;
                 try { var d = card.CurrentDefinition; if (d != null) { cost = d.Cost; usesBefore = d.RemainingUses; maxUses = d.MaxUses; } } catch { }
-                try { var mm = MissionManager.Instance; if (mm != null) { var st = mm.SaveOperationState(); if (st != null) points = st.RequisitionPoints; } } catch { }
+                try { var mm = MissionManager.Instance; if (mm != null) { var st = mm.SaveOperationState(); if (st != null) pointsBefore = st.RequisitionPoints; } } catch { }
 
+                _lastTriggerSet = false; _lastTrigger = false;
                 _applyingRemote = true;
                 try
                 {
-                    try { if (slot.HasCard) slot.ClearSlot(); } catch { }
-                    try { slot.PlaceCard(card); } catch (Exception e) { Log.LogWarning("[punch] place: " + e.Message); }
+                    // ORDER MATTERS. PlaceCard respawns the card's console-control prefab, which RESETS its
+                    // PunchcardVariables to defaults. The old order (apply vars -> place -> attempt) let the place
+                    // wipe the client's recon target, so AttemptRequisition validated against defaults and rejected
+                    // silently. So: (1) ensure the card is in the slot WITHOUT a needless re-place (the movement
+                    // layer usually already mirrored it there), (2) apply the client's vars onto the LIVE controls,
+                    // (3) read them back to prove they're set, (4) attempt.
+                    bool already = false; try { already = slot.HasCard && slot.CurrentCard == card; } catch { }
+                    if (!already)
+                    {
+                        try { if (slot.HasCard) slot.ClearSlot(); } catch { }
+                        try { slot.PlaceCard(card); } catch (Exception e) { Log.LogWarning("[punch] place: " + e.Message); }
+                    }
+
+                    ApplyVariables(vars);
+                    LogLiveVars(vars);
+
+                    // Stage for result replication: if this forwarded redeem succeeds, OnRequisitionTrigger broadcasts
+                    // MSG_PUNCH_GRAPH(cardId, vars) so the submitting client (and any other client) runs the same graph.
+                    StagePendingGraph(card, vars);
+
                     try { slot.AttemptRequisition(); } catch (Exception e) { Log.LogWarning("[punch] run: " + e.Message); }
                 }
                 finally { _applyingRemote = false; }
 
                 int usesAfter = usesBefore; try { var d = card.CurrentDefinition; if (d != null) usesAfter = d.RemainingUses; } catch { }
+                int pointsAfter = pointsBefore; try { var mm = MissionManager.Instance; if (mm != null) { var st = mm.SaveOperationState(); if (st != null) pointsAfter = st.RequisitionPoints; } } catch { }
                 bool stillHeld = false; try { stillHeld = slot.HasCard && slot.CurrentCard == card; } catch { }
-                bool succeeded = (usesBefore < 0 ? false : usesAfter < usesBefore) || !stillHeld;
+                // Prefer the validator's own FireRequisitionTrigger(success) signal; fall back to observable side
+                // effects (uses/points/eject) only if it never fired. Point-spend + use-decrement are coroutine-
+                // driven so they usually lag this synchronous read — the trigger is the reliable signal.
+                bool succeeded = _lastTriggerSet ? _lastTrigger
+                               : ((usesBefore >= 0 && usesAfter < usesBefore) || (pointsBefore >= 0 && pointsAfter < pointsBefore) || !stillHeld);
 
                 _ranRedeem++;
                 _lastDeckSig = null;   // force a deck re-broadcast next poll so the client mirrors the consumed use
-                Log.LogInfo($"[punch] host ran '{cardId}': success={succeeded} cost={cost} uses {usesBefore}->{usesAfter}/{maxUses} hostPoints={points} stillHeld={stillHeld} ({vars.Count} var)");
+                Log.LogInfo($"[punch] host ran '{cardId}': success={succeeded} trigger={(_lastTriggerSet ? _lastTrigger.ToString() : "n/a")} cost={cost} uses {usesBefore}->{usesAfter}/{maxUses} points {pointsBefore}->{pointsAfter} stillHeld={stillHeld} ({vars.Count} var)");
                 if (!succeeded)
-                    Log.LogWarning($"[punch] REDEEM REJECTED on host for '{cardId}' — cost={cost} vs hostPoints={points}, remainingUses={usesBefore}. The host runs redemptions authoritatively, so the HOST must have the points/uses (shared-pool resources aren't host-synced mid-mission yet).");
+                    Log.LogWarning($"[punch] REDEEM REJECTED on host for '{cardId}' — validator said no. uses={usesBefore}/{maxUses} (MaxUses=0 means unlimited) points={pointsBefore} cost={cost}. If the LIVE var readback above shows the recon target set, the requirement needs something the intent doesn't carry (e.g. a map selection, not a PunchcardVariable).");
             }
             catch (Exception e) { Log.LogWarning("[punch] run redeem: " + e.Message); }
+        }
+
+        // ================= (B) RESULT — client runs the graph locally =================
+
+        private static void OnGraphPacket(Il2CppStructArray<byte> a, int len)
+        {
+            if (CoopP2P.IsHost) return;                       // clients run the visual; the host already did its own
+            if (!Config.CoopPunchcardSync || !Config.CoopPunchcardRedeemSync || !Config.CoopPunchcardResultSync) return;
+            int o = 1;
+            string cardId = GetStr(a, ref o, len);
+            if (string.IsNullOrEmpty(cardId)) return;
+            if (o + 4 > len) return;
+            int vc = GetInt(a, ref o);
+            if (vc < 0 || vc > 64) return;
+
+            var vars = new List<VarSnap>(vc);
+            for (int i = 0; i < vc; i++)
+            {
+                var v = new VarSnap();
+                v.Id = GetStr(a, ref o, len); if (v.Id == null) break;
+                if (o + 4 > len) break; v.Type = GetInt(a, ref o);
+                if (o + 4 > len) break; v.I = GetInt(a, ref o);
+                if (o + 4 > len) break; v.F = GetF(a, ref o);
+                if (o + 1 > len) break; v.B = a[o++] != 0;
+                if (o + 12 > len) break; v.GridLoc = GetInt(a, ref o); v.GridX = GetInt(a, ref o); v.GridY = GetInt(a, ref o);
+                if (o + 4 > len) break; v.Shell = GetInt(a, ref o);
+                v.Text = GetStr(a, ref o, len) ?? "";
+                vars.Add(v);
+            }
+
+            RunGraphLocal(cardId, vars);
+        }
+
+        // Client: reproduce the host's redemption RESULT locally. Run the FULL redeem (place card -> apply the
+        // authoritative vars -> AttemptRequisition) exactly like the host's RunRedeem — so the card's PunchcardGraph
+        // executes in game-native order and the recon photo / scout flyby / reveal all appear on THIS machine,
+        // operating on its own (host-mirrored) entities. The client's enemy-spawn node stays gated (no duplicate
+        // entities; the host's authored ones arrive via CoopEntities); only the local visual + reveal run here.
+        // _applyingRemote makes our OWN AttemptRequisition prefix pass through (no re-forward to the host). The client
+        // consumes its own card + decrements its own use as part of this run, so the host suppresses MSG_PUNCH_CONSUME.
+        private static void RunGraphLocal(string cardId, List<VarSnap> vars)
+        {
+            try
+            {
+                var mgr = Mgr();
+                if (mgr == null) { Log.LogWarning($"[punch] graph: no requisition console for '{cardId}'"); return; }
+                var card = FindDeckCard(mgr, cardId);
+                if (card == null) { Log.LogWarning($"[punch] graph: no local deck card '{cardId}' (deck out of sync?)"); return; }
+                var slot = SafeReqSlot(mgr);
+                if (slot == null) { Log.LogWarning("[punch] graph: console has no RequisitionSlot"); return; }
+
+                ArmReconWatch(card, "client-result");
+
+                _lastTriggerSet = false; _lastTrigger = false;
+                _applyingRemote = true;
+                try
+                {
+                    bool already = false; try { already = slot.HasCard && slot.CurrentCard == card; } catch { }
+                    if (!already)
+                    {
+                        try { if (slot.HasCard) slot.ClearSlot(); } catch { }
+                        try { slot.PlaceCard(card); } catch (Exception e) { Log.LogWarning("[punch] graph place: " + e.Message); }
+                    }
+                    ApplyVariables(vars);
+                    try { slot.AttemptRequisition(); } catch (Exception e) { Log.LogWarning("[punch] graph run: " + e.Message); }
+                }
+                finally { _applyingRemote = false; }
+
+                bool ok = _lastTriggerSet && _lastTrigger;
+                _ranGraph++;
+                Log.LogInfo($"[punch] client ran result for '{cardId}' locally: trigger={(_lastTriggerSet ? _lastTrigger.ToString() : "n/a")} ({vars.Count} var)");
+
+                // Safety net: if the client's local redeem did NOT fire success (a requirement the client's scene
+                // can't satisfy), the card was not consumed locally — drop it manually so the deck stays in lockstep
+                // with the host (which DID redeem). Guarded so the resulting OnCardUsed doesn't echo a consume.
+                if (!ok)
+                {
+                    Log.LogWarning($"[punch] client result for '{cardId}' did not fire success — reconciling card bookkeeping to match host");
+                    _consumingMirror = true;
+                    try
+                    {
+                        try { if (slot.HasCard && slot.CurrentCard == card) slot.ClearSlot(); } catch { }
+                        try { card.OnCardUsed(0f); } catch (Exception e) { Log.LogWarning("[punch] graph reconcile: " + e.Message); }
+                    }
+                    finally { _consumingMirror = false; }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[punch] run graph local: " + e.Message); }
+        }
+
+        // ================= (B) live recon-dial sync =================
+        // The requisition console's coordinate input is FOUR dials (two Grid-Location .Range Dials + gross/fine bearing),
+        // not just the one the DialOdometerPunchcardBridge references. CoopControls EXCLUDES every console dial (their
+        // path-hash collides with the gun's same-named targeting dials), so we sync ALL of them here — keyed by
+        // CONSOLE-RELATIVE path (unique per dial under this root, collision-free) and applied with SetDialValue (the
+        // proven setter: the audit showed SetAccumulatedValueUnlimited does nothing, SetDialValue moves value + knob).
+        // Firing OnValueChanged after the set drives the wired effect (bridge → odometer for bearing; the Coordinate
+        // PunchcardVariable for the grid dials). Last-writer-wins, both directions.
+        private sealed class ReconDial { public int Key; public DialInteractable D; public bool PrevDrag; public float SuppressUntil; }
+        private static readonly Dictionary<int, ReconDial> _consoleDials = new Dictionary<int, ReconDial>();
+        private static float _nextConsoleScan;
+
+        private static void ResolveConsoleDials()
+        {
+            float now = Time.unscaledTime;
+            if (_consoleDials.Count > 0 && now < _nextConsoleScan) return;
+            _nextConsoleScan = now + 3f;
+            Transform root = null;
+            try { var mgr = Mgr(); root = mgr != null ? mgr.transform : null; } catch { }
+            if (root == null) { _consoleDials.Clear(); return; }
+            _consoleDials.Clear();
+            try { CollectConsoleDials(root, ""); } catch (Exception e) { Log.LogWarning("[punch] console dials: " + e.Message); }
+        }
+
+        private static void CollectConsoleDials(Transform t, string prefix)
+        {
+            int n = 0; try { n = t.childCount; } catch { return; }
+            for (int i = 0; i < n; i++)
+            {
+                Transform c = null; try { c = t.GetChild(i); } catch { continue; }
+                if (c == null) continue;
+                string nm = "?"; try { nm = c.name; } catch { }
+                string rp = prefix.Length == 0 ? nm : prefix + "/" + nm;
+                DialInteractable d = null; try { d = c.GetComponent<DialInteractable>(); } catch { }
+                if (d != null) { int key = Fnv(rp); if (!_consoleDials.ContainsKey(key)) _consoleDials[key] = new ReconDial { Key = key, D = d }; }
+                CollectConsoleDials(c, rp);
+            }
+        }
+
+        private static void DialSyncTick()
+        {
+            ResolveConsoleDials();
+            if (_consoleDials.Count == 0) return;
+            float now = Time.unscaledTime;
+            bool sendNow = Config.CoopSendHz <= 0f || now >= _nextDialSend;
+            if (sendNow && Config.CoopSendHz > 0f) _nextDialSend = now + 1f / Config.CoopSendHz;
+
+            foreach (var rd in _consoleDials.Values)
+            {
+                if (rd.D == null) continue;
+                bool dragging = false; try { dragging = rd.D.isDragging; } catch { }
+                if (now >= rd.SuppressUntil)   // skip while we're settling a freshly-applied peer turn
+                {
+                    if (dragging && sendNow) SendDial(rd, false);
+                    else if (!dragging && rd.PrevDrag) SendDial(rd, true);   // release edge — reliable final
+                }
+                rd.PrevDrag = dragging;
+            }
+        }
+
+        private static void SendDial(ReconDial rd, bool reliable)
+        {
+            if (!EnsureBuf()) return;
+            float v; try { v = rd.D.AccumulatedValue; } catch { return; }
+            if (!Finite(v)) return;
+            int o = 0; _buf[o++] = MSG_PUNCH_DIAL; o = PutInt(o, rd.Key); o = PutF(o, v);
+            CoopP2P.Send(_buf, o, reliable);
+            _sentDial++;
+        }
+
+        private static void OnDialPacket(Il2CppStructArray<byte> a, int len)
+        {
+            if (len < 9) return;
+            int o = 1;
+            int key = GetInt(a, ref o);
+            float v = GetF(a, ref o);
+            if (!Finite(v)) return;
+            ResolveConsoleDials();
+            if (!_consoleDials.TryGetValue(key, out var rd) || rd.D == null) return;
+            bool localDragging = false; try { localDragging = rd.D.isDragging; } catch { }
+            if (localDragging) return;                          // the local player is turning this dial — their input wins
+            try { rd.D.SetDialValue(v); }                       // proven setter — moves value + rotates the knob
+            catch (Exception e) { Log.LogWarning("[punch] dial apply: " + e.Message); return; }
+            try { var ev = rd.D.OnValueChanged; if (ev != null) ev.Invoke(v); }   // drive the wired effect (bridge / Coordinate variable)
+            catch { }
+            rd.SuppressUntil = Time.unscaledTime + 0.4f;
+            _ranDial++;
+        }
+
+        // ================= DIAGNOSTIC: dial → bridge → odometer → variable chain =================
+        // The visible parameter NUMBER is an OdometerDisplay, which POLLS a floatValueProvider via reflection each
+        // frame (it is never pushed a value). So syncing dials/variables may not move the readout. This dumps the
+        // whole chain on BOTH machines once per 2s while a punchcard console is up — diff host vs client to see
+        // exactly where the value stops matching (dial knob? bridge.Bearing? the variable? the odometer provider?).
+        private static float _nextDialProbe;
+
+        private static void DialProbeTick()
+        {
+            float now = Time.unscaledTime;
+            if (now < _nextDialProbe) return;
+
+            PunchcardVariable[] pvs = null;
+            try
+            {
+                var a = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PunchcardVariable>(), FindObjectsSortMode.None);
+                if (a != null) { pvs = new PunchcardVariable[a.Length]; for (int i = 0; i < a.Length; i++) pvs[i] = a[i].TryCast<PunchcardVariable>(); }
+            }
+            catch { }
+            if (pvs == null || pvs.Length == 0) return;   // no console up — nothing to probe
+            _nextDialProbe = now + 2f;
+
+            string who = CoopP2P.IsHost ? "HOST" : "CLI ";
+            var sb = new StringBuilder();
+
+            // 1) Dials (knob accumulated angle)
+            sb.Append("dials[");
+            try
+            {
+                var a = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<DialInteractable>(), FindObjectsSortMode.None);
+                if (a != null) for (int i = 0; i < a.Length; i++)
+                {
+                    var d = a[i].TryCast<DialInteractable>(); if (d == null) continue;
+                    string nm = null; try { nm = d.gameObject.name; } catch { }
+                    if (nm == null) continue;
+                    if (nm.IndexOf("Bearing", StringComparison.OrdinalIgnoreCase) < 0 && nm.IndexOf("Range", StringComparison.OrdinalIgnoreCase) < 0 && nm.IndexOf("Dial", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    float av = 0; try { av = d.AccumulatedValue; } catch { }
+                    sb.Append($"{nm}={av:0.0} ");
+                }
+            }
+            catch (Exception e) { sb.Append("ERR:" + e.Message); }
+
+            // 2) Bridges (computed bearing/distance)
+            sb.Append("] bridge[");
+            try
+            {
+                var a = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<DialOdometerPunchcardBridge>(), FindObjectsSortMode.None);
+                if (a != null) for (int i = 0; i < a.Length; i++)
+                {
+                    var b = a[i].TryCast<DialOdometerPunchcardBridge>(); if (b == null) continue;
+                    float br = 0, di = 0; try { br = b.Bearing; } catch { } try { di = b.Distance; } catch { }
+                    sb.Append($"B={br:0.0}/D={di:0.0} ");
+                }
+            }
+            catch { }
+
+            // 3) Odometers (the visible readout + what it polls)
+            sb.Append("] odo[");
+            try
+            {
+                var a = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<OdometerDisplay>(), FindObjectsSortMode.None);
+                if (a != null) for (int i = 0; i < a.Length; i++)
+                {
+                    var o = a[i].TryCast<OdometerDisplay>(); if (o == null) continue;
+                    float cur = 0, tgt = 0; string prop = "?", prov = "?";
+                    try { cur = o.currentNumber; } catch { }
+                    try { tgt = o.targetNumber; } catch { }
+                    try { prop = o.providerPropertyName; } catch { }
+                    try { var fp = o.floatValueProvider; if (fp != null) prov = fp.GetIl2CppType().Name; } catch { }
+                    sb.Append($"{prov}.{prop}: cur={cur:0.0} tgt={tgt:0.0} ");
+                }
+            }
+            catch { }
+
+            // 4) Variables (the redemption-facing value)
+            sb.Append("] vars[");
+            try
+            {
+                for (int i = 0; i < pvs.Length; i++)
+                {
+                    var pv = pvs[i]; if (pv == null) continue;
+                    string vid = null; try { vid = pv.VariableID; } catch { }
+                    if (string.IsNullOrEmpty(vid)) continue;
+                    int vt = 0; try { vt = (int)pv.VariableType; } catch { }
+                    string val = vt == 1 ? $"{SafeF(pv)}" : vt == 3 ? SafeCoord(pv) : vt == 0 ? $"{SafeI(pv)}" : "?";
+                    sb.Append($"{vid}={val} ");
+                }
+            }
+            catch { }
+            sb.Append("]");
+
+            Log.LogInfo($"[dial-probe {who}] {sb}");
+        }
+
+        private static float SafeF(PunchcardVariable pv) { try { return pv.VariableFloat; } catch { return -999; } }
+        private static int SafeI(PunchcardVariable pv) { try { return pv.VariableInt; } catch { return -999; } }
+        private static string SafeCoord(PunchcardVariable pv) { try { var g = pv.VariableCoordinate; return g != null ? $"({(int)g.Location},{g.X},{g.Y})" : "null"; } catch { return "err"; } }
+
+        // ================= DIAGNOSTIC: recon reveal probe =================
+        // The scout plane's on-map result (recon marker + revealing hidden enemies) is NOT an EntityLocation spawn
+        // (host entity count never moves) and produced ZERO MapEntity.State changes in the logs — so we don't yet
+        // know the reveal MECHANISM. This time-windowed sampler runs on BOTH instances after a recon redeem and
+        // dumps MapEntity states (Hidden flag) + MapToken_Recon positions once/sec for 12s. Diff host vs client to
+        // see exactly what changes on the host that never reaches the client. Pure logging — no behaviour change.
+        private static float _reconWatchUntil;
+        private static float _nextReconSnap;
+        private static int _reconSnapIdx;
+        private static bool _photoDumped;   // photo-probe: dump the first MapToken_Recon's render tree once per arm
+        private static int _photoNodeCount;
+
+        private static void ArmReconWatch(PunchcardRuntime card, string who)
+        {
+            bool recon = false;
+            try
+            {
+                var d = card != null ? card.CurrentDefinition : null;
+                if (d != null)
+                {
+                    try { recon = d.IsRecon; } catch { }
+                    if (!recon) { string id = null; try { id = d.ID; } catch { } if (!string.IsNullOrEmpty(id)) { string l = id.ToLowerInvariant(); recon = l.Contains("scout") || l.Contains("recon"); } }
+                }
+            }
+            catch { }
+            if (!recon) return;
+            _reconWatchUntil = Time.unscaledTime + 12f;
+            _nextReconSnap = 0f;     // sample on the very next Tick
+            _reconSnapIdx = 0;
+            _photoDumped = false;
+            Log.LogInfo($"[recon-probe] armed ({who}) — sampling MapEntity/recon-token state for 12s to find the reveal mechanism");
+        }
+
+        private static void ReconWatchTick()
+        {
+            if (_reconWatchUntil <= 0f) return;
+            float now = Time.unscaledTime;
+            if (now >= _reconWatchUntil) { _reconWatchUntil = 0f; Log.LogInfo("[recon-probe] window closed"); return; }
+            if (now < _nextReconSnap) return;
+            _nextReconSnap = now + 1f;
+            ReconSnapshot(_reconSnapIdx++);
+            DumpReconPhoto();   // one-shot: the photo's actual RENDER content (entity/fog state already proved identical)
+        }
+
+        // The recon-probe proved entity/fog/token STATE is byte-identical host vs client, yet the host's photos show
+        // enemy icons and the client's are blank — so the gap is in the photo's RENDERED content, which no state probe
+        // sees. Dump the first MapToken_Recon's full descendant tree with each node's render components (Camera +
+        // targetTexture, RawImage + texture, Image + sprite, SpriteRenderer + sprite, MeshRenderer). Diff host vs client:
+        // a NULL/empty texture or sprite (or disabled renderer) on the client side is the icon that never made it onto
+        // the photo. A Camera+targetTexture means the photo is a render-to-texture SNAPSHOT (timing/layer bug); per-icon
+        // Image/SpriteRenderer children mean it's procedural (missing/blank-sprite children).
+        private static void DumpReconPhoto()
+        {
+            if (_photoDumped) return;
+            DraggableItem token = null;
+            try
+            {
+                var drags = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<DraggableItem>(), FindObjectsSortMode.None);
+                if (drags != null) for (int i = 0; i < drags.Length; i++)
+                {
+                    var d = drags[i].TryCast<DraggableItem>(); if (d == null) continue;
+                    string nm = null; try { nm = d.gameObject.name; } catch { }
+                    if (nm != null && nm.StartsWith("MapToken_Recon")) { token = d; break; }
+                }
+            }
+            catch { }
+            if (token == null) return;   // none spawned yet — retry next tick
+            _photoDumped = true;
+            _photoNodeCount = 0;
+
+            Transform root = null; try { root = token.transform; } catch { }
+            if (root == null) return;
+            var sb = new StringBuilder();
+            try { DumpPhotoNode(root, 0, sb); } catch (Exception e) { sb.Append(" ERR:" + e.Message); }
+            Log.LogInfo($"[photo-probe {(CoopP2P.IsHost ? "HOST" : "CLI ")}] '{SafeNodeName(root)}' render tree:{sb}");
+        }
+
+        private static void DumpPhotoNode(Transform t, int depth, StringBuilder sb)
+        {
+            if (_photoNodeCount > 90 || depth > 9) return;
+            _photoNodeCount++;
+            sb.Append('\n');
+            for (int i = 0; i < depth; i++) sb.Append("  ");
+            bool act = false; try { act = t.gameObject.activeInHierarchy; } catch { }
+            sb.Append(act ? "" : "(off)").Append(SafeNodeName(t));
+
+            try { var cam = t.GetComponent<Camera>(); if (cam != null) { var rt = cam.targetTexture; sb.Append($" [Cam en={cam.enabled} tt={(rt != null ? rt.name + " " + rt.width + "x" + rt.height : "NULL")}]"); } } catch { }
+            try { var ri = t.GetComponent<UnityEngine.UI.RawImage>(); if (ri != null) { var tx = ri.texture; sb.Append($" [RawImg en={ri.enabled} tex={(tx != null ? tx.name : "NULL")}]"); } } catch { }
+            try { var im = t.GetComponent<UnityEngine.UI.Image>(); if (im != null) { var sp = im.sprite; float a = 1f; try { a = im.color.a; } catch { } sb.Append($" [Img en={im.enabled} sp={(sp != null ? sp.name : "NULL")} a={a:0.0}]"); } } catch { }
+            try { var sr = t.GetComponent<SpriteRenderer>(); if (sr != null) { var sp = sr.sprite; sb.Append($" [SprR en={sr.enabled} sp={(sp != null ? sp.name : "NULL")}]"); } } catch { }
+            try { var mr = t.GetComponent<MeshRenderer>(); if (mr != null) sb.Append($" [Mesh en={mr.enabled}]"); } catch { }
+
+            int n = 0; try { n = t.childCount; } catch { return; }
+            for (int i = 0; i < n; i++)
+            {
+                Transform c = null; try { c = t.GetChild(i); } catch { continue; }
+                if (c != null) DumpPhotoNode(c, depth + 1, sb);
+            }
+        }
+
+        private static string SafeNodeName(Transform t) { try { return t.name; } catch { return "?"; } }
+
+        private static void ReconSnapshot(int idx)
+        {
+            try
+            {
+                int total = 0, hidden = 0, visHidden = 0, visShown = 0, goOff = 0;
+                var states = new StringBuilder();
+                Il2CppArrayBase<UnityEngine.Object> ents = null;
+                try { ents = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<EntityLocation>(), FindObjectsSortMode.None); } catch { }
+                if (ents != null) for (int i = 0; i < ents.Length; i++)
+                {
+                    var loc = ents[i].TryCast<EntityLocation>(); if (loc == null) continue;
+                    MapEntity e = null; try { e = loc.Entity; } catch { }
+                    if (e == null) continue;
+                    total++;
+                    int st = 0; string id = "?";
+                    try { st = (int)e.State; } catch { }
+                    try { id = e.ID; } catch { }
+                    bool actGo = false; try { actGo = loc.gameObject.activeInHierarchy; } catch { }
+                    if (!actGo) goOff++;
+                    if ((st & 0x80) != 0) hidden++;
+                    // VisibilityGroup (CanvasGroup) is what actually shows/hides the on-map icon — aggregate alpha so the
+                    // host-vs-client diff after recon shows whether the reveal flips visibility on this machine.
+                    float alpha = -1f; try { var vg = loc.VisibilityGroup; if (vg != null) alpha = vg.alpha; } catch { }
+                    if (alpha >= 0f) { if (alpha < 0.5f) visHidden++; else visShown++; }
+                    if ((st != 0 || !actGo) && states.Length < 400) states.Append($"{id}=st{st}{(actGo ? "" : ",off")} ");
+                }
+
+                // Recon fog: enemies start covered by MapReconClearChild fog GameObjects under a MapReconClearHandle;
+                // recon DESTROYS them. Count active clearers/handles/children so the host-vs-client diff shows whether
+                // the client's graph run actually clears its own fog.
+                int clearers = 0, activeHandles = 0, fogChildren = 0, fogActive = 0;
+                try
+                {
+                    var cs = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearer>(), FindObjectsSortMode.None);
+                    if (cs != null) for (int i = 0; i < cs.Length; i++) { var c = cs[i].TryCast<MapReconClearer>(); if (c == null) continue; clearers++; try { activeHandles += c.ActiveCount; } catch { } }
+                }
+                catch { }
+                try
+                {
+                    var ch = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearChild>(), FindObjectsSortMode.None);
+                    if (ch != null) for (int i = 0; i < ch.Length; i++) { var c = ch[i].TryCast<MapReconClearChild>(); if (c == null) continue; fogChildren++; try { if (c.gameObject.activeInHierarchy) fogActive++; } catch { } }
+                }
+                catch { }
+
+                var toks = new StringBuilder();
+                int reconCount = 0;
+                Il2CppArrayBase<UnityEngine.Object> drags = null;
+                try { drags = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<DraggableItem>(), FindObjectsSortMode.None); } catch { }
+                if (drags != null) for (int i = 0; i < drags.Length; i++)
+                {
+                    var d = drags[i].TryCast<DraggableItem>(); if (d == null) continue;
+                    string nm = null; try { nm = d.gameObject.name; } catch { }
+                    if (nm == null || !nm.StartsWith("MapToken_Recon")) continue;
+                    reconCount++;
+                    Vector3 p; try { p = d.transform.position; } catch { continue; }
+                    if (toks.Length < 600) toks.Append($"{nm}=({p.x:0.00},{p.y:0.00},{p.z:0.00}) ");
+                }
+
+                Log.LogInfo($"[recon-probe T{idx}] entities={total} stHidden={hidden} goOff={goOff} vis(shown={visShown} hidden={visHidden}) | fog: clearers={clearers} activeHandles={activeHandles} children={fogActive}/{fogChildren} | reconTokens={reconCount} | nonzero/off: {states}| recon: {toks}");
+            }
+            catch (Exception e) { Log.LogWarning("[recon-probe] snap: " + e.Message); }
+        }
+
+        // Postfix on RequisitionSlot.FireRequisitionTrigger(bool success) — the validator emits this synchronously
+        // inside AttemptRequisition with the verdict. Captures it so RunRedeem can report the TRUE outcome instead
+        // of inferring from coroutine-delayed point/use changes. Fires for the host's own redemptions too (harmless).
+        public static void OnRequisitionTrigger(bool success)
+        {
+            _lastTrigger = success;
+            _lastTriggerSet = true;
+
+            // RESULT replication: this fires synchronously inside AttemptRequisition with the verdict, for the host's
+            // own redeem AND a client-forwarded one (RunRedeem). If it succeeded, broadcast the staged card + vars so
+            // every client runs the same graph locally and sees the same result. Consume the staging either way.
+            try
+            {
+                if (_pgActive)
+                {
+                    bool canSend = success && CoopP2P.IsHost && SteamNet.InLobby && CoopP2P.HasPeer
+                                   && Config.CoopPunchcardSync && Config.CoopPunchcardRedeemSync && Config.CoopPunchcardResultSync;
+                    if (canSend) SendGraph(_pgCardId, _pgVars);
+                    ClearPendingGraph();
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[punch] trigger-broadcast: " + e.Message); }
+        }
+
+        // Stage the card + authoritative vars for the redeem about to run; OnRequisitionTrigger broadcasts on success.
+        private static void StagePendingGraph(PunchcardRuntime card, List<VarSnap> vars)
+        {
+            string id = null;
+            try { if (card != null && card.CurrentDefinition != null) id = card.CurrentDefinition.ID; } catch { }
+            if (string.IsNullOrEmpty(id)) { ClearPendingGraph(); return; }
+            _pgActive = true; _pgCardId = id; _pgVars = vars ?? new List<VarSnap>();
+        }
+
+        private static void ClearPendingGraph() { _pgActive = false; _pgCardId = null; _pgVars = null; }
+
+        // Read back the live PunchcardVariable values right before AttemptRequisition — proves whether the client's
+        // parameters actually survived to attempt time (a reset-after-place wipe shows here as default/null).
+        private static void LogLiveVars(List<VarSnap> vars)
+        {
+            if (vars.Count == 0) return;
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PunchcardVariable>(), FindObjectsSortMode.None);
+                if (arr == null) return;
+                foreach (var v in vars)
+                {
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        var pv = arr[i].TryCast<PunchcardVariable>(); if (pv == null) continue;
+                        string id = null; try { id = pv.VariableID; } catch { }
+                        if (id != v.Id) continue;
+                        string live;
+                        try
+                        {
+                            switch (v.Type)
+                            {
+                                case 0: live = $"i={pv.VariableInt}"; break;
+                                case 1: live = $"f={pv.VariableFloat}"; break;
+                                case 2: live = $"text='{pv.VariableText}'"; break;
+                                case 3:
+                                    var gr = pv.VariableCoordinate;
+                                    live = gr != null ? $"loc={(int)gr.Location} x={gr.X} y={gr.Y}" : "coord NULL (reset?)";
+                                    break;
+                                case 4: live = $"b={pv.VariableBool}"; break;
+                                default: live = "?"; break;
+                            }
+                        }
+                        catch (Exception e) { live = "read-fail: " + e.Message; }
+                        Log.LogInfo($"[punch] LIVE var '{v.Id}' at attempt: {live}");
+                        break;
+                    }
+                }
+            }
+            catch { }
         }
 
         // VariableTypes (nested in PunchcardVariable): Int=0, Float=1, Text=2, Coordinate=3, Bool=4, ShellSlot=5.
@@ -810,6 +1417,8 @@ namespace IronNestVR
                 case MSG_PUNCH_POS:     OnPos(origin, a, len); break;
                 case MSG_PUNCH_PLACE:   OnPlace(origin, a, len); break;
                 case MSG_PUNCH_CONSUME: OnConsumePacket(a, len); break;
+                case MSG_PUNCH_GRAPH:   OnGraphPacket(a, len); break;
+                case MSG_PUNCH_DIAL:    OnDialPacket(a, len); break;
             }
         }
 
@@ -819,7 +1428,7 @@ namespace IronNestVR
         {
             int owned = 0, remote = 0;
             foreach (var c in _cards.Values) { if (c.LocalOwned) owned++; if (c.RemoteOwner != 0) remote++; }
-            return $"punch: cards={_cards.Count}(local={owned} remote={remote} pend={_pendingPose.Count}) redeem(sent={_sentRedeem} ran={_ranRedeem}) consume(sent={_sentConsume} ran={_ranConsume})";
+            return $"punch: cards={_cards.Count}(local={owned} remote={remote} pend={_pendingPose.Count}) redeem(sent={_sentRedeem} ran={_ranRedeem}) graph(sent={_sentGraph} ran={_ranGraph}) consume(sent={_sentConsume} ran={_ranConsume}) dial(sent={_sentDial} ran={_ranDial})";
         }
 
         // ================= helpers =================

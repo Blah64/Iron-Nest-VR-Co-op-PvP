@@ -150,6 +150,19 @@ namespace IronNestVR
         // Separate flag so it can be disabled without touching the working card-movement layer.
         public static bool CoopPunchcardRedeemSync = true;
 
+        // Punchcard RESULT replication (the "host scouts but the client's map shows nothing" half). When ON, after
+        // the host runs a redemption authoritatively (its own OR a client-forwarded one) and the validator fires
+        // success, the host broadcasts MSG_PUNCH_GRAPH (card ID + the authoritative PunchcardVariable values). Each
+        // client then runs the SAME redemption locally — place card, apply those vars, AttemptRequisition — so the
+        // card's PunchcardGraph executes on the client too: recon photo / scout flyby / reveal all appear, operating
+        // on the client's own (host-mirrored) entities. Enemy/entity SPAWNS stay gated (no duplicates; the host's
+        // authored entities still arrive via CoopEntities); only the reveal/photo/flyby run locally. Because the
+        // client runs the full redemption, it consumes its OWN card + decrements its OWN use, so the host SKIPS the
+        // MSG_PUNCH_CONSUME drop (it would double-decrement). Lockstep: both machines execute the same action once,
+        // gated by host authority (the client only runs on the host's success broadcast). Default ON; turn OFF to
+        // fall back to host-runs-only + MSG_PUNCH_CONSUME (client sees no visual result).
+        public static bool CoopPunchcardResultSync = true;
+
         // Punchcard DECK-COMPOSITION/uses sync (the host-authoritative "make the client's deck match the host's"
         // overlay). DEFAULT OFF (2026-06-21): the punchcard CATALOG is already identical on both machines, and
         // overlaying the host's per-save RemainingUses onto the client can ZERO a card the client could otherwise

@@ -330,6 +330,9 @@ namespace IronNestVR
                 e.ID = id; e.Name = name ?? id; e.Icon = icon ?? "";
                 e.Role = (EntityRoles)role; e.Position = pos; e.State = (MapEntityStates)state;
                 e.Health = hp; e.MaxHealth = maxHp; e.Armour = armour; e.Stars = stars; e.Scale = scale;
+                // IconRaw (the display Sprite) doesn't cross the wire — resolve it from the icon key via the
+                // MapEntityIcon registry so the map marker AND recon photos show the right icon (not a blank).
+                try { var sp = ResolveIconRaw(icon); if (sp != null) e.IconRaw = sp; } catch { }
             }
             catch (Exception ex) { Log.LogWarning("[ent] build MapEntity: " + ex.Message); try { UnityEngine.Object.Destroy(go); } catch { } return; }
 
@@ -338,7 +341,47 @@ namespace IronNestVR
             try { loc.LocalPosition = new Vector2(pos.x, pos.y); } catch { }
 
             _mirrors[key] = new Mirror { Key = key, ID = id, Go = go, Loc = loc, Entity = e, IsClone = true, LastState = state };
-            Log.LogInfo($"[ent] cloned remote entity '{id}' <- peer (role={role} hp={hp}/{maxHp} parent={(parent != null ? parent.name : "<none>")})");
+            bool hasIcon = false; try { hasIcon = e.IconRaw != null; } catch { }
+            Log.LogInfo($"[ent] cloned remote entity '{id}' <- peer (role={role} hp={hp}/{maxHp} iconKey='{icon}' iconRaw={hasIcon} parent={(parent != null ? parent.name : "<none>")})");
+        }
+
+        // ---------------- icon resolution (IconRaw isn't serializable) ----------------
+        // The display sprite (MapEntity.IconRaw) can't be sent over the wire — resolve it on the client from the icon
+        // key. MapEntityIcon is a ScriptableObject {string ID, Sprite Icon}; we index every loaded one by BOTH its ID
+        // and its sprite's name so either the entity's Icon string OR the sprite name (the host's fallback key) resolves.
+        private static readonly Dictionary<string, Sprite> _iconByKey = new Dictionary<string, Sprite>(StringComparer.OrdinalIgnoreCase);
+        private static int _iconMissLog;
+
+        private static Sprite ResolveIconRaw(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return null;
+            if (_iconByKey.Count == 0) BuildIconCache();
+            if (_iconByKey.TryGetValue(key, out var sp) && sp != null) return sp;
+            BuildIconCache();   // assets may have loaded since the first build — rebuild once and retry
+            if (_iconByKey.TryGetValue(key, out var sp2) && sp2 != null) return sp2;
+            if (_iconMissLog < 6) { _iconMissLog++; Log.LogWarning($"[ent] icon key '{key}' not in MapEntityIcon registry ({_iconByKey.Count} icons) — marker/photo blank for this entity"); }
+            return null;
+        }
+
+        private static void BuildIconCache()
+        {
+            try
+            {
+                var arr = Resources.FindObjectsOfTypeAll(Il2CppType.Of<MapEntityIcon>());
+                if (arr == null) return;
+                _iconByKey.Clear();
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    var mi = arr[i].TryCast<MapEntityIcon>(); if (mi == null) continue;
+                    Sprite sp = null; try { sp = mi.Icon; } catch { }
+                    if (sp == null) continue;
+                    string id = null; try { id = mi.ID; } catch { }
+                    if (!string.IsNullOrEmpty(id)) _iconByKey[id] = sp;
+                    string sn = null; try { sn = sp.name; } catch { }
+                    if (!string.IsNullOrEmpty(sn) && !_iconByKey.ContainsKey(sn)) _iconByKey[sn] = sp;
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[ent] icon cache: " + e.Message); }
         }
 
         // Position-only apply for the unreliable MSG_MOVE stream. Deliberately does NOT read or write state/hp,
@@ -419,6 +462,11 @@ namespace IronNestVR
             try
             {
                 id = e.ID; name = e.Name; icon = e.Icon; role = (int)e.Role; pos = e.Position;
+                // The actual display sprite is e.IconRaw (NOT serializable); e.Icon is its string key. If the key is
+                // empty, fall back to the sprite's NAME so the client can still resolve the same sprite (it indexes the
+                // MapEntityIcon registry by both ID and sprite name). Without this, the client's clone has no sprite →
+                // blank map marker AND blank recon photo.
+                if (string.IsNullOrEmpty(icon)) { try { var ir = e.IconRaw; if (ir != null) icon = ir.name; } catch { } }
                 state = (int)e.State; hp = e.Health; maxHp = e.MaxHealth; armour = e.Armour; stars = e.Stars; scale = e.Scale;
             }
             catch { return; }

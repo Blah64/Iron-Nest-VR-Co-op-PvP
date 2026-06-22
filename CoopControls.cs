@@ -117,6 +117,12 @@ namespace IronNestVR
         private static float _nextRecon;   // host: next current-state reconcile broadcast (REVIEW-fix P3)
         private static float _nextElevDiag;     // throttle for the "applied peer elevation" (receiver) diagnostic
         private static float _nextElevSendDiag;  // throttle for the "streaming elevation" (sender) diagnostic
+        // ALL requisition-console dials are EXCLUDED from this path-hash registry: their PathOf hash collides with the
+        // artillery gun's same-named targeting dials (.Gross Bearing/.Range), AND the console's real coordinate input is
+        // FOUR dials (two Grid-Location .Range Dials + gross/fine bearing), not just the bridge's one. CoopPunchcards
+        // owns them — keyed by console-relative path (collision-free, every relpath is unique under this root), applied
+        // with SetDialValue (the proven setter). Counted per scan for the registry log.
+        private static int _reconExcluded;
 
         // Reusable send buffer (control packets are tiny: 1+4+4 max). Lazily created on the Unity thread.
         private static Il2CppStructArray<byte> _buf;
@@ -129,6 +135,7 @@ namespace IronNestVR
         private static readonly bool[] _groupOwnedLocal = new bool[_grp.Length];
 
         private static int _grabs, _releases;
+        private static int _dialCollisions;   // DIAGNOSTIC: count/log dials dropped because their path-hash NetId already exists
 
         public static bool Active => _byId.Count > 0 && _turret != null;
 
@@ -289,6 +296,11 @@ namespace IronNestVR
                     if (c.LocalOwned || c.RemoteOwner == 0 || now >= c.RemoteUntil || !c.HasRemoteVal) continue;
                     try
                     {
+                        // VISUAL KNOB ONLY for every dial in this registry, NO value-changed event. The recon console's
+                        // bearing/range dials are NOT here (excluded — synced collision-free by CoopPunchcards); what's
+                        // left is turret/gun and flavor dials. Firing value-changed would drive the gun's targeting
+                        // dials into the barrel (their event moves azimuth/elevation) — turret/gun aim syncs via
+                        // ApplyGroup, not this. So just snap the knob to the peer's angle.
                         if (c.Dial != null) c.Dial.SetAccumulatedValueUnlimited(c.RemoteVal, false, false);
                         else if (c.Slider != null) c.Slider.ApplyLocalPosition(c.RemoteVal);
                     }
@@ -644,7 +656,11 @@ namespace IronNestVR
                     float v = GetFloat(a, ref o);
                     // Only the control's current owner may move it. A non-owner's late value (simultaneous-grab
                     // contention at N>2) must not drag a control another origin already won (REVIEW-fix P1a).
-                    if (_byId.TryGetValue(id, out var c)) { if (c.RemoteOwner == origin) { c.RemoteVal = v; c.HasRemoteVal = true; c.RemoteUntil = now + StaleSec; } }
+                    if (_byId.TryGetValue(id, out var c))
+                    {
+                        bool ownerMatch = c.RemoteOwner == origin;
+                        if (ownerMatch) { c.RemoteVal = v; c.HasRemoteVal = true; c.RemoteUntil = now + StaleSec; }
+                    }
                     else _pendingVal[id] = (origin, v);   // arrived before the control registered — adopt only if this origin becomes owner
                     break;
                 }
@@ -716,7 +732,8 @@ namespace IronNestVR
                     else if (type == CoopImpact.MSG_IMPACT) CoopImpact.OnPacket(type, a, len);
                     else if (type == CoopPunchcards.MSG_PUNCH_DECK || type == CoopPunchcards.MSG_PUNCH_REDEEM
                              || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
-                             || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_CONSUME) CoopPunchcards.OnPacket(type, origin, a, len);
+                             || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_CONSUME
+                             || type == CoopPunchcards.MSG_PUNCH_GRAPH || type == CoopPunchcards.MSG_PUNCH_DIAL) CoopPunchcards.OnPacket(type, origin, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
                     else CoopMap.OnPacket(type, origin, a, len);
                     break;
@@ -943,11 +960,12 @@ namespace IronNestVR
             _turret = turret; _turretIid = iid;
             ResolveGuns(turret);
 
+            _reconExcluded = 0;
             int added = 0;
             added += Scan(Il2CppType.Of<DialInteractable>(), true);
             added += Scan(Il2CppType.Of<LinearSliderInteractable>(), false);
             int sw = ScanSwitches();
-            if (added + sw > 0) Log.LogInfo($"[ctrl] registry: {_byId.Count} controls (+{added} drag, +{sw} click; host={CoopP2P.IsHost})");
+            if (added + sw > 0) Log.LogInfo($"[ctrl] registry: {_byId.Count} controls (+{added} drag, +{sw} click, {_reconExcluded} recon-dials-excluded; host={CoopP2P.IsHost})");
         }
 
         private static int Scan(Il2CppSystem.Type t, bool dial)
@@ -967,9 +985,20 @@ namespace IronNestVR
                 catch { }
                 if (tr == null) continue;
 
-                int id = Fnv(PathOf(tr));
-                if (_byId.ContainsKey(id)) continue;
-                var c = new Ctrl { NetId = id, T = tr, Dial = d, Slider = s, Grp = Classify(PathOf(tr)) };
+                string path = PathOf(tr);
+                // Skip ALL requisition-console dials — their path-hash collides with the gun's same-named targeting
+                // dials, and CoopPunchcards owns them (console-relative key + SetDialValue). The submit LEVER is a click
+                // (ScanSwitches), not a dial, so it still syncs.
+                if (dial && path.IndexOf("Requisition Console", StringComparison.OrdinalIgnoreCase) >= 0) { _reconExcluded++; continue; }
+                int id = Fnv(path);
+                if (_byId.TryGetValue(id, out var exist))
+                {
+                    // DIAGNOSTIC: a path-hash collision — two controls map to the same NetId, so the peer can't tell
+                    // them apart (the recon-console vs gun targeting dial cross-wire). The second is dropped here.
+                    if (_dialCollisions < 12) { _dialCollisions++; Log.LogWarning($"[ctrl] dial NetId COLLISION: '{tr.name}' (grp={Classify(path)}) hashes to id={id}, already held by '{SafeName(exist)}' (grp={exist.Grp}) — DROPPED. path='{path}'"); }
+                    continue;
+                }
+                var c = new Ctrl { NetId = id, T = tr, Dial = d, Slider = s, Grp = Classify(path) };
 
                 // Apply anything that arrived for this control before it existed.
                 if (_pendingGrab.TryGetValue(id, out var pgOrigin)) { c.RemoteOwner = pgOrigin; c.RemoteUntil = Time.unscaledTime + StaleSec; MarkGroupRemote(c.Grp, pgOrigin, Time.unscaledTime); _pendingGrab.Remove(id); }
@@ -1090,6 +1119,8 @@ namespace IronNestVR
             catch { return false; }
         }
 
+        private static string SafeName(Ctrl c) { try { return c.T != null ? c.T.name : "?"; } catch { return "?"; } }
+
         private static Group Classify(string path)
         {
             string p = path.ToLowerInvariant();
@@ -1102,12 +1133,23 @@ namespace IronNestVR
 
         // ---------------- helpers ----------------
 
+        // FULL hierarchy path, each segment disambiguated by its SIBLING INDEX. Name-only paths collide whenever two
+        // sibling GameObjects share a name — and the cockpit is full of them: the gun loading consoles have several
+        // identical "PressureValve/Dial" subtrees, the aiming console has paired Elevation/Rotation pressure dials, the
+        // turret has duplicate ".Spur Gear 12 DRIVER" wheels. Name-only, those hash to ONE id and the second is dropped,
+        // so the elevation + loading dials never register → their group never detects ownership → elevation/powder stop
+        // syncing (only the uniquely-named rotation Lever survived). The sibling index is authored into the scene/prefab,
+        // identical on both machines for the same build, so '#i' keeps every id deterministic AND collision-free.
         private static string PathOf(Transform t)
         {
-            var sb = new StringBuilder(t.name);
-            for (var p = t.parent; p != null; p = p.parent) { sb.Insert(0, '/'); sb.Insert(0, p.name); }
+            var sb = new StringBuilder();
+            sb.Append(t.name).Append('#').Append(SiblingIndex(t));
+            for (var p = t.parent; p != null; p = p.parent)
+                sb.Insert(0, p.name + "#" + SiblingIndex(p) + "/");
             return sb.ToString();
         }
+
+        private static int SiblingIndex(Transform t) { try { return t.GetSiblingIndex(); } catch { return 0; } }
 
         // FNV-1a 32-bit — deterministic across processes (unlike string.GetHashCode), so both machines derive
         // the same id from the same transform path.
