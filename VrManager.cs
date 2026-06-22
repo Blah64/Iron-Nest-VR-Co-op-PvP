@@ -30,7 +30,6 @@ namespace IronNestVR
         private HandManipulator _handManip;
         private VrSettingsMenu _menu;
         private VrPopup _popup;
-        private VrTooltip _tooltip;
         private bool _prevChord;
         private float _appliedRenderScale;
         private bool _xrReady;
@@ -386,10 +385,6 @@ namespace IronNestVR
                 Dbg.Beat("hud");
                 _hud.Tick(_rig, active);
                 Notify.TickVr(_rig);   // world-space "X joined" toast in front of the head
-                // World-space mirror of the game's screen-space "[E] interact" hover tooltip (invisible in
-                // VR otherwise). Hidden while a modal VR panel owns the view to avoid clutter.
-                if (!_menu.IsOpen && (_popup == null || !_popup.Active)) _tooltip.Tick(_rig);
-                else _tooltip.Hide();
                 Dbg.Beat("loopEnd");
 
                 if (shouldRender && _xr.ViewsValid && Time.unscaledTime >= _nextPoseLog)
@@ -437,7 +432,6 @@ namespace IronNestVR
                 _handManip = new HandManipulator();
                 _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab };
                 _popup = new VrPopup();
-                _tooltip = new VrTooltip();
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
                 _frameFailStreak = 0;
@@ -494,8 +488,6 @@ namespace IronNestVR
             _menu = null;
             try { _popup?.Dispose(); } catch { }
             _popup = null;
-            try { _tooltip?.Dispose(); } catch { }
-            _tooltip = null;
             try { Notify.DisposeVr(); } catch { }
             try { _rig?.Destroy(); } catch { }
             _rig = null;

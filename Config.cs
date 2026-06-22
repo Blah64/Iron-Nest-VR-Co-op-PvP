@@ -402,18 +402,12 @@ namespace IronNestVR
         // Rotate the panel 180° if it ends up facing away from you (handedness sanity flip).
         public static bool MenuFlip = false;
 
-        // --- Screen-space UI mirrored into VR (hover tooltips + confirmation popups) ---
-        // The game's "[E] interact" hover tooltip (HoverTooltip) and its confirmation popups (the
-        // "I understand" language/disclaimer box, exit-mission/exit-to-menu, etc.) all render to a
-        // SCREEN-SPACE canvas, which never reaches the VR eye RenderTextures — so they're invisible in
-        // the headset (and the popups silently block input). We mirror them to world-space 3D TextMeshPro
-        // (the same trick as the settings menu) and, for popups, present laser-pressable buttons wired to
-        // the real uGUI buttons. Off = leave them screen-only (e.g. if a future build changes the layout).
-        public static bool TooltipVrEnabled = true;
-        public static float TooltipHeightOffset = 0.12f;  // metres above the hovered object's anchor
-        public static float TooltipScale = 1f;             // tooltip card size multiplier
-        public static float TooltipMaxDistance = 10f;      // skip anchors farther than this from the head
-
+        // --- Screen-space confirmation popups mirrored into VR ---
+        // The game's confirmation popups (the "I understand" language/disclaimer box, exit-mission /
+        // exit-to-menu, etc.) render to a SCREEN-SPACE canvas, which never reaches the VR eye RenderTextures
+        // — so they're invisible in the headset AND silently block input. We mirror them to a world-space 3D
+        // TextMeshPro panel (the same trick as the settings menu) with laser-pressable buttons wired to the
+        // real uGUI buttons. Off = leave them screen-only (e.g. if a future build changes the layout).
         public static bool PopupVrEnabled = true;
         public static float PopupDistance = 0.85f;         // metres in front of the head when it appears
         public static float PopupHeightOffset = 0f;        // metres relative to eye level
@@ -543,7 +537,6 @@ namespace IronNestVR
                 WF(sb, "FingerCurlSign", FingerCurlSign);
                 WB(sb, "SwitchGrabEnabled", SwitchGrabEnabled);
                 WF(sb, "SwitchThrowDistance", SwitchThrowDistance);
-                WB(sb, "TooltipVrEnabled", TooltipVrEnabled);
                 WB(sb, "PopupVrEnabled", PopupVrEnabled);
                 WB(sb, "ClipPlacementSaved", ClipPlacementSaved);
                 WV(sb, "ClipHeadOffPos", ClipHeadOffPos);
@@ -645,7 +638,6 @@ namespace IronNestVR
                 case "FingerCurlAxis": FingerCurlAxis = PI(v, FingerCurlAxis); break;
                 case "FingerCurlSign": FingerCurlSign = PF(v, FingerCurlSign); break;
                 case "SwitchGrabEnabled": SwitchGrabEnabled = PB(v, SwitchGrabEnabled); break;
-                case "TooltipVrEnabled": TooltipVrEnabled = PB(v, TooltipVrEnabled); break;
                 case "PopupVrEnabled": PopupVrEnabled = PB(v, PopupVrEnabled); break;
                 case "SwitchThrowDistance": SwitchThrowDistance = PF(v, SwitchThrowDistance); break;
                 case "ClipPlacementSaved": ClipPlacementSaved = PB(v, ClipPlacementSaved); break;
