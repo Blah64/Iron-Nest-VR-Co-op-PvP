@@ -39,7 +39,10 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        public const byte MSG_SPAWN = 16;    // [t][key i32][id str][name str][icon str][role i32][pos 3f][state i32][hp i32][maxHp i32][armour i32][stars i32][scale i32]  reliable
+        public const byte MSG_SPAWN = 16;    // [t][key i32][id str][name str][icon str][role i32][pos 3f][state i32][hp i32][maxHp i32][armour i32][stars i32][scale i32][lpos 3f]  reliable
+        //                                     ^ lpos = the host EntityLocation's transform.localPosition under Fire Mission Root. The marker's
+        //                                       world TRANSFORM (what the recon photo reads) is authored here; LocalPosition(grid cell) is DERIVED
+        //                                       from it by RecalculateAndRegister, so the client must place the TRANSFORM, not the grid cell.
         public const byte MSG_UPDATE = 17;   // [t][key i32][seq i32][pos 3f][state i32][hp i32]  RELIABLE — discrete state/hp change OR periodic position keyframe (REVIEW-fix P2)
         public const byte MSG_DESPAWN = 18;  // [t][key i32]                              reliable
         public const byte MSG_MOVE = 23;     // [t][key i32][seq i32][pos 3f]            UNRELIABLE — position stream; per-entity seq drops late/reordered moves (REVIEW-fix P2)
@@ -81,7 +84,7 @@ namespace IronNestVR
         // Spawns that arrived before a clone template was available (a gated client just entered the mission scene
         // and hasn't found anything to clone yet). The host diff-sends each entity exactly ONCE, so a dropped SPAWN
         // never comes back on its own — we queue them and ClientTick replays them the moment a template appears.
-        private sealed class PendingSpawn { public int Key; public string ID, Name, Icon; public int Role, State, Hp, MaxHp, Armour, Stars, Scale; public Vector3 Pos; }
+        private sealed class PendingSpawn { public int Key; public string ID, Name, Icon; public int Role, State, Hp, MaxHp, Armour, Stars, Scale; public Vector3 Pos; public Vector3 Lpos; }
         private static readonly List<PendingSpawn> _pendingSpawns = new List<PendingSpawn>();
 
         // Client clone template (a disabled EntityLocation copy kept across scene loads, since a gated client
@@ -149,7 +152,7 @@ namespace IronNestVR
 
                 if (!_sent.TryGetValue(key, out var s))
                 {
-                    SendSpawn(key, e);
+                    SendSpawn(key, e, loc);
                     _sent[key] = new SentState { ID = id, Pos = pos, State = state, Health = hp, Seq = 0, LastKeyframe = now };
                 }
                 else
@@ -210,7 +213,7 @@ namespace IronNestVR
             foreach (var p in pend)
             {
                 if (_mirrors.ContainsKey(p.Key)) continue;
-                AdoptOrClone(p.Key, p.ID, p.Name, p.Icon, p.Role, p.Pos, p.State, p.Hp, p.MaxHp, p.Armour, p.Stars, p.Scale);
+                AdoptOrClone(p.Key, p.ID, p.Name, p.Icon, p.Role, p.Pos, p.State, p.Hp, p.MaxHp, p.Armour, p.Stars, p.Scale, p.Lpos);
                 n++;
             }
             if (n > 0) Log.LogInfo($"[ent] replayed {n} queued spawn(s) now that a clone template is available");
@@ -242,9 +245,10 @@ namespace IronNestVR
                     int armour = GetInt(a, ref o);
                     int stars = GetInt(a, ref o);
                     int scale = GetInt(a, ref o);
+                    Vector3 lpos = (o + 12 <= len) ? GetV(a, ref o) : Vector3.zero;   // parent-relative transform placement
                     if (id == null) return;
                     if (_mirrors.TryGetValue(key, out var ex)) { ApplyUpdate(ex, pos, state, hp); return; }   // JIP/dup re-spawn
-                    AdoptOrClone(key, id, name, icon, role, pos, state, hp, maxHp, armour, stars, scale);
+                    AdoptOrClone(key, id, name, icon, role, pos, state, hp, maxHp, armour, stars, scale, lpos);
                     break;
                 }
                 case MSG_UPDATE:
@@ -287,7 +291,7 @@ namespace IronNestVR
             }
         }
 
-        private static void AdoptOrClone(int key, string id, string name, string icon, int role, Vector3 pos, int state, int hp, int maxHp, int armour, int stars, int scale)
+        private static void AdoptOrClone(int key, string id, string name, string icon, int role, Vector3 pos, int state, int hp, int maxHp, int armour, int stars, int scale, Vector3 lpos)
         {
             // Already present locally as a shared/pre-placed scene entity? Adopt it (don't duplicate).
             var existing = FindLocalEntityById(id);
@@ -307,7 +311,7 @@ namespace IronNestVR
             if (tmpl == null)
             {
                 if (!PendingContains(key))
-                    _pendingSpawns.Add(new PendingSpawn { Key = key, ID = id, Name = name, Icon = icon, Role = role, Pos = pos, State = state, Hp = hp, MaxHp = maxHp, Armour = armour, Stars = stars, Scale = scale });
+                    _pendingSpawns.Add(new PendingSpawn { Key = key, ID = id, Name = name, Icon = icon, Role = role, Pos = pos, State = state, Hp = hp, MaxHp = maxHp, Armour = armour, Stars = stars, Scale = scale, Lpos = lpos });
                 Log.LogInfo($"[ent] no clone template yet — queued '{id}' ({_pendingSpawns.Count} pending; replays when a source appears)");
                 return;
             }
@@ -316,7 +320,14 @@ namespace IronNestVR
             try { go = UnityEngine.Object.Instantiate(tmpl).TryCast<GameObject>(); } catch (Exception ex) { Log.LogWarning("[ent] instantiate: " + ex.Message); }
             if (go == null) { Log.LogWarning($"[ent] clone failed for '{id}'"); return; }
             try { go.SetActive(true); } catch { }
-            var parent = ResolveEntityParent();
+            // Parent under the SAME world-space map container the host uses ('Fire Mission Root'). A gated client
+            // spawns no native entities, so ResolveEntityParent() finds none and the clone would be unparented at
+            // world origin: it still draws on the flat map (EntityLocation self-resolves a root canvas from its
+            // LocalPosition) but its WORLD transform stays at (0,0,0), so it never lands near the recon-photo paper
+            // in 3-D — the photo shows no icons on the client. (Proven by the host/client recon-probe diff: host
+            // enemies par='Fire Mission Root' wp≈real; client par='<none>' wp=0, and every host-photo nearby entity
+            // Image is entirely absent on the client.)
+            var parent = ResolveCloneParent();
             if (parent != null) { try { go.transform.SetParent(parent, false); } catch { } }
 
             EntityLocation loc = null;
@@ -336,13 +347,22 @@ namespace IronNestVR
             }
             catch (Exception ex) { Log.LogWarning("[ent] build MapEntity: " + ex.Message); try { UnityEngine.Object.Destroy(go); } catch { } return; }
 
+            // Position the GO's TRANSFORM directly from the host's parent-relative localPosition. The decompiled
+            // EntityLocation contract: RecalculateAndRegister is transform→lp (recomputes the grid cell FROM the
+            // transform); the LocalPosition setter only writes the lp FIELD and never moves the GO (proven: a clone
+            // with lp set correctly snapped back to lp=0/wp=parent-origin one frame later when the per-frame recalc
+            // re-derived lp from the un-moved transform). The recon photo reads the WORLD TRANSFORM, so we author the
+            // transform under the shared Fire Mission Root and let RecalculateAndRegister derive the matching lp.
             try { loc.Init(e); } catch (Exception ex) { Log.LogWarning("[ent] Init: " + ex.Message); }
+            try { go.transform.localPosition = lpos; } catch { }
             try { loc.RecalculateAndRegister(true); } catch (Exception ex) { Log.LogWarning("[ent] register: " + ex.Message); }
-            try { loc.LocalPosition = new Vector2(pos.x, pos.y); } catch { }
 
             _mirrors[key] = new Mirror { Key = key, ID = id, Go = go, Loc = loc, Entity = e, IsClone = true, LastState = state };
             bool hasIcon = false; try { hasIcon = e.IconRaw != null; } catch { }
-            Log.LogInfo($"[ent] cloned remote entity '{id}' <- peer (role={role} hp={hp}/{maxHp} iconKey='{icon}' iconRaw={hasIcon} parent={(parent != null ? parent.name : "<none>")})");
+            Vector3 wp = Vector3.zero; Vector2 lp = Vector2.zero;
+            try { wp = go.transform.position; } catch { }
+            try { lp = loc.LocalPosition; } catch { }
+            Log.LogInfo($"[ent] cloned remote entity '{id}' <- peer (role={role} hp={hp}/{maxHp} iconKey='{icon}' iconRaw={hasIcon} parent={(parent != null ? parent.name : "<none>")} lp=({lp.x:0.0},{lp.y:0.0}) wp=({wp.x:0.0},{wp.y:0.0},{wp.z:0.0}))");
         }
 
         // ---------------- icon resolution (IconRaw isn't serializable) ----------------
@@ -444,7 +464,7 @@ namespace IronNestVR
                     string id; try { id = e.ID; } catch { continue; }
                     if (string.IsNullOrEmpty(id)) continue;
                     int key = Fnv(id);
-                    SendSpawn(key, e);
+                    SendSpawn(key, e, loc);
                     if (!_sent.ContainsKey(key)) { try { _sent[key] = new SentState { ID = id, Pos = e.Position, State = (int)e.State, Health = e.Health }; } catch { } }
                     n++;
                 }
@@ -455,7 +475,7 @@ namespace IronNestVR
 
         // ---------------- send ----------------
 
-        private static void SendSpawn(int key, MapEntity e)
+        private static void SendSpawn(int key, MapEntity e, EntityLocation loc)
         {
             if (!EnsureBuf()) return;
             string id, name, icon; int role, state, hp, maxHp, armour, stars, scale; Vector3 pos;
@@ -470,12 +490,16 @@ namespace IronNestVR
                 state = (int)e.State; hp = e.Health; maxHp = e.MaxHealth; armour = e.Armour; stars = e.Stars; scale = e.Scale;
             }
             catch { return; }
+            // Parent-relative transform position = the authored world placement (the grid cell `pos` is DERIVED from it,
+            // not vice-versa). Sent so the client can position the clone's TRANSFORM under the shared Fire Mission Root.
+            Vector3 lpos = Vector3.zero; try { if (loc != null) lpos = loc.transform.localPosition; } catch { }
             int o = 0; _buf[o++] = MSG_SPAWN; o = PutInt(o, key);
             o = PutStr(o, id); o = PutStr(o, name); o = PutStr(o, icon);
             o = PutInt(o, role); o = PutV(o, pos); o = PutInt(o, state); o = PutInt(o, hp);
             o = PutInt(o, maxHp); o = PutInt(o, armour); o = PutInt(o, stars); o = PutInt(o, scale);
+            o = PutV(o, lpos);
             CoopP2P.Send(_buf, o, true);
-            Log.LogInfo($"[ent] spawn '{id}' -> peer (role={role} hp={hp}/{maxHp} state={state})");
+            Log.LogInfo($"[ent] spawn '{id}' -> peer (role={role} hp={hp}/{maxHp} state={state} lpos=({lpos.x:0.00},{lpos.y:0.00},{lpos.z:0.00}))");
         }
 
         // Discrete state/hp change OR periodic position keyframe — ALWAYS reliable (and Steam-ordered), so it can't
@@ -546,7 +570,10 @@ namespace IronNestVR
 
         // Parent for a cloned mirror: the canvas the game places EntityLocations under. Prefer an existing
         // scene EntityLocation's parent (exact match for the live scene); else null and let EntityLocation
-        // self-resolve its root canvas (ResolveRootCanvasRect).
+        // self-resolve its root canvas (ResolveRootCanvasRect) — which positions the marker correctly by its
+        // LocalPosition (grid cell). NOTE: do NOT force 'Fire Mission Root' on a gated client — that's a world-space
+        // container, not the marker canvas, and parenting there collapses every marker's LocalPosition to (0,0) (all
+        // icons stack on one point). The markers render fine unparented; the recon-photo gap is elsewhere.
         private static Transform ResolveEntityParent()
         {
             try
@@ -560,6 +587,40 @@ namespace IronNestVR
                 }
             }
             catch { }
+            return null;
+        }
+
+        // Clone parent: prefer an existing native EntityLocation's parent (exact for THIS scene); else the host's
+        // world-space entity container 'Fire Mission Root'. Cached — the host's spawn burst calls AdoptOrClone up to
+        // ~60× back-to-back, and a gated client always falls through to the (otherwise full-hierarchy) FMR lookup.
+        private static Transform _cloneParentCache;
+
+        private static Transform ResolveCloneParent()
+        {
+            try { if (_cloneParentCache != null) { var _ = _cloneParentCache.name; return _cloneParentCache; } } catch { _cloneParentCache = null; }
+            var p = ResolveEntityParent();
+            if (p != null) { _cloneParentCache = p; return p; }
+            var fmr = FindFireMissionRoot();
+            if (fmr != null) _cloneParentCache = fmr;
+            return fmr;
+        }
+
+        private static Transform FindFireMissionRoot()
+        {
+            try
+            {
+                var go = GameObject.Find("Fire Mission Root");
+                if (go != null) return go.transform;
+                // Fallback: scan transforms by name (covers a differently-rooted/inactive-by-the-time-we-look case).
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<Transform>(), FindObjectsSortMode.None);
+                if (arr != null) for (int i = 0; i < arr.Length; i++)
+                {
+                    var t = arr[i].TryCast<Transform>(); if (t == null) continue;
+                    string nm = null; try { nm = t.name; } catch { }
+                    if (nm == "Fire Mission Root") return t;
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[ent] findFMR: " + e.Message); }
             return null;
         }
 
@@ -601,6 +662,7 @@ namespace IronNestVR
         {
             foreach (var m in _mirrors.Values) if (m.IsClone && m.Go != null) { try { UnityEngine.Object.Destroy(m.Go); } catch { } }
             _mirrors.Clear();
+            _cloneParentCache = null;   // re-resolve the entity container in the next mission scene
         }
 
         private static void ClearAll()

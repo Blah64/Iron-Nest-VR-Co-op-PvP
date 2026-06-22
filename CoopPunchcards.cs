@@ -1102,8 +1102,7 @@ namespace IronNestVR
         private static float _reconWatchUntil;
         private static float _nextReconSnap;
         private static int _reconSnapIdx;
-        private static bool _photoDumped;   // photo-probe: dump the first MapToken_Recon's render tree once per arm
-        private static int _photoNodeCount;
+        private static int _photoNodeCount;   // photo-probe: descendant-walk node cap guard
 
         private static void ArmReconWatch(PunchcardRuntime card, string who)
         {
@@ -1122,7 +1121,6 @@ namespace IronNestVR
             _reconWatchUntil = Time.unscaledTime + 12f;
             _nextReconSnap = 0f;     // sample on the very next Tick
             _reconSnapIdx = 0;
-            _photoDumped = false;
             Log.LogInfo($"[recon-probe] armed ({who}) — sampling MapEntity/recon-token state for 12s to find the reveal mechanism");
         }
 
@@ -1133,41 +1131,104 @@ namespace IronNestVR
             if (now >= _reconWatchUntil) { _reconWatchUntil = 0f; Log.LogInfo("[recon-probe] window closed"); return; }
             if (now < _nextReconSnap) return;
             _nextReconSnap = now + 1f;
-            ReconSnapshot(_reconSnapIdx++);
-            DumpReconPhoto();   // one-shot: the photo's actual RENDER content (entity/fog state already proved identical)
+            int idx = _reconSnapIdx++;
+            ReconSnapshot(idx);
+            DumpReconPhoto(idx);   // the photo's actual RENDER content (entity/fog state already proved identical)
         }
 
-        // The recon-probe proved entity/fog/token STATE is byte-identical host vs client, yet the host's photos show
-        // enemy icons and the client's are blank — so the gap is in the photo's RENDERED content, which no state probe
-        // sees. Dump the first MapToken_Recon's full descendant tree with each node's render components (Camera +
-        // targetTexture, RawImage + texture, Image + sprite, SpriteRenderer + sprite, MeshRenderer). Diff host vs client:
-        // a NULL/empty texture or sprite (or disabled renderer) on the client side is the icon that never made it onto
-        // the photo. A Camera+targetTexture means the photo is a render-to-texture SNAPSHOT (timing/layer bug); per-icon
-        // Image/SpriteRenderer children mean it's procedural (missing/blank-sprite children).
-        private static void DumpReconPhoto()
+        // COMPREHENSIVE photo probe — sampled 3× across the recon window (idx 3/7/11) so we catch late development and
+        // don't depend on one token being a content photo. For EVERY MapToken_Recon: its TMP text + spriteAsset (icons
+        // may be inline <sprite> glyphs), and every SpriteRenderer/Image/MeshRenderer within 1u that is NOT its own child
+        // (icons may be separate objects laid over the paper) WITH its hierarchy path so we can find + replicate them.
+        // The FIRST token also gets a full descendant tree listing ALL component type names (catches a custom recon/icon
+        // MonoBehaviour the typed render checks miss). Diff host vs client: whatever the host has and the client lacks
+        // (text content, a sprite asset, or a nearby icon object) is the gap.
+        private static void DumpReconPhoto(int idx)
         {
-            if (_photoDumped) return;
-            DraggableItem token = null;
+            if (idx != 3 && idx != 7 && idx != 11) return;
+
+            Il2CppArrayBase<UnityEngine.Object> srAll = null, imAll = null, mrAll = null, drags = null;
+            try { srAll = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<SpriteRenderer>(), FindObjectsSortMode.None); } catch { }
+            try { imAll = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<UnityEngine.UI.Image>(), FindObjectsSortMode.None); } catch { }
+            try { mrAll = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MeshRenderer>(), FindObjectsSortMode.None); } catch { }
+            try { drags = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<DraggableItem>(), FindObjectsSortMode.None); } catch { }
+
+            var sb = new StringBuilder();
+            int tokCount = 0;
+            if (drags != null) for (int i = 0; i < drags.Length && tokCount < 12; i++)
+            {
+                var d = drags[i].TryCast<DraggableItem>(); if (d == null) continue;
+                string nm = null; try { nm = d.gameObject.name; } catch { }
+                if (nm == null || !nm.StartsWith("MapToken_Recon")) continue;
+                tokCount++;
+                Transform tr = null; try { tr = d.transform; } catch { }
+                if (tr == null) continue;
+                Vector3 tp; try { tp = tr.position; } catch { continue; }
+                sb.Append($"\n {nm} @({tp.x:0.00},{tp.y:0.00},{tp.z:0.00}):");
+
+                // Full descendant tree (with ALL component types) for the FIRST token only — they share structure.
+                if (tokCount == 1) { _photoNodeCount = 0; try { DumpPhotoNode(tr, 3, sb); } catch (Exception e) { sb.Append(" tree-ERR:" + e.Message); } }
+
+                // Hypothesis A: TMP inline-sprite icons in the photo's text.
+                string txt = "<none>", sa = "";
+                try
+                {
+                    var tmp = tr.GetComponentInChildren<TMPro.TMP_Text>(true);
+                    if (tmp != null)
+                    {
+                        try { var s = tmp.text; if (s != null) txt = (s.Length > 80 ? s.Substring(0, 80) : s).Replace("\n", "\\n"); } catch { }
+                        try { var sp = tmp.spriteAsset; if (sp != null) sa = sp.name; } catch { }
+                    }
+                }
+                catch { }
+                sb.Append($"\n   text='{txt}' spriteAsset='{sa}'");
+
+                // Hypothesis B: separate icon objects laid over the paper (not children) — within 1u, with their path.
+                int nSpr = 0, nImg = 0, nMesh = 0; var nb = new StringBuilder();
+                if (srAll != null) for (int j = 0; j < srAll.Length; j++)
+                {
+                    var sr = srAll[j].TryCast<SpriteRenderer>(); if (sr == null) continue;
+                    var st = sr.transform; Vector3 p2; try { p2 = st.position; } catch { continue; }
+                    if ((p2 - tp).sqrMagnitude > 1.0f || IsUnder(st, tr)) continue;
+                    nSpr++; if (nb.Length < 400) { string spn = "?"; try { spn = sr.sprite != null ? sr.sprite.name : "null"; } catch { } bool en = false; try { en = sr.enabled; } catch { } nb.Append($"\n   +SPR {PathShort(st)} sp={spn} en={en}"); }
+                }
+                if (imAll != null) for (int j = 0; j < imAll.Length; j++)
+                {
+                    var im = imAll[j].TryCast<UnityEngine.UI.Image>(); if (im == null) continue;
+                    var st = im.transform; Vector3 p2; try { p2 = st.position; } catch { continue; }
+                    if ((p2 - tp).sqrMagnitude > 1.0f || IsUnder(st, tr)) continue;
+                    nImg++; if (nb.Length < 700) { string spn = "?"; try { spn = im.sprite != null ? im.sprite.name : "null"; } catch { } nb.Append($"\n   +IMG {PathShort(st)} sp={spn}"); }
+                }
+                if (mrAll != null) for (int j = 0; j < mrAll.Length; j++)
+                {
+                    var mr = mrAll[j].TryCast<MeshRenderer>(); if (mr == null) continue;
+                    var st = mr.transform; Vector3 p2; try { p2 = st.position; } catch { continue; }
+                    if ((p2 - tp).sqrMagnitude > 1.0f || IsUnder(st, tr)) continue;
+                    nMesh++;   // count only — the map surface + paper are meshes, don't spam their paths
+                }
+                sb.Append($"\n   nearby(spr={nSpr} img={nImg} mesh={nMesh}){nb}");
+            }
+
+            Log.LogInfo($"[photo-probe {(CoopP2P.IsHost ? "HOST" : "CLI ")} T{idx}] {tokCount} recon token(s):{sb}");
+        }
+
+        // True if t is, or is descended from, ancestor.
+        private static bool IsUnder(Transform t, Transform ancestor)
+        {
+            try { for (Transform p = t; p != null; p = p.parent) if ((object)p == (object)ancestor) return true; } catch { }
+            return false;
+        }
+
+        // Last up-to-3 path segments — enough to identify + locate an object without dumping the whole hierarchy.
+        private static string PathShort(Transform t)
+        {
             try
             {
-                var drags = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<DraggableItem>(), FindObjectsSortMode.None);
-                if (drags != null) for (int i = 0; i < drags.Length; i++)
-                {
-                    var d = drags[i].TryCast<DraggableItem>(); if (d == null) continue;
-                    string nm = null; try { nm = d.gameObject.name; } catch { }
-                    if (nm != null && nm.StartsWith("MapToken_Recon")) { token = d; break; }
-                }
+                string a = t.name; var p = t.parent; if (p == null) return a;
+                string b = p.name; var g = p.parent; if (g == null) return b + "/" + a;
+                return g.name + "/" + b + "/" + a;
             }
-            catch { }
-            if (token == null) return;   // none spawned yet — retry next tick
-            _photoDumped = true;
-            _photoNodeCount = 0;
-
-            Transform root = null; try { root = token.transform; } catch { }
-            if (root == null) return;
-            var sb = new StringBuilder();
-            try { DumpPhotoNode(root, 0, sb); } catch (Exception e) { sb.Append(" ERR:" + e.Message); }
-            Log.LogInfo($"[photo-probe {(CoopP2P.IsHost ? "HOST" : "CLI ")}] '{SafeNodeName(root)}' render tree:{sb}");
+            catch { return "?"; }
         }
 
         private static void DumpPhotoNode(Transform t, int depth, StringBuilder sb)
@@ -1183,7 +1244,54 @@ namespace IronNestVR
             try { var ri = t.GetComponent<UnityEngine.UI.RawImage>(); if (ri != null) { var tx = ri.texture; sb.Append($" [RawImg en={ri.enabled} tex={(tx != null ? tx.name : "NULL")}]"); } } catch { }
             try { var im = t.GetComponent<UnityEngine.UI.Image>(); if (im != null) { var sp = im.sprite; float a = 1f; try { a = im.color.a; } catch { } sb.Append($" [Img en={im.enabled} sp={(sp != null ? sp.name : "NULL")} a={a:0.0}]"); } } catch { }
             try { var sr = t.GetComponent<SpriteRenderer>(); if (sr != null) { var sp = sr.sprite; sb.Append($" [SprR en={sr.enabled} sp={(sp != null ? sp.name : "NULL")}]"); } } catch { }
-            try { var mr = t.GetComponent<MeshRenderer>(); if (mr != null) sb.Append($" [Mesh en={mr.enabled}]"); } catch { }
+            try
+            {
+                var mr = t.GetComponent<MeshRenderer>();
+                if (mr != null)
+                {
+                    sb.Append($" [Mesh en={mr.enabled}");
+                    try
+                    {
+                        var mat = mr.sharedMaterial;
+                        if (mat != null)
+                        {
+                            string shader = "?"; try { shader = mat.shader != null ? mat.shader.name : "null"; } catch { }
+                            sb.Append($" shader='{shader}'");
+                            // URP/Lit keeps its albedo in _BaseMap, NOT _MainTex — material.mainTexture (=_MainTex) reads
+                            // null for it. Probe the real URP slots so we SEE the developed photo texture.
+                            AppendTex(sb, mat, "_BaseMap");
+                            AppendTex(sb, mat, "_MainTex");
+                            AppendTex(sb, mat, "_BaseColorMap");
+                            AppendTex(sb, mat, "_UnlitColorMap");
+                            try { var mt = mat.mainTexture; if (mt != null) { int w = mt.width, h = mt.height; string tt = mt.GetIl2CppType().Name; sb.Append($" mainTexture='{mt.name}'({tt} {w}x{h})"); } } catch { }
+                        }
+                        else sb.Append(" mat=NULL");
+                    }
+                    catch (Exception e) { sb.Append(" mat-ERR:" + e.Message); }
+                    sb.Append(']');
+                }
+            }
+            catch { }
+
+            // ALL component types on this node — a custom recon/icon MonoBehaviour that builds the photo content hides
+            // here, invisible to the typed render checks above.
+            try
+            {
+                var comps = t.GetComponents(Il2CppType.Of<Component>());
+                if (comps != null && comps.Length > 0)
+                {
+                    sb.Append(" {");
+                    for (int i = 0; i < comps.Length; i++)
+                    {
+                        var c = comps[i]; if (c == null) continue;
+                        string tn = "?"; try { tn = c.GetIl2CppType().Name; } catch { }
+                        if (i > 0) sb.Append(',');
+                        sb.Append(tn);
+                    }
+                    sb.Append('}');
+                }
+            }
+            catch { }
 
             int n = 0; try { n = t.childCount; } catch { return; }
             for (int i = 0; i < n; i++)
@@ -1195,12 +1303,28 @@ namespace IronNestVR
 
         private static string SafeNodeName(Transform t) { try { return t.name; } catch { return "?"; } }
 
+        // Read a named texture property (URP uses _BaseMap etc., not _MainTex) — logs nothing if the property is absent.
+        private static void AppendTex(StringBuilder sb, Material mat, string prop)
+        {
+            try
+            {
+                var tex = mat.GetTexture(prop);
+                if (tex == null) return;
+                int w = 0, h = 0; try { w = tex.width; h = tex.height; } catch { }
+                string tt = "?"; try { tt = tex.GetIl2CppType().Name; } catch { }
+                sb.Append($" {prop}='{tex.name}'({tt} {w}x{h})");
+            }
+            catch { }
+        }
+
         private static void ReconSnapshot(int idx)
         {
             try
             {
                 int total = 0, hidden = 0, visHidden = 0, visShown = 0, goOff = 0;
                 var states = new StringBuilder();
+                var hostiles = new StringBuilder();   // per-enemy POSITION+parent+alpha — the only host/client asymmetry left to check
+                int hostCount = 0;
                 Il2CppArrayBase<UnityEngine.Object> ents = null;
                 try { ents = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<EntityLocation>(), FindObjectsSortMode.None); } catch { }
                 if (ents != null) for (int i = 0; i < ents.Length; i++)
@@ -1220,6 +1344,18 @@ namespace IronNestVR
                     float alpha = -1f; try { var vg = loc.VisibilityGroup; if (vg != null) alpha = vg.alpha; } catch { }
                     if (alpha >= 0f) { if (alpha < 0.5f) visHidden++; else visShown++; }
                     if ((st != 0 || !actGo) && states.Length < 400) states.Append($"{id}=st{st}{(actGo ? "" : ",off")} ");
+
+                    // Enemy markers carry the icons that should land on the photo. Dump each one's MAP position, world
+                    // position, actual parent (after RecalculateAndRegister) and alpha — if these differ host vs client,
+                    // the client's enemies sit somewhere the photo doesn't cover (or in a canvas that doesn't render over it).
+                    if (id != null && id.StartsWith("hostile") && hostCount < 8)
+                    {
+                        hostCount++;
+                        Vector2 lp = Vector2.zero; try { lp = loc.LocalPosition; } catch { }
+                        Vector3 wp = Vector3.zero; try { wp = loc.transform.position; } catch { }
+                        string par = "<none>"; try { var pp = loc.transform.parent; if (pp != null) par = pp.name; } catch { }
+                        hostiles.Append($"{id} lp=({lp.x:0.0},{lp.y:0.0}) wp=({wp.x:0.00},{wp.y:0.00},{wp.z:0.00}) a={alpha:0.0} par='{par}'; ");
+                    }
                 }
 
                 // Recon fog: enemies start covered by MapReconClearChild fog GameObjects under a MapReconClearHandle;
@@ -1254,6 +1390,7 @@ namespace IronNestVR
                 }
 
                 Log.LogInfo($"[recon-probe T{idx}] entities={total} stHidden={hidden} goOff={goOff} vis(shown={visShown} hidden={visHidden}) | fog: clearers={clearers} activeHandles={activeHandles} children={fogActive}/{fogChildren} | reconTokens={reconCount} | nonzero/off: {states}| recon: {toks}");
+                if (hostiles.Length > 0) Log.LogInfo($"[recon-probe T{idx} enemies] {hostiles}");
             }
             catch (Exception e) { Log.LogWarning("[recon-probe] snap: " + e.Message); }
         }
