@@ -320,6 +320,7 @@ namespace IronNestVR
             PerfProbe.UpdateBegin();
             LogEnvironmentOnce();
             AutoTuneOnce();
+            RenderThreadProbe.Tick();   // PLANXR feasibility test (self-terminating; logs one [rtprobe] RESULT)
             PerfTick();
             ScanSceneOnce();
             Diagnostics.Tick();

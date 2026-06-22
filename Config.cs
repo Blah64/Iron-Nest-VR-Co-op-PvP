@@ -326,6 +326,20 @@ namespace IronNestVR
         public static bool LeaderboardCamThrottle = true;
         public static float LeaderboardCamHz = 6f;
 
+        // One-shot feasibility probe for the render-thread swapchain-copy plan (PLANXR open question #2):
+        // can we register an [UnmanagedCallersOnly] callback fired via CommandBuffer.IssuePluginEvent under
+        // BepInEx IL2CPP, and does it run on the render thread? Self-terminates after ~120 frames with one
+        // [rtprobe] RESULT line. ANSWERED 2026-06-22 (✓ fires; render-thread when gfx-direct off) — default
+        // off now. See RenderThreadProbe.
+        public static bool RenderThreadProbeTest = false;
+
+        // PLANXR Phase 0: route the per-eye swapchain copy + xrReleaseSwapchainImage through a single
+        // CommandBuffer.IssuePluginEventAndData callback (instead of the raw main-thread CopyResource +
+        // ReleaseEye). Default OFF — flatscreen/VR behavior is identical to today until proven. With
+        // -force-gfx-direct ON the callback runs on the main thread (no race); the win comes in Phase 1
+        // when the flag is dropped and the same callback lands on Unity's render thread. See PLANXR.md.
+        public static bool RenderThreadCopy = false;
+
         // --- Diagnostics / quick toggles for live tuning ---
         // Phase 2.5 isolation: render each eye as a flat clear color (no scene) to prove the
         // swapchain copy + projection-layer submission path independent of scene rendering.
@@ -771,6 +785,8 @@ namespace IronNestVR
                 case "DisableLeaderboardCam": DisableLeaderboardCam = PB(v, DisableLeaderboardCam); break;
                 case "LeaderboardCamThrottle": LeaderboardCamThrottle = PB(v, LeaderboardCamThrottle); break;
                 case "LeaderboardCamHz": LeaderboardCamHz = PF(v, LeaderboardCamHz); break;
+                case "RenderThreadProbeTest": RenderThreadProbeTest = PB(v, RenderThreadProbeTest); break;
+                case "RenderThreadCopy": RenderThreadCopy = PB(v, RenderThreadCopy); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;

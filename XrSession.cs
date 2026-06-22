@@ -1,9 +1,12 @@
 using System;
+using System.Runtime.InteropServices;
 using BepInEx.Logging;
 using Silk.NET.Core.Native;
 using Silk.NET.OpenXR;
 using Silk.NET.OpenXR.Extensions.KHR;
 using UnityEngine.Experimental.Rendering;
+// NOTE: deliberately NOT `using UnityEngine;` — UnityEngine.Space collides with Silk.NET.OpenXR.Space.
+// UnityEngine types (Graphics, SystemInfo, Rendering.CommandBuffer) are fully qualified below.
 
 namespace IronNestVR
 {
@@ -42,6 +45,32 @@ namespace IronNestVR
         private int _submitFrames;
         private long _swapchainFormat;
         private GraphicsFormat _gfxFormat = GraphicsFormat.R8G8B8A8_UNorm;
+
+        // ---- PLANXR Phase 0: render-thread copy + release (Config.RenderThreadCopy) ----
+        // Per eye, the raw CopyResource (reusing the proven D3D11Bridge path) and xrReleaseSwapchainImage
+        // are issued as ONE CommandBuffer.IssuePluginEventAndData event, so they replay in program order on
+        // whatever thread runs the render command stream: the MAIN thread while -force-gfx-direct is on
+        // (Phase 0 — no cross-thread race), the RENDER thread once it's dropped (Phase 1). Default OFF.
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CopyReleaseData { public IntPtr Dst; public IntPtr Src; public int Eye; }
+
+        // __stdcall matches Unity's UnityRenderingEventAndData(int eventId, void* data). Do NOT switch to
+        // [UnmanagedCallersOnly] — it collides (CS0433) with IL2CPP's own copy in UnityEngine.CoreModule.
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void RenderEventAndData(int eventId, IntPtr data);
+
+        private const int RtCopyEvent = 0x4953; // 'IS'
+        private static readonly RenderEventAndData _rtcDel = OnCopyRelease; // static-kept-alive (else dangles)
+        private static IntPtr _rtcCbPtr;
+        private static volatile bool _rtcActive;
+        private static volatile int _rtcFires;
+        private static XR _rtcXr;
+        private static D3D11Bridge _rtcBridge;
+        private static Swapchain[] _rtcSwapchains;
+        private static IntPtr _rtcData0, _rtcData1; // CopyReleaseData* (AllocHGlobal — GC-stable for the callback)
+        private bool _rtcInit;
+        private UnityEngine.Rendering.CommandBuffer[] _rtcCb;
+        private int _rtcNextLog;
 
         private int _lastRcWarnTick;
         // Finite swapchain wait. The old long.MaxValue could freeze the whole game (the wait runs on
@@ -487,14 +516,80 @@ namespace IronNestVR
                 // if the process vanishes here, the heartbeat file's last line names this exact step.
                 Dbg.Beat($"f{f} eye{eye} CopyTexture sc={(sc != IntPtr.Zero ? 1 : 0)} rt={(rt != IntPtr.Zero ? 1 : 0)}");
                 if (tr) Dbg.Step($"submit eye{eye}: rt=0x{rt:X}; CopyTexture");
-                if (sc != IntPtr.Zero && rt != IntPtr.Zero) bridge.CopyTexture((void*)sc, (void*)rt);
-                if (tr) Dbg.Step($"submit eye{eye}: ReleaseEye");
-                if (sc != IntPtr.Zero) ReleaseEye(eye);
+                if (sc != IntPtr.Zero && rt != IntPtr.Zero)
+                {
+                    if (Config.RenderThreadCopy)
+                    {
+                        if (!_rtcInit) InitRenderThreadCopy(bridge);
+                        IntPtr dp = eye == 0 ? _rtcData0 : _rtcData1;
+                        var d = (CopyReleaseData*)dp;
+                        d->Dst = sc; d->Src = rt; d->Eye = eye;
+                        var cb = _rtcCb[eye];
+                        cb.Clear();
+                        cb.IssuePluginEventAndData(_rtcCbPtr, RtCopyEvent, dp);
+                        if (tr) Dbg.Step($"submit eye{eye}: ExecuteCommandBuffer (copy+release)");
+                        UnityEngine.Graphics.ExecuteCommandBuffer(cb); // copy + xrReleaseSwapchainImage, in-order
+                    }
+                    else
+                    {
+                        bridge.CopyTexture((void*)sc, (void*)rt);
+                        if (tr) Dbg.Step($"submit eye{eye}: ReleaseEye");
+                        ReleaseEye(eye);
+                    }
+                }
+                else if (sc != IntPtr.Zero)
+                {
+                    // Acquired but nothing to copy (rt null): release anyway so the image isn't leaked.
+                    if (tr) Dbg.Step($"submit eye{eye}: ReleaseEye (no copy)");
+                    ReleaseEye(eye);
+                }
             }
             Dbg.Beat($"f{f} SubmitProjection");
             if (tr) Dbg.Step("submit: SubmitProjection");
             SubmitProjection();
+            if (Config.RenderThreadCopy && _rtcActive && f >= _rtcNextLog)
+            {
+                _rtcNextLog = f + 120;
+                Log.LogInfo($"[rtcopy] frame={f} fires={_rtcFires} mode={UnityEngine.SystemInfo.renderingThreadingMode}");
+            }
             if (tr) Dbg.Step("submit: frame done");
+        }
+
+        // Runs on the render-command-stream thread: the MAIN thread in Direct mode, the RENDER thread once
+        // -force-gfx-direct is dropped. MUST stay minimal — only raw native calls (CopyResource via the
+        // bridge, xrReleaseSwapchainImage) and an int counter. No managed allocation, no Unity main-thread
+        // APIs, no logging. An exception must never cross back into native render code.
+        private static void OnCopyRelease(int eventId, IntPtr data)
+        {
+            if (!_rtcActive || data == IntPtr.Zero) return;
+            try
+            {
+                var d = (CopyReleaseData*)data;
+                _rtcBridge.CopyTexture(d->Dst, d->Src);            // proven raw CopyResource (immediate ctx)
+                var ri = new SwapchainImageReleaseInfo { Type = StructureType.TypeSwapchainImageReleaseInfo };
+                _rtcXr.ReleaseSwapchainImage(_rtcSwapchains[d->Eye], &ri); // ordered AFTER the copy, same stream
+                _rtcFires++;
+            }
+            catch { /* swallow: never propagate across the native boundary */ }
+        }
+
+        // Lazily arm the render-thread copy path on first use (single session, so static stash is safe).
+        private void InitRenderThreadCopy(D3D11Bridge bridge)
+        {
+            _rtcInit = true;
+            _rtcXr = _xr;
+            _rtcBridge = bridge;
+            _rtcSwapchains = _swapchains;
+            _rtcCbPtr = Marshal.GetFunctionPointerForDelegate(_rtcDel);
+            _rtcData0 = Marshal.AllocHGlobal(sizeof(CopyReleaseData));
+            _rtcData1 = Marshal.AllocHGlobal(sizeof(CopyReleaseData));
+            _rtcCb = new[]
+            {
+                new UnityEngine.Rendering.CommandBuffer { name = "IronNestVR_CopyRelease0" },
+                new UnityEngine.Rendering.CommandBuffer { name = "IronNestVR_CopyRelease1" }
+            };
+            _rtcActive = true;
+            Log.LogInfo($"[rtcopy] Phase 0 armed: copy+release via IssuePluginEventAndData. mode={UnityEngine.SystemInfo.renderingThreadingMode}");
         }
 
         private void SubmitProjection()
@@ -559,6 +654,15 @@ namespace IronNestVR
         {
             try
             {
+                // Stop the render-thread copy path first so no in-flight callback touches a destroyed
+                // swapchain. In Direct mode (Phase 0) callbacks are synchronous so none are pending here;
+                // a real in-flight drain is a Phase 2 hardening item (see PLANXR.md).
+                _rtcActive = false;
+                _rtcXr = null; _rtcBridge = null; _rtcSwapchains = null;
+                if (_rtcCb != null) { foreach (var cb in _rtcCb) { try { cb?.Dispose(); } catch { } } _rtcCb = null; }
+                if (_rtcData0 != IntPtr.Zero) { Marshal.FreeHGlobal(_rtcData0); _rtcData0 = IntPtr.Zero; }
+                if (_rtcData1 != IntPtr.Zero) { Marshal.FreeHGlobal(_rtcData1); _rtcData1 = IntPtr.Zero; }
+
                 if (_inFrame) EndFrame(null, 0);
                 _input.Dispose();
                 if (_swapchainsReady) { _xr.DestroySwapchain(_swapchains[0]); _xr.DestroySwapchain(_swapchains[1]); }
