@@ -390,20 +390,23 @@ namespace IronNestVR
                       () => (Grab != null && Grab.CalibratingWatch) ? "R-grip on wrist" : "tap",
                       () => Grab?.ToggleCalibrateWatch());
             AddToggle("Calibrate Clip Hold",   // how it sits in the hand: hold it, grip with the OTHER hand to move
-                      () => ClipHoldHint(),    // per-hand: grab with each hand and adjust to set L and R separately
+                      () => HoldHint(Grab != null && Grab.CalibratingClipHold, "grip clipboard"),
                       () => Grab?.ToggleCalibrateClipHold());
+            AddToggle("Calibrate Manual Hold", // how a world manual sits in the hand (its own offset)
+                      () => HoldHint(Grab != null && Grab.CalibratingManualHold, "grab a manual"),
+                      () => Grab?.ToggleCalibrateManualHold());
 
             AddAction("Reset HUD Layout", ResetHudLayout);
             AddAction("Close Menu", Close);
         }
 
-        // "Calibrate Clip Hold" value text: prompt to grab the clipboard, then show which hand's held pose is
-        // being edited (each hand is calibrated separately — grab with the left to set L, the right to set R).
-        private string ClipHoldHint()
+        // Hold-calibration value text: prompt to grab the prop, then show which hand's held pose is being
+        // edited (each hand is calibrated separately — grab with the left to set L, the right to set R).
+        private string HoldHint(bool armed, string grabPrompt)
         {
-            if (Grab == null || !Grab.CalibratingClipHold) return "tap";
-            int h = Grab.ClipboardHoldHand;
-            return h == 2 ? "R: other grip" : h == 1 ? "L: other grip" : "grip clipboard";
+            if (!armed) return "tap";
+            int h = Grab != null ? Grab.ClipboardHoldHand : 0;
+            return h == 2 ? "R: other grip" : h == 1 ? "L: other grip" : grabPrompt;
         }
 
         // Restore the waist/wrist/held anchors to their built-in defaults (the values baked into Config).
@@ -416,6 +419,10 @@ namespace IronNestVR
             Config.ClipHeldOffsetL = new Vector3(0.30866373f, 0.030668717f, 0.40904504f);
             Config.ClipHeldEulerL = new Vector3(62.616592f, 190.85422f, 198.97607f);
             Config.ClipHoldCurl = 0.28f;
+            Config.ManualHeldOffsetR = new Vector3(0f, 0.02f, 0.06f);
+            Config.ManualHeldEulerR = Vector3.zero;
+            Config.ManualHeldOffsetL = new Vector3(0f, 0.02f, 0.06f);
+            Config.ManualHeldEulerL = Vector3.zero;
             Config.WatchWristOffset = new Vector3(-0.118086986f, -0.03401533f, -0.1825182f);
             Config.WatchWristEuler = new Vector3(291.49533f, 99.28354f, 78.04213f);
             try { Config.Save(); } catch { }

@@ -402,6 +402,14 @@ namespace IronNestVR
         public static Vector3 ClipHeldEulerL = new Vector3(62.616592f, 190.85422f, 198.97607f);
         public static float ClipHoldCurl = 0.28f;
 
+        // World "operating manual" props get their OWN held pose — their pivots differ from the clipboard's,
+        // so the clipboard's offset would float them too far out. Per-hand (grip frames mirror). Calibrate by
+        // grabbing a manual and using "Calibrate Manual Hold". (Holding-hand finger curl reuses ClipHoldCurl.)
+        public static Vector3 ManualHeldOffsetR = new Vector3(0f, 0.02f, 0.06f);
+        public static Vector3 ManualHeldEulerR = new Vector3(0f, 0f, 0f);
+        public static Vector3 ManualHeldOffsetL = new Vector3(0f, 0.02f, 0.06f);
+        public static Vector3 ManualHeldEulerL = new Vector3(0f, 0f, 0f);
+
         // --- Gun watch wristband ---
         // The watch rides the LEFT controller like a wristwatch (it can't be grabbed). Offset is metres in the
         // left grip frame; WatchWristEuler orients the dial on the back of the wrist (degrees). The grip-frame
@@ -561,6 +569,10 @@ namespace IronNestVR
                 WV(sb, "ClipHeldOffsetL", ClipHeldOffsetL);
                 WV(sb, "ClipHeldEulerL", ClipHeldEulerL);
                 WF(sb, "ClipHoldCurl", ClipHoldCurl);
+                WV(sb, "ManualHeldOffsetR", ManualHeldOffsetR);
+                WV(sb, "ManualHeldEulerR", ManualHeldEulerR);
+                WV(sb, "ManualHeldOffsetL", ManualHeldOffsetL);
+                WV(sb, "ManualHeldEulerL", ManualHeldEulerL);
                 WV(sb, "WatchWristOffset", WatchWristOffset);
                 WV(sb, "WatchWristEuler", WatchWristEuler);
                 WB(sb, "CoopGasMask", CoopGasMask);
@@ -661,6 +673,10 @@ namespace IronNestVR
                 case "ClipHeldOffsetL": ClipHeldOffsetL = PV(v, ClipHeldOffsetL); break;
                 case "ClipHeldEulerL": ClipHeldEulerL = PV(v, ClipHeldEulerL); break;
                 case "ClipHoldCurl": ClipHoldCurl = PF(v, ClipHoldCurl); break;
+                case "ManualHeldOffsetR": ManualHeldOffsetR = PV(v, ManualHeldOffsetR); break;
+                case "ManualHeldEulerR": ManualHeldEulerR = PV(v, ManualHeldEulerR); break;
+                case "ManualHeldOffsetL": ManualHeldOffsetL = PV(v, ManualHeldOffsetL); break;
+                case "ManualHeldEulerL": ManualHeldEulerL = PV(v, ManualHeldEulerL); break;
                 case "WatchWristOffset": WatchWristOffset = PV(v, WatchWristOffset); break;
                 case "WatchWristEuler": WatchWristEuler = PV(v, WatchWristEuler); break;
                 case "CoopGasMask": CoopGasMask = PB(v, CoopGasMask); break;

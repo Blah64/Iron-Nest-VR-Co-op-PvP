@@ -7,24 +7,25 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// "Gravity glove" grab of cockpit controls. The laser stays the targeting tool; squeezing the RIGHT
-    /// grip while the laser is on a control flies the hand model onto it and operates it. Two families:
+    /// "Gravity glove" grab of cockpit controls. The laser stays the targeting tool; squeezing a grip while
+    /// that hand's laser is on a control flies the hand model onto it and operates it. Two families:
     ///
     /// • DRAG controls (<c>DialInteractable</c>/<c>LinearSliderInteractable</c>): start the GAME'S OWN drag
     ///   (<c>BeginDialDrag</c>/<c>BeginSliderDrag</c>) — the exact path the trigger uses, so the control
-    ///   actually turns/slides and the turret reacts (the prior value-API drive rotated the knob but
-    ///   bypassed the drag/broker state, so it never registered). While held the control follows the
-    ///   controller pointer (the <see cref="CockpitInteractor"/> keeps its raycast camera pinned down the
-    ///   controller every frame) and the hand is stuck RIGIDLY to the control's transform.
+    ///   actually turns/slides and the turret reacts. While held the control follows the controller pointer
+    ///   (the <see cref="CockpitInteractor"/> keeps its raycast camera pinned down the holding controller every
+    ///   frame — the right pointer cam for a right-hand grab, the LEFT pointer cam for a left-hand grab) and the
+    ///   hand is stuck RIGIDLY to the control's transform.
     ///
-    /// • CLICK switches/buttons (<c>LookAtTarget</c> — the simple click-to-activate controls): there is no
-    ///   drag to ride, so instead we let you PHYSICALLY OPERATE them — the hand follows your controller's
-    ///   travel from the grab point, and once it moves past <see cref="Config.SwitchThrowDistance"/> we fire
-    ///   the control's click the same way the cursor manager does (<c>HandleClickDown/UpFromManager</c>).
-    ///   Moving back re-arms it, so one grab can flip a toggle on then off. (Skips <c>PickUpZoomTarget</c>
+    /// • CLICK switches/buttons (<c>LookAtTarget</c>): there is no drag to ride, so we let you PHYSICALLY
+    ///   OPERATE them — the hand follows the controller's travel from the grab point, and once it moves past
+    ///   <see cref="Config.SwitchThrowDistance"/> we fire the control's click the same way the cursor manager
+    ///   does (<c>HandleClickDown/UpFromManager</c>). Moving back re-arms it. (Skips <c>PickUpZoomTarget</c>
     ///   manuals — those stay reposition-grabs owned by <see cref="GrabManager"/>.)
     ///
-    /// Right-hand only (only the right aim ray exists); the left hand stays a cosmetic follower.
+    /// EITHER hand can grab (both controllers have an aim ray). One control at a time; the right hand wins a
+    /// tie. For a left-hand DRAG the held control's raycast camera must follow the LEFT controller — see
+    /// <see cref="LeftHeldControlTransform"/>, which CockpitInteractor reads to pin that control to the left cam.
     /// </summary>
     internal sealed class HandManipulator
     {
@@ -33,6 +34,7 @@ namespace IronNestVR
         private enum Kind { None, Dial, Lever, Switch }
 
         private Kind _kind;
+        private int _hand;             // 0 none, 1 left, 2 right (which hand holds the control)
         private DialInteractable _dial;
         private LinearSliderInteractable _lever;
 
@@ -45,7 +47,12 @@ namespace IronNestVR
         private Vector3 _switchHandAnchor;
         private bool _switchLatched;
 
-        private bool _prevGrab;
+        private bool _prevGrabR, _prevGrabL;
+
+        // Set by VrManager. For a LEFT-hand dial/lever drag we point the control's own raycast camera at the
+        // LEFT pointer cam right away (before BeginDialDrag), so the first drag frame already reads the left
+        // controller instead of the right (CockpitInteractor keeps it pinned there for the rest of the drag).
+        internal CockpitInteractor Cockpit;
 
         // The hand's grab pose expressed in the control's LOCAL space, reapplied each frame so the hand
         // rides the actual knob/handle as the game moves it.
@@ -56,6 +63,14 @@ namespace IronNestVR
 
         public bool Active => _kind != Kind.None;
 
+        // The dial/lever currently held by the LEFT hand (else null). CockpitInteractor pins this control's
+        // own raycast camera to the LEFT pointer cam each frame so its native drag follows the left controller
+        // (the periodic repoint otherwise pins every control to the right cam). Switches don't need it (their
+        // activation is camera-independent), so only Dial/Lever are reported.
+        public Transform LeftHeldControlTransform =>
+            (_hand == 1) ? (_kind == Kind.Dial && _dial != null ? _dial.transform
+                          : _kind == Kind.Lever && _lever != null ? _lever.transform : null) : null;
+
         public void Tick(VrInput input, CameraRig rig, HandVisuals hands, bool active)
         {
             try
@@ -63,40 +78,54 @@ namespace IronNestVR
                 if (!Config.HandManipEnabled || !active)
                 {
                     if (Active) Release(input, hands, "inactive");
-                    _prevGrab = false;
+                    _prevGrabR = _prevGrabL = false;
                     return;
                 }
                 var origin = rig.OriginTransform;
                 if (origin == null) return;
 
                 if (Active) Drive(input, origin, hands);
-                else if (input.GrabR && !_prevGrab && input.AimValid && input.GripValid)
-                    TryAcquire(input, origin, hands);
+                else
+                {
+                    // Right hand wins a tie; each hand needs its OWN aim ray + grip.
+                    if (input.GrabR && !_prevGrabR && input.AimValid && input.GripValid)
+                        TryAcquire(2, input, origin, hands);
+                    else if (input.GrabL && !_prevGrabL && input.AimValidL && input.GripValidL)
+                        TryAcquire(1, input, origin, hands);
+                }
 
-                _prevGrab = input.GrabR;
+                _prevGrabR = input.GrabR;
+                _prevGrabL = input.GrabL;
             }
             catch (Exception e)
             {
                 Log.LogWarning("[manip] " + e.Message);
                 EndDrag();
-                _kind = Kind.None; _dial = null; _lever = null;
+                _kind = Kind.None; _hand = 0; _dial = null; _lever = null;
                 _switch = null; _switchInteractable = null; _switchLatched = false;
                 try { hands.ClearGrab(true); } catch { }
+                try { hands.ClearGrab(false); } catch { }
             }
         }
 
+        // ---------------- per-hand input helpers ----------------
+
+        private static bool HandGrab(int hand, VrInput input) => hand == 2 ? input.GrabR : input.GrabL;
+        private static bool HandGripValid(int hand, VrInput input) => hand == 2 ? input.GripValid : input.GripValidL;
+        private static Posef HandGripPose(int hand, VrInput input) => hand == 2 ? input.GripPose : input.GripPoseL;
+        private static Posef HandAimPose(int hand, VrInput input) => hand == 2 ? input.AimPose : input.AimPoseL;
+
         // ---------------- acquire ----------------
 
-        private void TryAcquire(VrInput input, Transform origin, HandVisuals hands)
+        private void TryAcquire(int hand, VrInput input, Transform origin, HandVisuals hands)
         {
-            GetWorld(origin, input.AimPose, out Vector3 ao, out Quaternion ar);
+            GetWorld(origin, HandAimPose(hand, input), out Vector3 ao, out Quaternion ar);
             Vector3 dir = ar * Vector3.forward;
             // Pick the nearest CONTROL the ray passes through, not just the single closest collider. A plain
             // Physics.Raycast stops at the first collider on any layer — so an invisible trigger volume (or any
-            // other non-control collider) in front of a dial/lever/switch silently blocks the grab, even though
-            // the laser visual (ignores triggers) and the trigger-click (game's layer-filtered interaction
-            // raycast) both reach the control. Scanning all hits for the nearest grabbable control restores
-            // parity with the trigger; a closer pick-up manual still yields to GrabManager's reposition grab.
+            // other non-control collider) in front of a dial/lever/switch silently blocks the grab. Scanning
+            // all hits for the nearest grabbable control restores parity with the trigger; a closer pick-up
+            // manual still yields to GrabManager's reposition grab.
             if (!RaycastControl(ao, dir, out RaycastHit hit, out Transform t))
                 return;
 
@@ -104,13 +133,13 @@ namespace IronNestVR
             if (dial != null)
             {
                 if (CoopControls.IsRemotelyOwned(dial)) { input.Haptic(Config.DetentHapticAmplitude, 0.02f); return; }  // peer is using it
-                EngageDial(dial, hit.point, input, origin, hands); return;
+                EngageDial(hand, dial, hit.point, input, origin, hands); return;
             }
             var lever = FindUp<LinearSliderInteractable>(t);
             if (lever != null)
             {
                 if (CoopControls.IsRemotelyOwned(lever)) { input.Haptic(Config.DetentHapticAmplitude, 0.02f); return; }
-                EngageLever(lever, hit.point, input, origin, hands); return;
+                EngageLever(hand, lever, hit.point, input, origin, hands); return;
             }
 
             // Click switch/button (LookAtTarget). Skip manuals (PickUpZoomTarget) — those are reposition
@@ -118,52 +147,64 @@ namespace IronNestVR
             if (Config.SwitchGrabEnabled && FindUp<PickUpZoomTarget>(t) == null)
             {
                 var sw = FindUp<LookAtTarget>(t);
-                if (sw != null) EngageSwitch(sw, hit.point, input, origin, hands);
+                if (sw != null) EngageSwitch(hand, sw, hit.point, input, origin, hands);
             }
         }
 
-        private void EngageDial(DialInteractable dial, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
+        private void EngageDial(int hand, DialInteractable dial, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
         {
             _dial = dial;
             _kind = Kind.Dial;
-            StickTo(dial.transform, hitPoint, input, origin);
+            _hand = hand;
+            StickTo(hand, dial.transform, hitPoint, input, origin);
+            if (hand == 1) PinLeftCam(c => dial.raycastCamera = c);  // left drag follows the left controller from frame 0
             try { dial.BeginDialDrag(); } catch (Exception e) { Log.LogWarning("[manip] BeginDialDrag: " + e.Message); }
-            hands.SetGrab(true, _handPos, _handRot);
+            hands.SetGrab(hand == 2, _handPos, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[manip] grabbed dial '{dial.name}' (native drag).");
+            Log.LogInfo($"[manip] grabbed dial '{dial.name}' ({(hand == 2 ? "right" : "left")}, native drag).");
         }
 
-        private void EngageLever(LinearSliderInteractable lever, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
+        private void EngageLever(int hand, LinearSliderInteractable lever, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
         {
             _lever = lever;
             _kind = Kind.Lever;
-            StickTo(lever.transform, hitPoint, input, origin);
+            _hand = hand;
+            StickTo(hand, lever.transform, hitPoint, input, origin);
+            if (hand == 1) PinLeftCam(c => lever.raycastCamera = c);  // left drag follows the left controller from frame 0
             try { lever.BeginSliderDrag(); } catch (Exception e) { Log.LogWarning("[manip] BeginSliderDrag: " + e.Message); }
-            hands.SetGrab(true, _handPos, _handRot);
+            hands.SetGrab(hand == 2, _handPos, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[manip] grabbed lever '{lever.name}' (native drag).");
+            Log.LogInfo($"[manip] grabbed lever '{lever.name}' ({(hand == 2 ? "right" : "left")}, native drag).");
         }
 
-        private void EngageSwitch(LookAtTarget sw, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
+        private void EngageSwitch(int hand, LookAtTarget sw, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
         {
             _switch = sw;
             _switchInteractable = sw.interactable;
             _kind = Kind.Switch;
-            GetWorld(origin, input.GripPose, out Vector3 gp, out Quaternion gr);
+            _hand = hand;
+            GetWorld(origin, HandGripPose(hand, input), out Vector3 gp, out Quaternion gr);
             _switchGrabGripPos = gp;     // controller anchor — throw is measured from here
             _switchHandAnchor = hitPoint; // seed the hand on the switch; it rides the controller travel
             _switchLatched = false;
             _handPos = hitPoint;
             _handRot = gr;
-            hands.SetGrab(true, _handPos, _handRot);
+            hands.SetGrab(hand == 2, _handPos, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[manip] grabbed switch '{sw.name}' (throw {Config.SwitchThrowDistance * 100f:0.#}cm to activate).");
+            Log.LogInfo($"[manip] grabbed switch '{sw.name}' ({(hand == 2 ? "right" : "left")}, throw {Config.SwitchThrowDistance * 100f:0.#}cm to activate).");
+        }
+
+        // Point a left-held control's raycast camera at the LEFT pointer cam (owned by CockpitInteractor).
+        private void PinLeftCam(Action<Camera> set)
+        {
+            var cam = Cockpit != null ? Cockpit.LeftPointerCam : null;
+            if (cam != null) set(cam);
         }
 
         // Record the grab pose relative to the control's transform, and seed the hand there now.
-        private void StickTo(Transform ctrl, Vector3 hitPoint, VrInput input, Transform origin)
+        private void StickTo(int hand, Transform ctrl, Vector3 hitPoint, VrInput input, Transform origin)
         {
-            GetWorld(origin, input.GripPose, out _, out Quaternion cr);
+            GetWorld(origin, HandGripPose(hand, input), out _, out Quaternion cr);
             _stickLocalPos = ctrl.InverseTransformPoint(hitPoint);
             _stickLocalRot = Quaternion.Inverse(ctrl.rotation) * cr;
             _handPos = hitPoint;
@@ -174,7 +215,7 @@ namespace IronNestVR
 
         private void Drive(VrInput input, Transform origin, HandVisuals hands)
         {
-            bool held = input.GrabR && input.GripValid;
+            bool held = HandGrab(_hand, input) && HandGripValid(_hand, input);
             if (!held) { Release(input, hands, "released"); return; }
 
             if (_kind == Kind.Switch) { DriveSwitch(input, origin, hands); return; }
@@ -187,7 +228,7 @@ namespace IronNestVR
             // the hand stuck to the moving knob/handle.
             _handPos = ctrl.TransformPoint(_stickLocalPos);
             _handRot = ctrl.rotation * _stickLocalRot;
-            hands.SetGrab(true, _handPos, _handRot);
+            hands.SetGrab(_hand == 2, _handPos, _handRot);
         }
 
         // Click switch: the game has no drag to ride, so the HAND tracks the controller's travel from the
@@ -197,11 +238,11 @@ namespace IronNestVR
         {
             if (_switch == null) { Release(input, hands, "control gone"); return; }
 
-            GetWorld(origin, input.GripPose, out Vector3 gp, out Quaternion gr);
+            GetWorld(origin, HandGripPose(_hand, input), out Vector3 gp, out Quaternion gr);
             Vector3 delta = gp - _switchGrabGripPos;
             _handPos = _switchHandAnchor + delta; // hand follows the controller so it looks operated
             _handRot = gr;
-            hands.SetGrab(true, _handPos, _handRot);
+            hands.SetGrab(_hand == 2, _handPos, _handRot);
 
             float travel = delta.magnitude;
             if (!_switchLatched && travel >= Config.SwitchThrowDistance)
@@ -245,10 +286,10 @@ namespace IronNestVR
         private void Release(VrInput input, HandVisuals hands, string why)
         {
             EndDrag();
-            try { hands.ClearGrab(true); } catch { }
+            try { hands.ClearGrab(_hand == 2); } catch { }
             try { input.Haptic(Config.DetentHapticAmplitude, 0.03f); } catch { }
             Log.LogInfo($"[manip] released ({why}).");
-            _kind = Kind.None; _dial = null; _lever = null;
+            _kind = Kind.None; _hand = 0; _dial = null; _lever = null;
             _switch = null; _switchInteractable = null; _switchLatched = false;
         }
 
@@ -319,7 +360,7 @@ namespace IronNestVR
         public void Reset()
         {
             EndDrag();
-            _kind = Kind.None; _dial = null; _lever = null; _prevGrab = false;
+            _kind = Kind.None; _hand = 0; _dial = null; _lever = null; _prevGrabR = _prevGrabL = false;
             _switch = null; _switchInteractable = null; _switchLatched = false;
         }
     }

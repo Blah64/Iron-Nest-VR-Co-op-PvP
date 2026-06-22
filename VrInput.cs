@@ -23,6 +23,7 @@ namespace IronNestVR
 
         private ActionSet _actionSet;
         private XrAction _aAimPose;   // pointing ray origin (right)
+        private XrAction _aAimPoseL;  // pointing ray origin (left)
         private XrAction _aGripPose;  // right hand origin (grab)
         private XrAction _aGripPoseL; // left hand origin (grab)
         private XrAction _aGrabL;     // left squeeze -> grab HUD panel
@@ -38,10 +39,10 @@ namespace IronNestVR
         private XrAction _aStickR;   // right thumbstick click /
         private XrAction _aHaptic;   // vibration output
 
-        private Space _aimSpace, _gripSpace, _gripSpaceL;
+        private Space _aimSpace, _aimSpaceL, _gripSpace, _gripSpaceL;
         private bool _spacesReady;
 
-        private Posef _aimPose, _gripPose, _gripPoseL;
+        private Posef _aimPose, _aimPoseL, _gripPose, _gripPoseL;
         private bool _grabL, _grabR;
         private float _trigger, _prevTrigger;
         private bool _recenter, _prevRecenter;
@@ -53,9 +54,11 @@ namespace IronNestVR
         private bool _stickL, _stickR;
 
         public Posef AimPose => _aimPose;
+        public Posef AimPoseL => _aimPoseL;
         public Posef GripPose => _gripPose;
         public Posef GripPoseL => _gripPoseL;
         public bool AimValid { get; private set; }
+        public bool AimValidL { get; private set; }
         public bool GripValid { get; private set; }
         public bool GripValidL { get; private set; }
         public bool GrabL => _grabL;
@@ -87,6 +90,7 @@ namespace IronNestVR
             { error = "xrCreateActionSet failed"; return false; }
 
             if (!MakeAction("aim_pose", "Aim Pose", ActionType.PoseInput, out _aAimPose, out error)) return false;
+            if (!MakeAction("aim_pose_l", "Aim Pose L", ActionType.PoseInput, out _aAimPoseL, out error)) return false;
             if (!MakeAction("grip_pose", "Grip Pose", ActionType.PoseInput, out _aGripPose, out error)) return false;
             if (!MakeAction("grip_pose_l", "Grip Pose L", ActionType.PoseInput, out _aGripPoseL, out error)) return false;
             if (!MakeAction("grab_l", "Grab L", ActionType.BooleanInput, out _aGrabL, out error)) return false;
@@ -108,6 +112,7 @@ namespace IronNestVR
             ok += Suggest("/interaction_profiles/oculus/touch_controller", new[]
             {
                 (_aAimPose, "/user/hand/right/input/aim/pose"),
+                (_aAimPoseL, "/user/hand/left/input/aim/pose"),
                 (_aGripPose, "/user/hand/right/input/grip/pose"),
                 (_aGripPoseL, "/user/hand/left/input/grip/pose"),
                 (_aGrabL, "/user/hand/left/input/squeeze/value"),
@@ -126,6 +131,7 @@ namespace IronNestVR
             ok += Suggest("/interaction_profiles/valve/index_controller", new[]
             {
                 (_aAimPose, "/user/hand/right/input/aim/pose"),
+                (_aAimPoseL, "/user/hand/left/input/aim/pose"),
                 (_aGripPose, "/user/hand/right/input/grip/pose"),
                 (_aGripPoseL, "/user/hand/left/input/grip/pose"),
                 (_aGrabL, "/user/hand/left/input/squeeze/value"),
@@ -144,6 +150,7 @@ namespace IronNestVR
             ok += Suggest("/interaction_profiles/microsoft/motion_controller", new[]
             {
                 (_aAimPose, "/user/hand/right/input/aim/pose"),
+                (_aAimPoseL, "/user/hand/left/input/aim/pose"),
                 (_aGripPose, "/user/hand/right/input/grip/pose"),
                 (_aGripPoseL, "/user/hand/left/input/grip/pose"),
                 (_aGrabL, "/user/hand/left/input/squeeze/click"),
@@ -158,6 +165,7 @@ namespace IronNestVR
             ok += Suggest("/interaction_profiles/htc/vive_controller", new[]
             {
                 (_aAimPose, "/user/hand/right/input/aim/pose"),
+                (_aAimPoseL, "/user/hand/left/input/aim/pose"),
                 (_aGripPose, "/user/hand/right/input/grip/pose"),
                 (_aGripPoseL, "/user/hand/left/input/grip/pose"),
                 (_aGrabL, "/user/hand/left/input/squeeze/click"),
@@ -200,10 +208,11 @@ namespace IronNestVR
 
             var id = new Posef { Orientation = new Quaternionf(0, 0, 0, 1), Position = new Vector3f(0, 0, 0) };
             bool aim = CreateSpace(_aAimPose, id, ref _aimSpace);
+            bool aimL = CreateSpace(_aAimPoseL, id, ref _aimSpaceL);
             bool grip = CreateSpace(_aGripPose, id, ref _gripSpace);
             bool gripL = CreateSpace(_aGripPoseL, id, ref _gripSpaceL);
             _spacesReady = aim && grip;
-            Log.LogInfo($"[input] action set attached; pose spaces aim={aim} grip={grip} gripL={gripL}.");
+            Log.LogInfo($"[input] action set attached; pose spaces aim={aim} aimL={aimL} grip={grip} gripL={gripL}.");
             return true;
         }
 
@@ -253,8 +262,9 @@ namespace IronNestVR
 
         public void LocatePoses(Space baseSpace, long time)
         {
-            if (!_spacesReady) { AimValid = GripValid = GripValidL = false; return; }
+            if (!_spacesReady) { AimValid = AimValidL = GripValid = GripValidL = false; return; }
             AimValid = Locate(_aimSpace, baseSpace, time, out _aimPose);
+            AimValidL = Locate(_aimSpaceL, baseSpace, time, out _aimPoseL);
             GripValid = Locate(_gripSpace, baseSpace, time, out _gripPose);
             GripValidL = Locate(_gripSpaceL, baseSpace, time, out _gripPoseL);
         }
@@ -364,7 +374,7 @@ namespace IronNestVR
             {
                 if (_api != null)
                 {
-                    if (_spacesReady) { _api.DestroySpace(_aimSpace); _api.DestroySpace(_gripSpace); _api.DestroySpace(_gripSpaceL); }
+                    if (_spacesReady) { _api.DestroySpace(_aimSpace); _api.DestroySpace(_aimSpaceL); _api.DestroySpace(_gripSpace); _api.DestroySpace(_gripSpaceL); }
                     _api.DestroyActionSet(_actionSet);
                 }
             }

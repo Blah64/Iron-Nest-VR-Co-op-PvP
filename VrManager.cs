@@ -434,6 +434,8 @@ namespace IronNestVR
                 _grab = new GrabManager();
                 _hands = new HandVisuals();
                 _handManip = new HandManipulator();
+                _interactor.Manip = _handManip; // so the interactor can pin a left-held control to the left pointer cam
+                _handManip.Cockpit = _interactor; // so a left-hand dial/lever grab reads the left pointer cam immediately
                 _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab };
                 _popup = new VrPopup();
                 _prevChord = false;

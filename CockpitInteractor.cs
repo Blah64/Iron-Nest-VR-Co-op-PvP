@@ -36,6 +36,18 @@ namespace IronNestVR
         private bool _hoverColor;
         private bool _forceLaser;   // VR settings menu open -> always show the laser, even outside a mission
 
+        // LEFT pointer: a second ray-cast camera + laser down the LEFT controller, so the left hand can aim at
+        // and grab manuals/dials/levers/switches too. A left-hand dial/lever native drag follows THIS camera —
+        // we pin the held control's own raycastCamera to it each frame (the periodic repoint pins everything to
+        // the right cam). The HandManipulator tells us which control the left hand holds.
+        private GameObject _camGoL;
+        private Camera _camL;
+        private GameObject _laserGoL;
+        private LineRenderer _laserL;
+        private bool _hoverColorL;
+        internal HandManipulator Manip;   // set by VrManager; queried for the left-held control
+        internal Camera LeftPointerCam => _camL;   // HandManipulator pins a left-held control to this on grab
+
         private bool _triggerWasHeld;
         private bool _interactWasHeld;
         private bool _mapDeleteWasHeld;
@@ -75,15 +87,20 @@ namespace IronNestVR
                     // Keep the laser visible while the VR menu is open — even outside a mission — so the
                     // player can see where they're aiming at the panel. Drawn down the controller without
                     // engaging the game's cursor manager or interaction.
-                    if (forceLaser && origin != null && input.AimValid)
+                    if (forceLaser && origin != null)
                     {
                         EnsureRigObjects();
-                        Posef fp = input.AimPose;
-                        var flp = new Vector3(fp.Position.X, fp.Position.Y, -fp.Position.Z);
-                        var flr = new Quaternion(-fp.Orientation.X, -fp.Orientation.Y, fp.Orientation.Z, fp.Orientation.W);
-                        UpdateLaser(origin.TransformPoint(flp), origin.rotation * flr);
+                        if (input.AimValid)
+                        {
+                            Posef fp = input.AimPose;
+                            var flp = new Vector3(fp.Position.X, fp.Position.Y, -fp.Position.Z);
+                            var flr = new Quaternion(-fp.Orientation.X, -fp.Orientation.Y, fp.Orientation.Z, fp.Orientation.W);
+                            UpdateLaser(origin.TransformPoint(flp), origin.rotation * flr);
+                        }
+                        else ShowLaser(false);
+                        DriveLeftPointer(input, origin);
                     }
-                    else ShowLaser(false);
+                    else { ShowLaser(false); ShowLaserL(false); }
                     return;
                 }
 
@@ -106,9 +123,13 @@ namespace IronNestVR
                 // game flips it back when a menu/popup takes focus.
                 if (Config.MenuForceCenter) ForceCenterCursor();
 
+                // Drive the LEFT pointer (cam + laser + left-held control pin) every frame, AFTER the repoint
+                // above so the left-held control's camera override sticks. Independent of the right aim state.
+                DriveLeftPointer(input, origin);
+
                 if (!input.AimValid)
                 {
-                    // Tracking lost this frame: stop pointing/clicking but stay engaged (don't thrash).
+                    // Right tracking lost this frame: stop pointing/clicking but stay engaged (don't thrash).
                     EndAllInput();
                     ShowLaser(false);
                     return;
@@ -467,19 +488,53 @@ namespace IronNestVR
                 _hoverColor = false;
                 ApplyLaserColor(false);
             }
+            if (_camGoL == null)
+            {
+                _camGoL = new GameObject("IronNestVR_PointerCamL");
+                UnityEngine.Object.DontDestroyOnLoad(_camGoL);
+                _camGoL.hideFlags = HideFlags.HideAndDontSave;
+                _camL = _camGoL.AddComponent<Camera>();
+                _camL.clearFlags = CameraClearFlags.Nothing; // draws nothing; exists only to cast the left ray
+                _camL.cullingMask = 0;
+                _camL.depth = -100f;
+                _camL.nearClipPlane = 0.01f;
+                _camL.fieldOfView = 60f;
+                // Left enabled like the right pointer cam: it renders nothing (cullingMask 0) but must keep a
+                // valid viewport so the dial/lever native drag's ScreenPointToRay projects correctly.
+            }
+            if (_laserGoL == null)
+            {
+                _laserGoL = new GameObject("IronNestVR_LaserL");
+                UnityEngine.Object.DontDestroyOnLoad(_laserGoL);
+                _laserGoL.hideFlags = HideFlags.HideAndDontSave;
+                _laserL = _laserGoL.AddComponent<LineRenderer>();
+                _laserL.useWorldSpace = true;
+                _laserL.positionCount = 2;
+                _laserL.startWidth = Config.LaserWidth;
+                _laserL.endWidth = Config.LaserWidth;
+                _laserL.numCapVertices = 0;
+                var sh = Shader.Find("Universal Render Pipeline/Unlit");
+                if (sh == null) sh = Shader.Find("Sprites/Default");
+                if (sh == null) sh = Shader.Find("Unlit/Color");
+                if (sh != null) _laserL.material = new Material(sh);
+                _hoverColorL = false;
+                SetLaserColor(_laserL, false);
+            }
         }
 
         // Laser is cyan normally, GREEN when the game reports something interactable under it — so the
         // player knows when they're actually aimed at a control (catches any VR aim/parallax offset).
         // Set BOTH the LineRenderer vertex colors AND the material's colour properties: URP/Unlit
         // ignores vertex colours, so the gradient alone wouldn't change anything.
-        private void ApplyLaserColor(bool hovering)
+        private void ApplyLaserColor(bool hovering) => SetLaserColor(_laser, hovering);
+
+        private static void SetLaserColor(LineRenderer laser, bool hovering)
         {
-            if (_laser == null) return;
+            if (laser == null) return;
             Color c = hovering ? new Color(0.2f, 1f, 0.3f, 1f) : new Color(0.2f, 0.9f, 1f, 1f);
-            _laser.startColor = c;
-            _laser.endColor = new Color(c.r, c.g, c.b, 0.35f);
-            var m = _laser.material;
+            laser.startColor = c;
+            laser.endColor = new Color(c.r, c.g, c.b, 0.35f);
+            var m = laser.material;
             if (m != null)
             {
                 try { m.color = c; } catch { }
@@ -534,12 +589,94 @@ namespace IronNestVR
             if (_laserGo != null && _laserGo.activeSelf != on) _laserGo.SetActive(on);
         }
 
+        private void ShowLaserL(bool on)
+        {
+            if (_laserGoL != null && _laserGoL.activeSelf != on) _laserGoL.SetActive(on);
+        }
+
+        // Drive the LEFT pointer cam + laser down the left controller, and (during a left-hand dial/lever
+        // drag) pin the held control's own raycast camera to the left cam so its native drag follows the LEFT
+        // hand (the periodic repoint otherwise pins every control to the right cam).
+        private void DriveLeftPointer(VrInput input, Transform origin)
+        {
+            if (_camGoL == null) return;
+            if (!input.AimValidL) { ShowLaserL(false); return; }
+            Posef p = input.AimPoseL;
+            var lp = new Vector3(p.Position.X, p.Position.Y, -p.Position.Z);
+            var lr = new Quaternion(-p.Orientation.X, -p.Orientation.Y, p.Orientation.Z, p.Orientation.W);
+            Vector3 wp = origin.TransformPoint(lp);
+            Quaternion wr = origin.rotation * lr;
+            _camGoL.transform.SetPositionAndRotation(wp, wr);
+
+            UpdateLaserL(wp, wr);
+
+            var leftCtrl = Manip != null ? Manip.LeftHeldControlTransform : null;
+            if (leftCtrl != null && _camL != null) SetControlRaycastCam(leftCtrl, _camL);
+        }
+
+        private void UpdateLaserL(Vector3 origin, Quaternion rot)
+        {
+            if (_laserL == null) return;
+            Vector3 dir = rot * Vector3.forward;
+            LeftLaserScan(origin, dir, out float len, out bool hovering);
+            _laserL.SetPosition(0, origin);
+            _laserL.SetPosition(1, origin + dir * len);
+            if (hovering != _hoverColorL) { _hoverColorL = hovering; SetLaserColor(_laserL, hovering); }
+            ShowLaserL(Config.LaserAlwaysOn || hovering || _forceLaser);
+        }
+
+        // Nearest grabbable (dial/lever/switch/manual) under the left ray → green + laser ends there; else the
+        // laser ends at the first solid surface (or max). Sees through triggers, matching the grab raycasts.
+        private static void LeftLaserScan(Vector3 ao, Vector3 dir, out float len, out bool hovering)
+        {
+            len = Config.LaserMaxDistance; hovering = false;
+            var hits = Physics.RaycastAll(ao, dir, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide);
+            float grab = float.MaxValue, solid = float.MaxValue;
+            if (hits != null)
+                for (int i = 0; i < hits.Length; i++)
+                {
+                    var h = hits[i]; var col = h.collider; if (col == null) continue;
+                    var t = col.transform; if (t == null) continue;
+                    bool isGrab = FindUp<DialInteractable>(t) != null
+                               || FindUp<LinearSliderInteractable>(t) != null
+                               || FindUp<LookAtTarget>(t) != null
+                               || FindUp<PickUpZoomTarget>(t) != null;
+                    if (isGrab) { if (h.distance < grab) grab = h.distance; }
+                    else if (!col.isTrigger && h.distance < solid) solid = h.distance;
+                }
+            if (grab < float.MaxValue) { hovering = true; len = grab; }
+            else if (solid < float.MaxValue) len = solid;
+        }
+
+        // Pin a control's OWN raycast camera (dial/lever) so its native drag projects from that camera.
+        private static void SetControlRaycastCam(Transform t, Camera cam)
+        {
+            var d = t.GetComponent<DialInteractable>();
+            if (d != null) { d.raycastCamera = cam; return; }
+            var s = t.GetComponent<LinearSliderInteractable>();
+            if (s != null) { s.raycastCamera = cam; }
+        }
+
+        // Walk up from a transform to the first ancestor carrying component T.
+        private static T FindUp<T>(Transform t) where T : Component
+        {
+            for (Transform p = t; p != null; p = p.parent)
+            {
+                var c = p.GetComponent<T>();
+                if (c != null) return c;
+            }
+            return null;
+        }
+
         public void Dispose()
         {
             if (_engaged) Restore("dispose");
             if (_laserGo != null) UnityEngine.Object.Destroy(_laserGo);
             if (_camGo != null) UnityEngine.Object.Destroy(_camGo);
+            if (_laserGoL != null) UnityEngine.Object.Destroy(_laserGoL);
+            if (_camGoL != null) UnityEngine.Object.Destroy(_camGoL);
             _laserGo = null; _camGo = null; _laser = null; _cam = null;
+            _laserGoL = null; _camGoL = null; _laserL = null; _camL = null;
             _mgr = null; _engaged = false;
         }
 
