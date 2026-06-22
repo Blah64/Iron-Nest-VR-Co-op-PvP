@@ -126,7 +126,10 @@ namespace IronNestVR
                 Dbg.Step($"eye{i}: set near/far/depth");
                 c.nearClipPlane = Config.NearClip;
                 c.farClipPlane = Config.FarClip;
-                c.depth = mDepth - 1;
+                // Unique depth per eye: the game's Ultimate LOD System spams a per-frame LogError when two
+                // active cameras share a depth, so no two of our cameras may collide (eye0/eye1 here, and
+                // the pointer cams in CockpitInteractor).
+                c.depth = mDepth - 10 - i;
                 Dbg.Step($"eye{i}: set enabled={Config.UseEnabledCameras}");
                 c.enabled = Config.UseEnabledCameras;
 

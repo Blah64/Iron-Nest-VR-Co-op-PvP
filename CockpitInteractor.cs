@@ -466,6 +466,8 @@ namespace IronNestVR
                 _cam = _camGo.AddComponent<Camera>();
                 _cam.clearFlags = CameraClearFlags.Nothing; // draws nothing; exists only to cast the ray
                 _cam.cullingMask = 0;
+                // Unique depth (must differ from the left pointer cam below AND the eye cams): the game's
+                // Ultimate LOD System spams a per-frame LogError if two active cameras share a depth.
                 _cam.depth = -100f;
                 _cam.nearClipPlane = 0.01f;
                 _cam.fieldOfView = 60f;
@@ -496,7 +498,7 @@ namespace IronNestVR
                 _camL = _camGoL.AddComponent<Camera>();
                 _camL.clearFlags = CameraClearFlags.Nothing; // draws nothing; exists only to cast the left ray
                 _camL.cullingMask = 0;
-                _camL.depth = -100f;
+                _camL.depth = -101f; // distinct from the right pointer cam (-100) — see Ultimate LOD note above
                 _camL.nearClipPlane = 0.01f;
                 _camL.fieldOfView = 60f;
                 // Left enabled like the right pointer cam: it renders nothing (cullingMask 0) but must keep a

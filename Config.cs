@@ -342,6 +342,11 @@ namespace IronNestVR
         public static float MoveSpeedScale = 1f;
         // Fallback m/s if the FirstPersonController's walkSpeed reads as 0.
         public static float MoveSpeedFallback = 4f;
+        // Anti-pop guard: our locomotion Move is horizontal, but a CharacterController can still rise on its
+        // own (step-up, or — the float bug — depenetrating UPWARD out of overlapping cockpit geometry, which
+        // launches the player into the air where the FPC can read "grounded" so gravity never reels them back).
+        // When on, cancel any per-frame rise beyond a natural slope so a thumbstick walk can't bump you upward.
+        public static bool LocomotionAntiPop = true;
 
         // --- View turn (right thumbstick) ---
         public static bool TurnEnabled = true;

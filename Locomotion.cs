@@ -19,6 +19,7 @@ namespace IronNestVR
         private CharacterController _cc;
         private float _nextFind;
         private bool _loggedFound;
+        private bool _loggedPop;         // one-shot warning when the anti-pop guard first fires
         private bool _snapArmed = true; // snap turn fires once per stick flick
 
         public void Tick(VrInput input, CameraRig rig, float dt)
@@ -70,7 +71,31 @@ namespace IronNestVR
                 speed *= Config.MoveSpeedScale;
 
                 Vector3 motion = (right * dir.x + fwd * dir.y) * (scaled * speed * dt);
+                Vector3 before = _cc.transform.position;
                 _cc.Move(motion);
+
+                // Locomotion is HORIZONTAL — the FirstPersonController owns vertical (gravity/jump/grounding).
+                // But CharacterController.Move can rise on its own: a step-up, or — the rare "stuck floating"
+                // bug — depenetrating UPWARD when the capsule briefly overlaps cockpit geometry, popping the
+                // player into the air where the FPC can read isGrounded=true and zero verticalVelocity, so
+                // gravity never pulls them back down. Allow a natural slope (rise up to the horizontal distance
+                // moved, ≈45°) but cancel any pop beyond that, so a thumbstick walk can never launch us upward.
+                // This only touches OUR Move's side-effect — a real jump (the FPC's own Move) is untouched.
+                if (Config.LocomotionAntiPop)
+                {
+                    float rise = _cc.transform.position.y - before.y;
+                    float horiz = new Vector2(motion.x, motion.z).magnitude;
+                    if (rise > horiz + 0.003f)
+                    {
+                        _cc.Move(Vector3.down * (rise - horiz));
+                        if (!_loggedPop)
+                        {
+                            _loggedPop = true;
+                            Log.LogWarning($"[locomotion] cancelled an abnormal upward pop (rise={rise:0.000}m, " +
+                                           $"horiz={horiz:0.000}m) — the stuck-floating glitch. Disable with Config.LocomotionAntiPop.");
+                        }
+                    }
+                }
             }
             catch (Exception e)
             {
