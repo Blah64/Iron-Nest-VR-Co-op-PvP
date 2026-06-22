@@ -96,7 +96,7 @@ namespace IronNestVR
                             Posef fp = input.AimPose;
                             var flp = new Vector3(fp.Position.X, fp.Position.Y, -fp.Position.Z);
                             var flr = new Quaternion(-fp.Orientation.X, -fp.Orientation.Y, fp.Orientation.Z, fp.Orientation.W);
-                            UpdateLaser(origin.TransformPoint(flp), origin.rotation * flr);
+                            UpdateLaser(origin.TransformPoint(flp), origin.rotation * flr, true);
                         }
                         else ShowLaser(false);
                         DriveLeftPointer(input, origin);
@@ -108,14 +108,20 @@ namespace IronNestVR
                 if (!_engaged) Engage();
                 EnsureRigObjects();
 
-                // Keep the cursor ray on our controller cam, and (throttled) every control's own
-                // raycast camera too, so dials/levers/tooltips track the controller, not the flat camera.
-                if (_mgr.raycastCamera != _cam) _mgr.raycastCamera = _cam;
+                // Which controller drives the game cursor: normally the RIGHT hand, but when the RIGHT hand is
+                // busy holding the HUD clipboard, the LEFT hand takes over so it can pick the pencil colours /
+                // compass on the board (and work any other control). The pointing hand is the clicking hand.
+                bool leftActive = Grab != null && Grab.HudClipboardHoldHand == 2 && _camL != null;
+                Camera activeCam = leftActive ? _camL : _cam;
+
+                // Keep the cursor ray on the ACTIVE controller cam, and (throttled) every control's own
+                // raycast camera too, so dials/levers/tooltips track that controller, not the flat camera.
+                if (_mgr.raycastCamera != activeCam) _mgr.raycastCamera = activeCam;
                 if (Time.unscaledTime >= _nextRepoint)
                 {
                     _nextRepoint = Time.unscaledTime + 0.5f;
-                    RepointInteractionCameras(_cam);
-                    RepointMapCameras(_cam);
+                    RepointInteractionCameras(activeCam);
+                    RepointMapCameras(activeCam);
                 }
 
                 // Menus flip the cursor manager to FreeMouse (cursor follows the OS mouse, off-centre),
@@ -124,28 +130,30 @@ namespace IronNestVR
                 // game flips it back when a menu/popup takes focus.
                 if (Config.MenuForceCenter) ForceCenterCursor();
 
-                // Drive the LEFT pointer (cam + laser + left-held control pin) every frame, AFTER the repoint
-                // above so the left-held control's camera override sticks. Independent of the right aim state.
-                DriveLeftPointer(input, origin);
-
-                if (!input.AimValid)
+                // Position the RIGHT pointer cam + laser when tracked. It's the active cursor unless the left
+                // hand has taken over; pass that so its laser only colours from the game hover when it's live.
+                if (input.AimValid)
                 {
-                    // Right tracking lost this frame: stop pointing/clicking but stay engaged (don't thrash).
-                    EndAllInput();
-                    ShowLaser(false);
-                    return;
+                    Posef pose = input.AimPose;
+                    // OpenXR (right-handed, -Z fwd) -> Unity, then into world via the seated rig origin.
+                    var lp = new Vector3(pose.Position.X, pose.Position.Y, -pose.Position.Z);
+                    var lr = new Quaternion(-pose.Orientation.X, -pose.Orientation.Y, pose.Orientation.Z, pose.Orientation.W);
+                    Vector3 wp = origin.TransformPoint(lp);
+                    Quaternion wr = origin.rotation * lr;
+                    _camGo.transform.SetPositionAndRotation(wp, wr);
+                    UpdateLaser(wp, wr, !leftActive);
+                    GeometryLog(wp, wr);
                 }
+                else ShowLaser(false);
 
-                Posef pose = input.AimPose;
-                // OpenXR (right-handed, -Z fwd) -> Unity, then into world via the seated rig origin.
-                var lp = new Vector3(pose.Position.X, pose.Position.Y, -pose.Position.Z);
-                var lr = new Quaternion(-pose.Orientation.X, -pose.Orientation.Y, pose.Orientation.Z, pose.Orientation.W);
-                Vector3 wp = origin.TransformPoint(lp);
-                Quaternion wr = origin.rotation * lr;
+                // Drive the LEFT pointer (cam + laser + left-held control pin) every frame, AFTER the repoint
+                // above so the left-held control's camera override sticks. When it's the active cursor its laser
+                // colours from the game hover (the pencil/compass slots), not the grab scan.
+                DriveLeftPointer(input, origin, leftActive);
 
-                _camGo.transform.SetPositionAndRotation(wp, wr);
-
-                UpdateLaser(wp, wr);
+                // Clicking uses the ACTIVE hand's trigger; bail (without thrashing engage) if it isn't tracked.
+                bool activeAimValid = leftActive ? input.AimValidL : input.AimValid;
+                if (!activeAimValid) { EndAllInput(); return; }
 
                 if (suppressClick)
                 {
@@ -155,12 +163,10 @@ namespace IronNestVR
                 }
                 else
                 {
-                    HandleClick(input);
+                    HandleClick(input, leftActive);
                     HandleInteract(input);
                     HandleMapDelete(input);
                 }
-
-                GeometryLog(wp, wr);
             }
             catch (Exception e)
             {
@@ -364,9 +370,11 @@ namespace IronNestVR
             _mapObjCount = -1;
         }
 
-        private void HandleClick(VrInput input)
+        private void HandleClick(VrInput input, bool leftActive)
         {
-            bool held = input.TriggerHeld;
+            // The clicking hand follows the pointing hand: left trigger when the left hand is the active cursor
+            // (right hand holding the clipboard), right trigger otherwise.
+            bool held = leftActive ? input.TriggerHeldL : input.TriggerHeld;
             if (InputSynth.Supported)
             {
                 if (held) InputSynth.SetMouseLeft(true);
@@ -375,7 +383,7 @@ namespace IronNestVR
                 {
                     input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
                     var h = _mgr.CurrentHover;
-                    Log.LogInfo($"[interact] trigger DOWN over '{(h != null ? h.name : "nothing")}'");
+                    Log.LogInfo($"[interact] trigger DOWN ({(leftActive ? "L" : "R")}) over '{(h != null ? h.name : "nothing")}'");
                 }
             }
             else
@@ -550,8 +558,10 @@ namespace IronNestVR
             }
         }
 
-        // End the laser at the first surface it hits so it visibly lands on the control.
-        private void UpdateLaser(Vector3 origin, Quaternion rot)
+        // End the laser at the first surface it hits so it visibly lands on the control. <paramref name="activeCursor"/>
+        // is true only when the RIGHT hand is the live game cursor — the hover-green comes from the game's
+        // CurrentHover then; when the left hand has taken over the cursor, the right laser stays plain.
+        private void UpdateLaser(Vector3 origin, Quaternion rot, bool activeCursor)
         {
             if (_laser == null) return;
             Vector3 dir = rot * Vector3.forward;
@@ -562,7 +572,7 @@ namespace IronNestVR
             _laser.SetPosition(1, origin + dir * len);
 
             bool hovering = false;
-            try { hovering = _mgr.CurrentHover != null; } catch { }
+            if (activeCursor) { try { hovering = _mgr.CurrentHover != null; } catch { } }
             if (hovering != _hoverColor) { _hoverColor = hovering; ApplyLaserColor(hovering); }
             // Always-on draws it constantly; force-on while the VR menu is open; otherwise only when
             // aimed at an interactable (CurrentHover).
@@ -604,7 +614,7 @@ namespace IronNestVR
         // Drive the LEFT pointer cam + laser down the left controller, and (during a left-hand dial/lever
         // drag) pin the held control's own raycast camera to the left cam so its native drag follows the LEFT
         // hand (the periodic repoint otherwise pins every control to the right cam).
-        private void DriveLeftPointer(VrInput input, Transform origin)
+        private void DriveLeftPointer(VrInput input, Transform origin, bool activeCursor = false)
         {
             if (_camGoL == null) return;
             if (!input.AimValidL) { ShowLaserL(false); return; }
@@ -615,21 +625,37 @@ namespace IronNestVR
             Quaternion wr = origin.rotation * lr;
             _camGoL.transform.SetPositionAndRotation(wp, wr);
 
-            UpdateLaserL(wp, wr);
+            UpdateLaserL(wp, wr, activeCursor);
 
             var leftCtrl = Manip != null ? Manip.LeftHeldControlTransform : null;
             if (leftCtrl != null && _camL != null) SetControlRaycastCam(leftCtrl, _camL);
         }
 
-        private void UpdateLaserL(Vector3 origin, Quaternion rot)
+        // When <paramref name="activeCursor"/> the left hand IS the game cursor (right hand holds the clipboard):
+        // end the laser at the first solid surface and colour it from the game's CurrentHover (so the pencil/
+        // compass slots light it green), and keep it visible. Otherwise it's the secondary pointer — colour off
+        // the nearest grabbable under it (dial/lever/switch/manual), as before.
+        private void UpdateLaserL(Vector3 origin, Quaternion rot, bool activeCursor)
         {
             if (_laserL == null) return;
             Vector3 dir = rot * Vector3.forward;
-            LeftLaserScan(origin, dir, out float len, out bool hovering);
+            float len; bool hovering;
+            if (activeCursor)
+            {
+                len = Config.LaserMaxDistance;
+                if (Physics.Raycast(origin, dir, out RaycastHit hit, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Ignore))
+                    len = hit.distance;
+                hovering = false;
+                try { hovering = _mgr != null && _mgr.CurrentHover != null; } catch { }
+            }
+            else
+            {
+                LeftLaserScan(origin, dir, out len, out hovering);
+            }
             _laserL.SetPosition(0, origin);
             _laserL.SetPosition(1, origin + dir * len);
             if (hovering != _hoverColorL) { _hoverColorL = hovering; SetLaserColor(_laserL, hovering); }
-            ShowLaserL(Config.LaserAlwaysOn || hovering || _forceLaser);
+            ShowLaserL(Config.LaserAlwaysOn || hovering || _forceLaser || activeCursor);
         }
 
         // Nearest grabbable (dial/lever/switch/manual) under the left ray → green + laser ends there; else the

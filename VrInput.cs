@@ -28,7 +28,8 @@ namespace IronNestVR
         private XrAction _aGripPoseL; // left hand origin (grab)
         private XrAction _aGrabL;     // left squeeze -> grab HUD panel
         private XrAction _aGrabR;     // right squeeze -> grab HUD panel
-        private XrAction _aFire;     // float trigger -> click / grab
+        private XrAction _aFire;     // right float trigger -> click / grab
+        private XrAction _aFireL;    // left float trigger -> click (active when the left hand is the pointer)
         private XrAction _aRecenter; // bool button
         private XrAction _aMenu;     // left menu button -> ESC
         private XrAction _aMove;     // left thumbstick -> locomotion
@@ -46,6 +47,7 @@ namespace IronNestVR
         private Posef _aimPose, _aimPoseL, _gripPose, _gripPoseL;
         private bool _grabL, _grabR;
         private float _trigger, _prevTrigger;
+        private float _triggerL;
         private bool _recenter, _prevRecenter;
         private bool _menu;
         private float _moveX, _moveY;
@@ -67,6 +69,8 @@ namespace IronNestVR
         public bool GrabR => _grabR;
         public float Trigger => _trigger;
         public bool TriggerHeld => _trigger >= Config.TriggerFireThreshold;
+        public float TriggerL => _triggerL;
+        public bool TriggerHeldL => _triggerL >= Config.TriggerFireThreshold;
         public bool RecenterEdge { get; private set; }
         public float MoveX => _moveX;
         public float MoveY => _moveY;
@@ -99,6 +103,7 @@ namespace IronNestVR
             if (!MakeAction("grab_l", "Grab L", ActionType.BooleanInput, out _aGrabL, out error)) return false;
             if (!MakeAction("grab_r", "Grab R", ActionType.BooleanInput, out _aGrabR, out error)) return false;
             if (!MakeAction("fire", "Interact", ActionType.FloatInput, out _aFire, out error)) return false;
+            if (!MakeAction("fire_l", "Interact L", ActionType.FloatInput, out _aFireL, out error)) return false;
             if (!MakeAction("recenter", "Recenter", ActionType.BooleanInput, out _aRecenter, out error)) return false;
             if (!MakeAction("menu", "Menu Esc", ActionType.BooleanInput, out _aMenu, out error)) return false;
             if (!MakeAction("move", "Move", ActionType.Vector2fInput, out _aMove, out error)) return false;
@@ -122,6 +127,7 @@ namespace IronNestVR
                 (_aGrabL, "/user/hand/left/input/squeeze/value"),
                 (_aGrabR, "/user/hand/right/input/squeeze/value"),
                 (_aFire, "/user/hand/right/input/trigger/value"),
+                (_aFireL, "/user/hand/left/input/trigger/value"),
                 (_aRecenter, "/user/hand/left/input/y/click"),
                 (_aMapToolsL, "/user/hand/left/input/x/click"),
                 (_aMenu, "/user/hand/left/input/menu/click"),
@@ -142,6 +148,7 @@ namespace IronNestVR
                 (_aGrabL, "/user/hand/left/input/squeeze/value"),
                 (_aGrabR, "/user/hand/right/input/squeeze/value"),
                 (_aFire, "/user/hand/right/input/trigger/value"),
+                (_aFireL, "/user/hand/left/input/trigger/value"),
                 (_aRecenter, "/user/hand/left/input/b/click"),
                 (_aMenu, "/user/hand/left/input/a/click"),
                 (_aMove, "/user/hand/left/input/thumbstick"),
@@ -161,6 +168,7 @@ namespace IronNestVR
                 (_aGrabL, "/user/hand/left/input/squeeze/click"),
                 (_aGrabR, "/user/hand/right/input/squeeze/click"),
                 (_aFire, "/user/hand/right/input/trigger/value"),
+                (_aFireL, "/user/hand/left/input/trigger/value"),
                 (_aRecenter, "/user/hand/left/input/thumbstick/click"),
                 (_aMenu, "/user/hand/left/input/menu/click"),
                 (_aMove, "/user/hand/left/input/thumbstick"),
@@ -176,6 +184,7 @@ namespace IronNestVR
                 (_aGrabL, "/user/hand/left/input/squeeze/click"),
                 (_aGrabR, "/user/hand/right/input/squeeze/click"),
                 (_aFire, "/user/hand/right/input/trigger/value"),
+                (_aFireL, "/user/hand/left/input/trigger/value"),
                 (_aRecenter, "/user/hand/left/input/trackpad/click"),
                 (_aMenu, "/user/hand/left/input/menu/click"),
                 (_aMove, "/user/hand/left/input/trackpad"),
@@ -251,6 +260,7 @@ namespace IronNestVR
             _prevRecenter = _recenter;
 
             _trigger = GetFloat(_aFire);
+            _triggerL = GetFloat(_aFireL);
             _recenter = GetBool(_aRecenter);
             _menu = GetBool(_aMenu);
             _interact = GetBool(_aInteract);
