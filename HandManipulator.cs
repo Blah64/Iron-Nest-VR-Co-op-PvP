@@ -21,9 +21,14 @@ namespace IronNestVR
     ///   repointing the held dial (<see cref="HeldDialTransform"/>) so that aim sticks.
     ///
     /// • CLICK switches/buttons (<c>LookAtTarget</c>): there is no drag to ride, so we let you PHYSICALLY
-    ///   OPERATE them — the hand follows the controller's travel from the grab point, and once it moves past
-    ///   <see cref="Config.SwitchThrowDistance"/> we fire the control's click the same way the cursor manager
-    ///   does (<c>HandleClickDown/UpFromManager</c>). Moving back re-arms it. (Skips <c>PickUpZoomTarget</c>
+    ///   OPERATE them. The hand follows the controller's travel from the grab point, AND the switch mesh itself
+    ///   moves with it — driven by a per-switch <see cref="SwitchMotion"/> (rotate/slide, local axis, range,
+    ///   activation push direction) kept in <see cref="SwitchMotions"/>: auto-seeded on first grab, tunable in
+    ///   the VR menu (operating on the last-grabbed switch), and persisted. While held we disable the control's
+    ///   own Animator so our drive isn't overwritten (it runs after Update — same reason the watch/clipboard
+    ///   disable theirs), restoring it on release so the game shows the new on/off state. Once the push passes
+    ///   the throw threshold we fire the control's click the way the cursor manager does
+    ///   (<c>HandleClickDown/UpFromManager</c>); pushing back re-arms it. (Skips <c>PickUpZoomTarget</c>
     ///   manuals — those stay reposition-grabs owned by <see cref="GrabManager"/>.)
     ///
     /// EITHER hand can grab (both controllers have an aim ray). One control at a time; the right hand wins a
@@ -50,6 +55,113 @@ namespace IronNestVR
         private Vector3 _switchGrabGripPos;
         private Vector3 _switchHandAnchor;
         private bool _switchLatched;
+
+        // The switch mesh we physically move + its captured rest pose, the per-switch motion model, the control's
+        // own Animator (disabled while we drive so it can't overwrite us; restored on release), and the latest
+        // throw progress (0..1). _switchKey identifies the active grab in the registry; _selSwitchKey is the
+        // last-grabbed switch and PERSISTS after release so the menu can tune it.
+        private Transform _switchRef;   // frame the throw travel + push direction live in (animator root, else LAT node)
+        private SwitchMotion _switchMotion;
+        private Animator _switchAnimator;
+        private bool _switchAnimatorWasEnabled;
+        private float _switchProgress;
+        private string _switchKey;
+        private string _selSwitchKey;
+
+        // SCRUB the game's OWN animation with the hand: we can't pre-read the authored pose (manual Animator.Update
+        // writes nothing in this build), but the engine's normal animation phase DOES apply a Played state — so we
+        // freeze the animator (speed=0), find the press/flip state, and Play it at normalizedTime = throw progress
+        // each frame. The real handle then tracks the hand. On activation we restore speed and fire the real click.
+        private bool _switchScrubDone;
+
+        // LEARN-THEN-SCRUB. We can't replay the control's animation (neither AnimationClip.SampleAnimation nor a
+        // manual/forced Animator.Play applies in this build — the cap is moved by a ParentConstraint whose source the
+        // Animator drives), but the game DOES move real child nodes when the click fires. So on the FIRST grab of a
+        // control we LEARN: leave the animator enabled, watch the rig through the real click, and snapshot EVERY moved
+        // node's pressed local pose at the most-deflected frame. On LATER grabs we SCRUB: disable the animator + each
+        // moved node's ParentConstraint and hand-drive all of them rest→pressed by throw progress (manual Transform
+        // writes always apply once the constraint is off), re-enabling everything at activation. Cache is per control
+        // name, session-lived. We capture the WHOLE moved set (not just the max-delta node) so the entire lever/bat
+        // follows the hand, not only the tip light (which travels furthest from the pivot).
+        // T = the LIVE transform captured at learn (cache is session-lived, so the object is still valid on later grabs —
+        // direct refs eliminate name-resolution flakiness). Leaf/RestPos kept only as a fallback resolver if T dies.
+        private struct ScrubNode { public Transform T; public string Leaf; public Vector3 RestPos, PressPos; public Quaternion RestRot, PressRot; }
+        private static readonly System.Collections.Generic.Dictionary<string, ScrubNode[]> _scrubCache = new System.Collections.Generic.Dictionary<string, ScrubNode[]>();
+
+        // SCRUB pass: the resolved nodes we hand-drive + their rest/pressed local poses + their (disabled) constraint.
+        private struct ActiveMover { public Transform T; public Vector3 RestPos, PressPos; public Quaternion RestRot, PressRot; public UnityEngine.Animations.ParentConstraint Con; public bool ConWasEnabled; public Vector3 LastWrote; public float MaxDrift; public bool WroteOnce; public Vector3 StartLocal; public Quaternion StartLocalR; public float MoveMax; public float CachedGap; public Vector3 TgtPos; public Quaternion TgtRot; public Vector3 StartRL; public float WorldMove; }
+        private System.Collections.Generic.List<ActiveMover> _activeMovers;
+        // Every Animator that drives a mover (the LookAtTarget's AND any separate one, e.g. the hatch/lever's own) —
+        // disabled while scrubbing so it can't re-pose the lever each frame, restored on activation/release.
+        private struct AnimEntry { public Animator A; public bool WasEnabled; }
+        private System.Collections.Generic.List<AnimEntry> _scrubAnimators;
+        private bool _scrubManual;
+        private const bool ScrubDebugOscillate = false;  // DEBUG: held switch cycles rest↔press on a timer, no activation
+        private static readonly bool HeldStickFollow = true;  // point the held stick's '…Parent' hinge at the hand each frame
+        private bool _scrubOpening;    // this grab drives toward PRESS (true) or back toward REST (false)
+        private float _scrubProgMax;   // DIAG: peak throw progress reached during a scrub grab
+
+        // HELD-LEVER FOLLOW: the captured lever node is usually rolled about its OWN long axis by the game's clip — on a
+        // smooth cylinder that's invisible (origin stays put, world≈0), which is why "the lever stays frozen" while the
+        // hatch/locks/lights (real translation) move. Replaying that roll can't help; it's invisible in-game too. So for
+        // the one most-lever-like captured node we DON'T replay — we POINT IT AT THE HAND: rotate it about its pivot so
+        // its arm (pivot→tip) tracks the hand, clamped to the mechanism's own throw angle. Driven by real hand position,
+        // so it's guaranteed visible. Everything else keeps the captured replay (those already move correctly).
+        private Transform _leverT;           // the held stick (grabbed node or its visible parent); null => no synthetic swing
+        private Transform _leverParent;      // its parent — we work in parent-local so a turret rotation doesn't skew it
+        private Vector3 _leverPivotLocal;    // stick localPosition at grab (its origin is the pivot we swing about)
+        private Quaternion _leverRestLocalR; // stick localRotation at grab (the swing is measured off this)
+        private Vector3 _leverArmParentDir;  // pivot→grabPoint direction in PARENT-local space (rebuilt to world each frame)
+        private Vector3 _leverGrabLocal;     // the grab point in STICK-local space (a fixed point on the stick we aim at the hand)
+        private float _leverMaxAngle;        // clamp the swing so the stick can't fold through itself
+        private UnityEngine.Animations.ParentConstraint _leverCon; // a constraint pinning the stick (disabled while held), if any
+        private bool _leverConWasActive;
+        private Vector3 _leverTip0W;          // grab-point world position at grab (for the visible-travel readout)
+        private float _leverTipTravel;        // DIAG: peak world travel of the grab point during the grab (confirms it moved)
+        // SLIDE vs ROTATE: most levers rotate about their hinge, but some controls (War Horn pulley) TRANSLATE. Honour the
+        // per-control Translate flag (VR menu, persisted), auto-defaulted from a name hint. Slide axis locks after the
+        // first real shove (like PushLocal) so the handle slides along one line instead of drifting in 3D.
+        private bool _leverSlide;
+        private Vector3 _leverSlideAxisW; private bool _leverHasSlideAxis;
+        // ROTATE: lock the swing PLANE from the first real movement so the lever swings about one fixed hinge axis,
+        // instead of a free point-at-hand that tilts about the wrong axis when the hand drifts sideways.
+        private Vector3 _leverRotAxisW; private bool _leverHasRotAxis;
+        // FIRE-ON-RELEASE: while a stick is hand-followed, don't fire the click mid-pull (the game's animation would rip
+        // it out of your hand) — arm it when you pull past the threshold and fire when you LET GO, so the whole pull is
+        // hand-driven and the scripted animation only plays after the hand is gone.
+        private bool _leverArmed;
+
+
+        // LEARN pass: animator-root descendants + rest poses, and at the most-deflected (global-peak) frame the whole
+        // rig's snapshot + per-node delta — so we cache every node that actually moved on the click.
+        private Transform[] _scrubTs; private Vector3[] _scrubRestP; private Quaternion[] _scrubRestR;
+        private float[] _scrubNodePeak; private Vector3[] _scrubNodePeakPos; private Quaternion[] _scrubNodePeakRot;
+        private float _scrubGlobalPeak;
+        // LEARN TAIL: the click fires mid-grab, but the triggered animation keeps playing AFTER you release. To capture
+        // its FULL extent (not just however far it got before you let go), we keep sampling for a short tail post-release.
+        private bool _learnTriggered;   // the learn grab actually fired the click → the animation played, worth keeping
+        private bool _learnTail; private float _learnTailUntil; private string _learnTailKey;
+        private const float LearnTailSeconds = 2.0f;
+        private const float ScrubLearnMin = 0.02f;   // a node must move at least this to be REPORTED as a real mover
+        private const float ScrubKeepMin = 0.003f;    // but cache the whole chain down to this — sub-threshold ANCESTORS
+                                                      // still carry composition (a child rotates around them), so dropping
+                                                      // them loses the visible swing. Direct refs make the wider set cheap.
+        private const int ScrubRootClimb = 1;         // fallback parents to climb if no Animator ancestor is found
+        // DIAG arrays, parallel to _scrubTs: root-local position at grab + peak root-local travel during the learn click,
+        // so we can see each node's WORLD (in-assembly) displacement, not just its local-pose delta.
+        private Vector3[] _scrubRestRL; private float[] _scrubWorldPeak; private Transform _scrubRoot;
+
+        // AUTHORED motion: the actual transform(s) the control's animation clip moves, with their rest (grab-time)
+        // and activated-end local poses. We reproduce that exact motion by lerping rest→on with the throw
+        // progress, so the real handle/bat moves (not the LookAtTarget node, which often only carries lights).
+        // Null => fall back to the manual rotate/slide model above. _selAuthored mirrors it for the menu.
+        private struct SwMover { public Transform T; public Vector3 RestPos, OnPos; public Quaternion RestRot, OnRot; }
+        private System.Collections.Generic.List<SwMover> _switchMovers;
+        private bool _selAuthored;
+
+        // One-time-per-name diagnostic dump of a grabbed switch's hierarchy + components, so we can see what its
+        // moving part actually is (and what drives it) when the authored-motion read comes up empty.
+        private readonly System.Collections.Generic.HashSet<string> _diagDumped = new System.Collections.Generic.HashSet<string>();
 
         private bool _prevGrabR, _prevGrabL;
 
@@ -111,6 +223,13 @@ namespace IronNestVR
         {
             try
             {
+                // LEARN TAIL: keep sampling a just-triggered animation after release until it has played out, then cache.
+                if (_learnTail)
+                {
+                    SampleLearnFrame();
+                    if (Time.time >= _learnTailUntil) FinalizeLearnTail();
+                }
+
                 if (!Config.HandManipEnabled || !active)
                 {
                     if (Active) Release(input, hands, "inactive");
@@ -137,8 +256,8 @@ namespace IronNestVR
             {
                 Log.LogWarning("[manip] " + e.Message);
                 EndDrag();
+                ClearSwitchGrab();
                 _kind = Kind.None; _hand = 0; _dial = null; _lever = null;
-                _switch = null; _switchInteractable = null; _switchLatched = false;
                 try { hands.ClearGrab(true); } catch { }
                 try { hands.ClearGrab(false); } catch { }
             }
@@ -243,6 +362,143 @@ namespace IronNestVR
             _switchInteractable = sw.interactable;
             _kind = Kind.Switch;
             _hand = hand;
+
+            // We do NOT hand-drive the switch mesh, and we LEAVE THE GAME'S ANIMATOR ENABLED. Reproducing the
+            // authored pose was a dead end in this IL2CPP build (AnimationClip.SampleAnimation no-ops on Mecanim
+            // clips; a manually-Updated Animator writes no transforms even forced AlwaysAnimate), and DISABLING the
+            // animator to hand-drive a fallback was the actual "switch stays static" bug — it both moved the wrong
+            // node (the LookAtTarget carries the lights) AND blocked the real click animation. Instead: the hand
+            // follows the controller through the throw, and crossing the threshold fires the REAL click — the game
+            // then plays the control's OWN authored depress/flip. We keep the SwitchMotion only for the activation
+            // push DIRECTION (auto-seeded from the first shove) and remember the switch for the menu.
+            _switchKey = sw.name;
+            _selSwitchKey = sw.name;
+            _switchMotion = SwitchMotions.Get(_switchKey);
+            _switchProgress = 0f;
+            _switchMovers = null;   // no mesh driving — ApplySwitchPose is a no-op while the mover set is null
+            _selAuthored = false;
+
+            try { _switchAnimator = sw.animator; } catch { _switchAnimator = null; }
+            // Reference frame the throw travel + push direction are measured in (animator root, else the LAT node).
+            _switchRef = _switchAnimator != null ? _switchAnimator.transform : sw.transform;
+
+            // PROBE (one-time per control): dump the local hierarchy around the grabbed node so we can identify which node
+            // is the visible STICK the player holds (the grabbed LookAtTarget is usually a logical button carrying lights).
+            DumpStickCandidates(sw.transform, hitPoint);
+            _switchAnimatorWasEnabled = _switchAnimator != null && _switchAnimator.enabled;
+
+            // Finalize any pending learn-tail BEFORE starting a new grab, so its cache is ready if this is a scrub.
+            if (_learnTail) FinalizeLearnTail();
+
+            _switchScrubDone = false; _scrubManual = false; _activeMovers = null; _scrubAnimators = null;
+            _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f;
+            _scrubGlobalPeak = 0f; _scrubTs = null; _scrubProgMax = 0f; _scrubOpening = true; _learnTriggered = false;
+
+            // MOVE-EVERYTHING model: capture the whole triggered animation once (learn), then on later grabs DRIVE every
+            // node that the trigger actually animates and is a DRIVER (no follow-constraint), hand-paced by the pull, while
+            // FOLLOWERS (dome lights etc. — they carry a ParentConstraint) are left ALONE so they ride their driver via the
+            // constraint instead of being flung around on their own. Never reads constraint sources (that API crashes here).
+            if (_switchAnimator != null)
+            {
+                if (_scrubCache.TryGetValue(_switchKey, out var nodes) && nodes != null && nodes.Length > 0)
+                {
+                    // SCRUB pass: drive the DRIVERS (no follow-constraint) hand-paced; LEAVE followers (constrained) alone
+                    // so they ride their driver. Disable only the drivers' animators so our writes hold.
+                    var root = ScrubRoot(_switchAnimator.transform);
+                    _scrubRoot = root;
+                    _activeMovers = new System.Collections.Generic.List<ActiveMover>();
+                    Transform[] all = null;   // lazily built only if a direct ref died (then fall back to name resolve)
+                    int direct = 0, byname = 0;
+                    // Decide the TOGGLE DIRECTION from the control's actual current state: if the strongest mover currently
+                    // sits nearer its PRESSED pose (control left activated/open), this grab should drive it back toward REST
+                    // (closing); otherwise toward PRESS (opening). Picked once, applied to all movers so they stay coherent.
+                    bool opening = true; float bestTravel = -1f;
+                    for (int k = 0; k < nodes.Length; k++)
+                    {
+                        var t0 = nodes[k].T; if (t0 == null) continue;
+                        float travel = Vector3.Distance(nodes[k].RestPos, nodes[k].PressPos) + Quaternion.Angle(nodes[k].RestRot, nodes[k].PressRot) * 0.01f;
+                        if (travel <= bestTravel) continue;
+                        bestTravel = travel;
+                        float dRest = Vector3.Distance(t0.localPosition, nodes[k].RestPos) + Quaternion.Angle(t0.localRotation, nodes[k].RestRot) * 0.01f;
+                        float dPress = Vector3.Distance(t0.localPosition, nodes[k].PressPos) + Quaternion.Angle(t0.localRotation, nodes[k].PressRot) * 0.01f;
+                        opening = dRest <= dPress;   // nearer rest → open it; nearer press → close it
+                    }
+                    for (int k = 0; k < nodes.Length; k++)
+                    {
+                        // Prefer the LIVE ref captured at learn (same session) — no name ambiguity. Fall back to name only
+                        // if the object died (shouldn't, within a session).
+                        Transform t = nodes[k].T;
+                        if (t != null) { direct++; }
+                        else { if (all == null) all = root.GetComponentsInChildren<Transform>(true); t = FindByLeafNear(all, nodes[k].Leaf, nodes[k].RestPos); if (t != null) byname++; }
+                        if (t == null) continue;
+                        // FOLLOWER? If this node carries a follow-constraint, it's pinned to a driver — driving it directly
+                        // (as before) flings it off / moves unrelated lights. Skip it entirely: leave the constraint ENABLED
+                        // so it rides whichever driver we move. (We never read the constraint's source — that API crashes.)
+                        UnityEngine.Animations.ParentConstraint con = null;
+                        try { con = t.GetComponent<UnityEngine.Animations.ParentConstraint>(); } catch { con = null; }
+                        if (con != null) continue;
+                        // gap = how far the node currently sits from cached REST (diagnostic for stale state).
+                        float gap = Vector3.Distance(t.localPosition, nodes[k].RestPos) + Quaternion.Angle(t.localRotation, nodes[k].RestRot) * 0.01f;
+                        // Target this grab drives TOWARD; lerp begins at the node's ACTUAL current pose (no snap).
+                        Vector3 tgtP = opening ? nodes[k].PressPos : nodes[k].RestPos;
+                        Quaternion tgtR = opening ? nodes[k].PressRot : nodes[k].RestRot;
+                        Vector3 startRL = Vector3.zero; try { startRL = root.InverseTransformPoint(t.position); } catch { }
+                        _activeMovers.Add(new ActiveMover { T = t, RestPos = nodes[k].RestPos, RestRot = nodes[k].RestRot, PressPos = nodes[k].PressPos, PressRot = nodes[k].PressRot, Con = null, ConWasEnabled = false, StartLocal = t.localPosition, StartLocalR = t.localRotation, CachedGap = gap, TgtPos = tgtP, TgtRot = tgtR, StartRL = startRL });
+                    }
+                    if (_activeMovers.Count > 0)
+                    {
+                        _scrubManual = true;
+                        _scrubOpening = opening;
+                        // Disable every animator that drives a mover — the LAT's AND any separate one (e.g. the lever's
+                        // own), found via GetComponentInParent — so none of them re-pose the lever over our writes.
+                        _scrubAnimators = new System.Collections.Generic.List<AnimEntry>();
+                        DisableScrubAnimator(_switchAnimator);
+                        for (int k = 0; k < _activeMovers.Count; k++)
+                        {
+                            Animator a = null; try { a = _activeMovers[k].T.GetComponentInParent<Animator>(true); } catch { }
+                            DisableScrubAnimator(a);
+                        }
+
+                        var dbg = new System.Text.StringBuilder();
+                        int show = Mathf.Min(_activeMovers.Count, 8);
+                        for (int k = 0; k < show; k++) dbg.Append($" [{SafeName(_activeMovers[k].T)} con={_activeMovers[k].Con != null} gap={_activeMovers[k].CachedGap:0.00}]");
+                        Log.LogInfo($"[manip] scrub resolve '{_switchKey}': {_activeMovers.Count}/{nodes.Length} ({direct} ref, {byname} name; {_scrubAnimators.Count} anim; {(opening ? "OPEN" : "CLOSE")}) —{dbg}");
+                    }
+                }
+                else
+                {
+                    // LEARN pass: leave the animator enabled and snapshot the rig so DriveSwitch can record which nodes
+                    // the real click moves (and their pressed poses) to cache for next time. Root a parent UP from the
+                    // LookAtTarget so a handle that's a sibling/ancestor (outside the LAT's own subtree) is also seen —
+                    // local-pose measurement is immune to the turret's rotation, so a wider root is safe.
+                    try
+                    {
+                        var root = ScrubRoot(_switchAnimator.transform);
+                        _scrubRoot = root;
+                        _scrubTs = root.GetComponentsInChildren<Transform>(true);
+                        int m = _scrubTs != null ? _scrubTs.Length : 0;
+                        Log.LogInfo($"[manip] learn root '{_switchKey}': '{SafeName(root)}' ({m} nodes)");
+                        DumpAncestors(_switchAnimator.transform);   // PROBE: where the animators/renderers live above us
+                        DumpAnimators(root);                        // PROBE: every animator in the captured subtree + params
+                        _scrubRestP = new Vector3[m]; _scrubRestR = new Quaternion[m];
+                        _scrubNodePeak = new float[m]; _scrubNodePeakPos = new Vector3[m]; _scrubNodePeakRot = new Quaternion[m];
+                        _scrubRestRL = new Vector3[m]; _scrubWorldPeak = new float[m];
+                        for (int i = 0; i < m; i++)
+                        {
+                            _scrubRestP[i] = _scrubTs[i].localPosition; _scrubRestR[i] = _scrubTs[i].localRotation;
+                            _scrubNodePeakPos[i] = _scrubRestP[i]; _scrubNodePeakRot[i] = _scrubRestR[i];
+                            _scrubRestRL[i] = root.InverseTransformPoint(_scrubTs[i].position);  // root-local rest position
+                        }
+                    }
+                    catch { _scrubTs = null; }
+                }
+            }
+
+            // HELD-STICK FOLLOW: point the stick's '…Parent' hinge at the hand so the thing in your hand visibly follows.
+            // Runs on EVERY grab (learn or scrub) — it needs only the grab geometry, not the captured mechanism, so the
+            // stick follows on the very first grab. The captured movers (hatch/cylinders) replay separately on scrubs.
+            SelectHeldStick(sw.transform, hitPoint);
+
             GetWorld(origin, HandGripPose(hand, input), out Vector3 gp, out Quaternion gr);
             _switchGrabGripPos = gp;     // controller anchor — throw is measured from here
             _switchHandAnchor = hitPoint; // seed the hand on the switch; it rides the controller travel
@@ -251,7 +507,35 @@ namespace IronNestVR
             _handRot = gr;
             hands.SetGrab(hand == 2, _handPos, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[manip] grabbed switch '{sw.name}' ({(hand == 2 ? "right" : "left")}, throw {Config.SwitchThrowDistance * 100f:0.#}cm to activate).");
+            Log.LogInfo($"[manip] grabbed switch '{sw.name}' ({(hand == 2 ? "right" : "left")}; {(_scrubManual ? $"scrub {_activeMovers.Count} drivers" : "learn")}).");
+        }
+
+        // Pick the animator state to scrub for a grabbed switch: the press/flip clip (by name score), short enough to
+        // be the control's own motion (not a multi-second mechanism), and addressable as a state on layer 0. State
+        // names equal clip names on these controllers (verified: HasState(StringToHash(clipName)) is true).
+        private bool FindPressState(Animator anim, out int hash)
+        {
+            hash = 0;
+            try
+            {
+                var rac = anim.runtimeAnimatorController; if (rac == null) return false;
+                var clips = rac.animationClips; if (clips == null || clips.Length == 0) return false;
+                float best = float.NegativeInfinity; int bh = 0; bool found = false;
+                for (int c = 0; c < clips.Length; c++)
+                {
+                    var clip = clips[c]; if (clip == null) continue;
+                    string cn = SafeName(clip);
+                    float len = 0f; try { len = clip.length; } catch { }
+                    float score = ClipNameScore(cn);
+                    if (score <= -1000f || len <= 0.02f || len > 1.5f) continue;
+                    int h; try { h = Animator.StringToHash(cn); } catch { continue; }
+                    bool hs; try { hs = anim.HasState(0, h); } catch { hs = false; }
+                    if (!hs) continue;
+                    if (score > best) { best = score; bh = h; found = true; }
+                }
+                hash = bh; return found;
+            }
+            catch { return false; }
         }
 
         // Point a left-held control's raycast camera at the LEFT pointer cam (owned by CockpitInteractor).
@@ -301,30 +585,283 @@ namespace IronNestVR
             hands.SetGrab(_hand == 2, _handPos, _handRot);
         }
 
-        // Click switch: the game has no drag to ride, so the HAND tracks the controller's travel from the
-        // grab point and we fire the click once the travel passes the throw threshold (re-arming when the
-        // hand returns, so a back-and-forth toggles on then off within one grab).
+        // Click switch: the hand AND the switch mesh follow the controller's travel from the grab point along
+        // this switch's activation push direction; the mesh moves per its SwitchMotion (rotate/slide). Once the
+        // push passes the throw threshold we fire the click (re-arming when the hand returns, so a back-and-forth
+        // toggles on then off within one grab).
         private void DriveSwitch(VrInput input, Transform origin, HandVisuals hands)
         {
-            if (_switch == null) { Release(input, hands, "control gone"); return; }
+            if (_switch == null || _switchRef == null) { Release(input, hands, "control gone"); return; }
 
             GetWorld(origin, HandGripPose(_hand, input), out Vector3 gp, out Quaternion gr);
-            Vector3 delta = gp - _switchGrabGripPos;
-            _handPos = _switchHandAnchor + delta; // hand follows the controller so it looks operated
+            Vector3 worldTravel = gp - _switchGrabGripPos;
+            _handPos = _switchHandAnchor + worldTravel; // hand follows the controller so it looks operated
             _handRot = gr;
             hands.SetGrab(_hand == 2, _handPos, _handRot);
 
-            float travel = delta.magnitude;
-            if (!_switchLatched && travel >= Config.SwitchThrowDistance)
+            // Hand travel in the reference PARENT-local frame — the frame the motion axis / push direction live in —
+            // so the motion is defined relative to the switch wherever you stand.
+            Transform pspace = _switchRef.parent;
+            Vector3 localTravel = pspace != null ? pspace.InverseTransformVector(worldTravel) : worldTravel;
+
+            // Auto-seed the activation push direction from the first real shove, then persist it.
+            if (!_switchMotion.HasPush && localTravel.magnitude >= Config.SwitchThrowDistance * 0.5f)
             {
-                Activate(_switch, _switchInteractable);
-                _switchLatched = true;
-                input.Haptic(Config.HapticAmplitude, Mathf.Max(Config.HapticSeconds, 0.04f));
+                _switchMotion.PushLocal = localTravel.normalized;
+                _switchMotion.HasPush = true;
+                SwitchMotions.Set(_switchKey, _switchMotion);
             }
-            else if (_switchLatched && travel <= Mathf.Min(Config.SwitchThrowReset, Config.SwitchThrowDistance * 0.5f))
+
+            float along = _switchMotion.HasPush ? Vector3.Dot(localTravel, _switchMotion.PushLocal) : localTravel.magnitude;
+            // Followed levers are bidirectional toggles: pulling EITHER way from rest counts, so a control left in its
+            // 'on' state can be pulled back the other way to turn it off (and vice-versa). PushLocal is locked to the
+            // first-ever direction, so without abs the return pull reads as negative progress and never arms.
+            if (_leverT != null) along = Mathf.Abs(along);
+            float progress = Mathf.Clamp(along / Mathf.Max(0.01f, Config.SwitchThrowDistance), 0f, 1f);
+            _switchProgress = progress;
+            if (progress > _scrubProgMax) _scrubProgMax = progress;
+
+            // The held stick follows the hand on EVERY grab (learn or scrub) — independent of the mechanism replay below.
+            DriveHeldStick();
+
+            if (_scrubManual)
             {
-                _switchLatched = false; // back near the grab point — ready to flip again
+                // SCRUB pass: hand-drive every learned node rest→pressed by progress (animator + constraints off).
+                if (!_switchScrubDone && _activeMovers != null)
+                {
+                    for (int k = 0; k < _activeMovers.Count; k++)
+                    {
+                        var m = _activeMovers[k];
+                        if (m.T == null) continue;
+                        // The held stick is driven separately (point-at-hand) — never also replay it as a mechanism mover.
+                        if (_leverT != null && m.T == _leverT) continue;
+                        // DIAG: how far did the node drift from what we wrote last frame? ~0 = our write holds (so if the
+                        // visual still doesn't move, we've got the wrong node); large = something re-poses it after Update.
+                        if (m.WroteOnce)
+                        {
+                            float drift = Vector3.Distance(m.T.localPosition, m.LastWrote);
+                            if (drift > m.MaxDrift) m.MaxDrift = drift;
+                        }
+                        // DEBUG OSCILLATE: ignore the throw and cycle the FULL rest↔press range on a slow timer while held,
+                        // so we can see — independent of push speed / activation — whether these writes render at all.
+                        float drive = ScrubDebugOscillate ? Mathf.PingPong(Time.time * 0.6f, 1f) : progress;
+                        Vector3 fromP = ScrubDebugOscillate ? m.RestPos : m.StartLocal;
+                        Quaternion fromR = ScrubDebugOscillate ? m.RestRot : m.StartLocalR;
+                        Vector3 toP = ScrubDebugOscillate ? m.PressPos : m.TgtPos;
+                        Quaternion toR = ScrubDebugOscillate ? m.PressRot : m.TgtRot;
+                        // Lerp from the node's ACTUAL pose at grab toward this grab's target (open→press / close→rest), so
+                        // there's no snap when the control was left mid-state, and a re-grab reverses it like a real toggle.
+                        Vector3 wp = Vector3.Lerp(fromP, toP, drive);
+                        m.T.localPosition = wp;
+                        m.T.localRotation = Quaternion.Slerp(fromR, toR, drive);
+                        m.LastWrote = wp; m.WroteOnce = true;
+                        // DIAG: travel from grab pose, in the node's own local frame AND in root-local (visible) space.
+                        float mv = Vector3.Distance(m.T.localPosition, m.StartLocal) + Quaternion.Angle(m.T.localRotation, m.StartLocalR) * 0.01f;
+                        if (mv > m.MoveMax) m.MoveMax = mv;
+                        if (_scrubRoot != null)
+                        {
+                            float wmv = Vector3.Distance(_scrubRoot.InverseTransformPoint(m.T.position), m.StartRL);
+                            if (wmv > m.WorldMove) m.WorldMove = wmv;
+                        }
+                        _activeMovers[k] = m;
+                    }
+                }
             }
+            else if (_scrubTs != null)
+            {
+                SampleLearnFrame();
+            }
+
+            // DEBUG OSCILLATE: never auto-activate while scrubbing, so the lever keeps cycling for as long as you hold it.
+            if (ScrubDebugOscillate && _scrubManual) { /* held → keep oscillating; release ends it */ }
+            else if (!_switchLatched && progress >= 0.85f)
+            {
+                if (_leverT != null)
+                {
+                    // FOLLOW control: DON'T fire mid-pull — the game's animation would rip the lever out of your hand.
+                    // Arm it (a haptic tick marks the activation point); the click fires on RELEASE, after the hand is gone.
+                    if (!_leverArmed) { _leverArmed = true; input.Haptic(Config.HapticAmplitude, Mathf.Max(Config.HapticSeconds, 0.04f)); }
+                    _switchLatched = true;
+                }
+                else
+                {
+                    // On the scrub pass, hand the animator + constraints back to the game so it shows the post-click state.
+                    if (_scrubManual && !_switchScrubDone)
+                    {
+                        RestoreScrubDrivers();
+                        _switchScrubDone = true;
+                    }
+                    Activate(_switch, _switchInteractable);
+                    _switchLatched = true;
+                    if (!_scrubManual) _learnTriggered = true; // learn fired the click → capture its tail after release
+                    input.Haptic(Config.HapticAmplitude, Mathf.Max(Config.HapticSeconds, 0.04f));
+                }
+            }
+            else if (_switchLatched && progress <= 0.30f)
+            {
+                _switchLatched = false;          // pushed back — ready to flip again
+                if (_leverT != null) _leverArmed = false;  // pulled back before release → don't fire on release
+            }
+        }
+
+        // Retained mesh-poser (currently a no-op: we no longer hand-drive switch meshes — see EngageSwitch — so the
+        // authored mover set is always null). Kept as the single drive point if a future build scrubs the game's
+        // animator instead.
+        private void ApplySwitchPose(float progress)
+        {
+            if (_switchMovers == null) return;
+            for (int i = 0; i < _switchMovers.Count; i++)
+            {
+                var m = _switchMovers[i];
+                if (m.T == null) continue;
+                m.T.localPosition = Vector3.Lerp(m.RestPos, m.OnPos, progress);
+                m.T.localRotation = Quaternion.Slerp(m.RestRot, m.OnRot, progress);
+            }
+        }
+
+        // Discover the switch's real moving parts from its Animator and record the motion to reproduce. We sample
+        // the best (most-moving) clip at its start and activated end — SampleAnimation is span-free here, so it's
+        // safe in this IL2CPP build — diff every descendant of the animator root to find which transforms the
+        // clip actually moves, and store each mover's CURRENT (rest) pose + the clip's end pose. Driving then
+        // lerps rest→end with the throw progress, so the genuine handle/bat travels exactly as the game authored
+        // it (no axis/range guessing). Returns false (→ manual fallback) if there's no animator/controller/clip
+        // or nothing moves. Restores the sampled transforms to rest before returning (no visible flicker).
+        private bool TryBuildAuthoredMotion(LookAtTarget sw)
+        {
+            Animator anim = null;
+            try { anim = sw.animator; } catch { }
+            if (anim == null) return false;
+            var rac = anim.runtimeAnimatorController;
+            if (rac == null) return false;
+            var clips = rac.animationClips;
+            if (clips == null || clips.Length == 0) return false;
+
+            var go = anim.gameObject;
+            if (go == null) return false;
+            var ts = go.GetComponentsInChildren<Transform>(true);
+            if (ts == null || ts.Length == 0) return false;
+            int n = ts.Length;
+
+            // Rest = the live pose at grab time. A press/flip clip RETURNS to rest at its end (rest→pressed→rest),
+            // so comparing endpoints reads ~zero — we scan each clip across its length for the PEAK-deflection frame
+            // and capture the pressed/flipped pose there.
+            var restP = new Vector3[n]; var restR = new Quaternion[n];
+            for (int i = 0; i < n; i++) { var t = ts[i]; restP[i] = t.localPosition; restR[i] = t.localRotation; }
+
+            // Remember the live animator state so we can put it back after probing (we Play/Update foreign states).
+            int st0Hash = 0; float st0Nt = 0f; bool haveSt0 = false;
+            try { var si = anim.GetCurrentAnimatorStateInfo(0); st0Hash = si.fullPathHash; st0Nt = si.normalizedTime; haveSt0 = true; } catch { }
+
+            // A manually-Updated Animator in CullUpdateTransforms/CullCompletely writes NO transforms when its
+            // renderers are deemed invisible → our probe would read zero. Force AlwaysAnimate while probing, restore after.
+            int cm0 = -1;
+            try { cm0 = (int)anim.cullingMode; anim.cullingMode = AnimatorCullingMode.AlwaysAnimate; } catch { }
+
+            const int Steps = 12;
+            const float LenCap = 1.5f;   // skip long mechanism cycles (the rammer's 6-7s clip) — drive the press, not the gun
+            var diag = new System.Text.StringBuilder($"[manip] authored scan '{sw.name}' (root='{SafeName(go)}' n={n} en={anim.enabled} upd={(int)anim.updateMode} cull={cm0}): ");
+
+            int bestC = -1, bestHash = 0; float bestRank = float.NegativeInfinity, bestPeakTime = 0f, bestPeakDev = 0f;
+            for (int c = 0; c < clips.Length; c++)
+            {
+                var clip = clips[c];
+                if (clip == null) continue;
+                string cn = SafeName(clip);
+                float len = 0f; try { len = clip.length; } catch { }
+
+                float nameScore = ClipNameScore(cn);
+                bool excluded = nameScore <= -1000f || len <= 0.02f || len > LenCap;
+
+                // These are Mecanim (generic) clips: AnimationClip.SampleAnimation silently no-ops on them (it only
+                // applies LEGACY clips). The supported runtime evaluation is to drive the Animator itself — Play the
+                // clip's state at a normalized time and Update(0) to bake the pose onto the rig, then read it.
+                int hash = 0; bool hasState = false;
+                if (!excluded)
+                {
+                    try { hash = Animator.StringToHash(cn); hasState = anim.HasState(0, hash); } catch { hasState = false; }
+                }
+
+                float peakDev = 0f, peakTime = 0f; int peakIdx = -1; string err = null;
+                if (hasState)
+                {
+                    try
+                    {
+                        for (int s = 1; s <= Steps; s++)
+                        {
+                            float nt = (float)s / Steps;
+                            anim.Play(hash, 0, nt);
+                            anim.Update(0f);
+                            float dev = 0f; int mi = -1; float md = 0f;
+                            for (int i = 0; i < n; i++)
+                            {
+                                float di = Vector3.Distance(ts[i].localPosition, restP[i]) + Quaternion.Angle(ts[i].localRotation, restR[i]) * 0.01f;
+                                dev += di;
+                                if (di > md) { md = di; mi = i; }
+                            }
+                            if (dev > peakDev) { peakDev = dev; peakTime = nt; peakIdx = mi; }
+                        }
+                    }
+                    catch (Exception e) { peakDev = 0f; err = e.Message; }
+                    for (int i = 0; i < n; i++) { ts[i].localPosition = restP[i]; ts[i].localRotation = restR[i]; } // restore
+                }
+
+                string tag = excluded ? "X" : !hasState ? "noState" : err != null ? "ERR:" + err
+                           : "dev=" + peakDev.ToString("0.0000") + (peakIdx >= 0 ? "@" + SafeName(ts[peakIdx]) : "");
+                diag.Append($"[{cn} {len:0.00}s {tag}] ");
+                if (excluded || !hasState || peakDev < 1e-3f) continue;
+
+                // Prefer the named press/flip clip; deflection magnitude only breaks ties between same-named clips.
+                float rank = nameScore + Mathf.Min(peakDev, 1f);
+                if (rank > bestRank) { bestRank = rank; bestC = c; bestHash = hash; bestPeakTime = peakTime; bestPeakDev = peakDev; }
+            }
+
+            if (bestC < 0) { RestoreAnimator(anim, ts, restP, restR, haveSt0, st0Hash, st0Nt, cm0); Log.LogInfo(diag.ToString() + "=> none"); return false; }
+
+            // Bake the chosen clip's peak (pressed/flipped) pose as the activated end, read it, then restore.
+            var bestClip = clips[bestC];
+            var onP = new Vector3[n]; var onR = new Quaternion[n];
+            try { anim.Play(bestHash, 0, bestPeakTime); anim.Update(0f); }
+            catch { RestoreAnimator(anim, ts, restP, restR, haveSt0, st0Hash, st0Nt, cm0); return false; }
+            for (int i = 0; i < n; i++) { onP[i] = ts[i].localPosition; onR[i] = ts[i].localRotation; }
+            RestoreAnimator(anim, ts, restP, restR, haveSt0, st0Hash, st0Nt, cm0);
+
+            var movers = new System.Collections.Generic.List<SwMover>();
+            for (int i = 0; i < n; i++)
+            {
+                float d = Vector3.Distance(restP[i], onP[i]) + Quaternion.Angle(restR[i], onR[i]) * 0.01f;
+                if (d <= 1e-4f) continue;
+                movers.Add(new SwMover { T = ts[i], RestPos = restP[i], RestRot = restR[i], OnPos = onP[i], OnRot = onR[i] });
+            }
+            if (movers.Count == 0) { Log.LogInfo(diag.ToString() + "=> no movers"); return false; }
+            _switchMovers = movers;
+            Log.LogInfo(diag.ToString() + $"=> '{SafeName(bestClip)}' nt={bestPeakTime:0.00}, {movers.Count} mover(s).");
+            return true;
+        }
+
+        // Put the rig back: restore the original animator state + culling mode (best-effort) and the rest local poses.
+        private static void RestoreAnimator(Animator anim, Transform[] ts, Vector3[] restP, Quaternion[] restR,
+                                            bool haveSt0, int st0Hash, float st0Nt, int cm0)
+        {
+            try { if (haveSt0) { anim.Play(st0Hash, 0, st0Nt); anim.Update(0f); } } catch { }
+            try { if (cm0 >= 0) anim.cullingMode = (AnimatorCullingMode)cm0; } catch { }
+            for (int i = 0; i < ts.Length; i++) { ts[i].localPosition = restP[i]; ts[i].localRotation = restR[i]; }
+        }
+
+        // Name-based preference for which clip is the control's "operate" motion. <= -1000 means exclude entirely.
+        private static float ClipNameScore(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return 0f;
+            string n = name.ToLowerInvariant();
+            if (n.Contains("hover")) return -1000f;                          // hover highlight, not a motion
+            float s = 0f;
+            if (n.Contains("safty") || n.Contains("safety")) s -= 100f;      // safety-cover flip is a different part
+            if (n.Contains("dead")) s -= 40f;                                // disabled-press variant
+            if (n.Contains("unclick") || n.Contains("un click")) s -= 30f;   // reverse of the press
+            else if (n.Contains("click")) s += 100f;                         // the press
+            if (n.Contains("active")) s += 40f;                              // active/depressed pose
+            if (n.Contains("switch")) s += 30f;
+            if (n.Contains("arm") || n.Contains("lever")) s += 20f;
+            return s;
         }
 
         // Fire the switch's click exactly as the cursor manager does: tell it it's hovered, then press and
@@ -356,11 +893,599 @@ namespace IronNestVR
         private void Release(VrInput input, HandVisuals hands, string why)
         {
             EndDrag();
+            ClearSwitchGrab();
             try { hands.ClearGrab(_hand == 2); } catch { }
             try { input.Haptic(Config.DetentHapticAmplitude, 0.03f); } catch { }
             Log.LogInfo($"[manip] released ({why}).");
             _kind = Kind.None; _hand = 0; _dial = null; _lever = null;
+        }
+
+        // Hand a grabbed switch back: re-enable its animator + each disabled constraint (so the game owns the
+        // post-click state again), and on a LEARN grab cache every node the click moved so later grabs scrub. MUST
+        // run on every switch teardown path (release, exception, reset) or a scrub-grab's animator/constraints stay
+        // disabled and that switch is frozen for the rest of the session. Keeps _selSwitchKey.
+        private void ClearSwitchGrab()
+        {
+            try
+            {
+                // PROBE: per-mover scrub result — local move, root-local (visible) move, stale-rest gap, write drift.
+                if (_scrubManual && _activeMovers != null && _switchKey != null)
+                {
+                    var dd = new System.Text.StringBuilder();
+                    for (int k = 0; k < _activeMovers.Count; k++)
+                        dd.Append($" [{SafeName(_activeMovers[k].T)} move={_activeMovers[k].MoveMax:0.00} world={_activeMovers[k].WorldMove:0.000} drift={_activeMovers[k].MaxDrift:0.000}]");
+                    Log.LogInfo($"[manip] scrub motion '{_switchKey}' progMax={_scrubProgMax:0.00} {(_scrubOpening ? "OPEN" : "CLOSE")}:{dd}");
+                }
+                // Held-stick result on EVERY grab (learn or scrub): how far the grab point on the hinge actually swung.
+                if (_leverT != null && _switchKey != null)
+                {
+                    string mode = _leverSlide
+                        ? $"SLIDE axis=({_leverSlideAxisW.x:0.00},{_leverSlideAxisW.y:0.00},{_leverSlideAxisW.z:0.00}) locked={_leverHasSlideAxis}"
+                        : $"ROTATE axis=({_leverRotAxisW.x:0.00},{_leverRotAxisW.y:0.00},{_leverRotAxisW.z:0.00}) locked={_leverHasRotAxis}";
+                    Log.LogInfo($"[manip] held-stick result '{_switchKey}': hinge '{SafeName(_leverT)}' {mode} grab-point moved {_leverTipTravel:0.000} m.");
+                }
+
+                RestoreScrubDrivers();
+                // Return the synthetic hinge to its rest pose so the lever doesn't stay stuck swung/slid after release.
+                try { if (_leverT != null) { _leverT.localRotation = _leverRestLocalR; _leverT.localPosition = _leverPivotLocal; } } catch { }
+                if (_switchAnimator != null) _switchAnimator.enabled = _switchAnimatorWasEnabled;
+
+                // FOLLOW control fired on RELEASE: you pulled past the threshold, so fire the click NOW (hand already gone
+                // → the scripted animation plays without yanking the lever). Set _learnTriggered so the tail still captures.
+                if (_leverT != null && _leverArmed && _switch != null)
+                {
+                    Activate(_switch, _switchInteractable);
+                    if (!_scrubManual) _learnTriggered = true;
+                    Log.LogInfo($"[manip] held-stick '{_switchKey}': fired click on release (pulled past threshold).");
+                }
+
+                // LEARN: if the click fired, the animation is still playing — keep the rig snapshot alive and sample a
+                // TAIL after release (in Tick) so the FULL animation is captured regardless of how fast you let go. The
+                // cache is built when the tail completes. If the click never fired, there's nothing to capture.
+                if (!_scrubManual && _scrubTs != null && _learnTriggered && _switchKey != null)
+                {
+                    _learnTail = true; _learnTailKey = _switchKey; _learnTailUntil = Time.time + LearnTailSeconds;
+                }
+            }
+            catch { }
             _switch = null; _switchInteractable = null; _switchLatched = false;
+            _switchScrubDone = false; _scrubManual = false; _activeMovers = null; _scrubAnimators = null;
+            _leverT = null; _leverParent = null; _leverCon = null;
+            _switchRef = null; _switchMovers = null; _switchAnimator = null; _switchKey = null; _switchProgress = 0f;
+            // Keep the learn arrays alive ONLY while a tail capture is pending; otherwise drop everything.
+            if (!_learnTail)
+            {
+                _scrubTs = null; _scrubRoot = null; _scrubRestRL = null; _scrubWorldPeak = null;
+                _scrubGlobalPeak = 0f; _learnTriggered = false;
+            }
+        }
+
+        // Sample one frame of the learn capture: update each node's peak local deflection (+ pose at peak) and its peak
+        // root-local (visible) travel. Runs both while holding the learn grab AND during the post-release tail.
+        // One-time structural dump per control: reveal which node is the visible STICK the player holds (vs the grabbed
+        // LookAtTarget, which is often a logical button carrying only lights/indicators). Lists self + ancestors, the
+        // grabbed node's children, and its siblings — each with renderer/animator/constraint flags, geometric EXTENT
+        // (farthest descendant = how long it is) and NEAR (closest its body comes to the grab point). The held stick is
+        // the elongated renderer node whose body is nearest the grab. We never read constraint sources (that crashes).
+        private static readonly System.Collections.Generic.HashSet<string> _stickDumped = new System.Collections.Generic.HashSet<string>();
+        private void DumpStickCandidates(Transform grabbed, Vector3 grabPoint)
+        {
+            if (grabbed == null) return;
+            string key = SafeName(grabbed);
+            if (key == null || _stickDumped.Contains(key)) return;
+            _stickDumped.Add(key);
+            try
+            {
+                Log.LogInfo($"[stick] === '{key}' grab@({grabPoint.x:0.00},{grabPoint.y:0.00},{grabPoint.z:0.00}) ===");
+                Transform t = grabbed; int up = 0;
+                while (t != null && up <= 3) { Log.LogInfo($"[stick] anc{up} {DescribeStickNode(t, grabPoint)}"); t = t.parent; up++; }
+                DumpStickChildren(grabbed, grabPoint, "  kid", 2);
+                Transform par = grabbed.parent;
+                if (par != null)
+                    for (int i = 0; i < par.childCount; i++)
+                    {
+                        Transform c = null; try { c = par.GetChild(i); } catch { }
+                        if (c == null || c == grabbed) continue;
+                        Log.LogInfo($"[stick] sib {DescribeStickNode(c, grabPoint)}");
+                    }
+            }
+            catch (Exception e) { Log.LogWarning("[stick] dump: " + e.Message); }
+        }
+
+        private void DumpStickChildren(Transform t, Vector3 grabPoint, string pre, int depth)
+        {
+            if (t == null || depth <= 0) return;
+            int n = 0; try { n = t.childCount; } catch { return; }
+            for (int i = 0; i < n; i++)
+            {
+                Transform c = null; try { c = t.GetChild(i); } catch { }
+                if (c == null) continue;
+                Log.LogInfo($"[stick]{pre} {DescribeStickNode(c, grabPoint)}");
+                DumpStickChildren(c, grabPoint, pre + "  ", depth - 1);
+            }
+        }
+
+        // One node line: name, renderer kind (+A animator, +C constraint), how long it is, how near its body is to the grab.
+        private string DescribeStickNode(Transform t, Vector3 grabPoint)
+        {
+            string kind = RendererKind(t);
+            bool anim = false; try { anim = t.GetComponent<Animator>() != null; } catch { }
+            bool con = false; try { con = t.GetComponent<UnityEngine.Animations.ParentConstraint>() != null; } catch { }
+            float extent = 0f, near = float.MaxValue;
+            Vector3 o = Vector3.zero; try { o = t.position; } catch { }
+            Transform[] kids = null; try { kids = t.GetComponentsInChildren<Transform>(true); } catch { }
+            if (kids != null)
+                for (int i = 0; i < kids.Length; i++)
+                {
+                    var k = kids[i]; if (k == null) continue;
+                    Vector3 kp; try { kp = k.position; } catch { continue; }
+                    float e = Vector3.Distance(kp, o); if (e > extent) extent = e;
+                    float nr = Vector3.Distance(kp, grabPoint); if (nr < near) near = nr;
+                }
+            if (near == float.MaxValue) near = Vector3.Distance(o, grabPoint);
+            return $"'{SafeName(t)}' {kind}{(anim ? "+A" : "")}{(con ? "+C" : "")} ext={extent:0.00} near={near:0.000}";
+        }
+
+        // Pick the stick the player is HOLDING (so we can point it at the hand). It's the grabbed node, OR its parent if
+        // the parent gives a longer lever-arm from the grab point — that's the long stick whose base is its own origin
+        // (e.g. the grabbed button sits on the end of 'Power Lever'). The captured movers are the actuated mechanism, NOT
+        // the held stick, so we never pick from them. Seeded from the grab point; null => no synthetic swing this grab.
+        private void SelectHeldStick(Transform grabbed, Vector3 grabPoint)
+        {
+            _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f; _leverArmed = false;
+            if (!HeldStickFollow) return;   // structure-dump build: don't drive any node until the real stick is identified
+            if (grabbed == null) return;
+
+            // The rig hinges every lever on a '<Name> Parent' empty (War Horn Parent / Power Lever Parent /
+            // .Hatch Lever Barbet Parent.001). Find the one nearest the grab — ancestors up to the assembly, then the
+            // grabbed node's siblings — and rotate THAT so its child stick swings about the correct hinge.
+            Transform pivot = FindPivotNode(grabbed, grabPoint);
+            if (pivot == null)
+            {
+                Log.LogInfo($"[manip] held-stick follow: no '…Parent' hinge near '{SafeName(grabbed)}' — no swing this control.");
+                return;
+            }
+            float arm = 0f; try { arm = Vector3.Distance(grabPoint, pivot.position); } catch { }
+            if (arm < 0.03f)
+            {
+                Log.LogInfo($"[manip] held-stick follow: hinge '{SafeName(pivot)}' arm<3cm ({arm:0.000}) — no swing.");
+                return;
+            }
+
+            _leverT = pivot; _leverParent = pivot.parent;
+            _leverPivotLocal = pivot.localPosition; _leverRestLocalR = pivot.localRotation;
+            Vector3 armW = grabPoint - pivot.position;
+            _leverArmParentDir = _leverParent != null ? _leverParent.InverseTransformDirection(armW) : armW;
+            try { _leverGrabLocal = pivot.InverseTransformPoint(grabPoint); } catch { _leverGrabLocal = Vector3.zero; }
+            _leverMaxAngle = 70f;
+            _leverTip0W = grabPoint; _leverTipTravel = 0f;
+            // SLIDE if the control is set to (menu) or its name hints a pulley/horn/chain; otherwise ROTATE about the hinge.
+            _leverSlide = _switchMotion.Translate || NameSlideHint(pivot) || NameSlideHint(grabbed);
+            _leverHasSlideAxis = false; _leverSlideAxisW = Vector3.zero;
+            _leverHasRotAxis = false; _leverRotAxisW = Vector3.zero;
+            _leverArmed = false;
+
+            // If a ParentConstraint pins the hinge, our rotation would be overwritten — disable it for the grab and
+            // restore on release. (Null-check only; we never read its sources — that API hard-crashes this runtime.)
+            try { _leverCon = pivot.GetComponent<UnityEngine.Animations.ParentConstraint>(); } catch { _leverCon = null; }
+            if (_leverCon != null) { try { _leverConWasActive = _leverCon.constraintActive; _leverCon.constraintActive = false; } catch { } }
+            // Disable any animator on the hinge so nothing re-poses it over our writes.
+            try { DisableScrubAnimator(pivot.GetComponent<Animator>()); } catch { }
+
+            Log.LogInfo($"[manip] held-stick follow: {(_leverSlide ? "sliding" : "swinging")} hinge '{SafeName(pivot)}' (arm={arm:0.000}m, con={_leverCon != null}).");
+        }
+
+        // Name hint that a control TRANSLATES rather than rotates (pulley/horn/chain). The menu Translate flag overrides.
+        private static bool NameSlideHint(Transform t)
+        {
+            string s = SafeName(t); if (string.IsNullOrEmpty(s)) return false;
+            s = s.ToLowerInvariant();
+            return s.Contains("horn") || s.Contains("pulley") || s.Contains("chain") || s.Contains("rope") || s.Contains("cord");
+        }
+
+        // The lever's hinge: the nearest node named '*Parent' to the grab point — ancestors first (up to the assembly),
+        // then the grabbed node's siblings. Ranked by how close the node's body comes to the grab. Null if none found.
+        private Transform FindPivotNode(Transform grabbed, Vector3 grabPoint)
+        {
+            Transform best = null; float bestNear = float.MaxValue;
+            Transform t = grabbed; int up = 0;
+            while (t != null && up <= 4)
+            {
+                if (t != grabbed && NameHasParent(t))
+                {
+                    float n = NearestApproach(t, grabPoint);
+                    if (n < bestNear) { bestNear = n; best = t; }
+                }
+                t = t.parent; up++;
+            }
+            Transform par = grabbed.parent;
+            if (par != null)
+            {
+                int cc = 0; try { cc = par.childCount; } catch { }
+                for (int i = 0; i < cc; i++)
+                {
+                    Transform c = null; try { c = par.GetChild(i); } catch { }
+                    if (c == null || c == grabbed || !NameHasParent(c)) continue;
+                    float n = NearestApproach(c, grabPoint);
+                    if (n < bestNear) { bestNear = n; best = c; }
+                }
+            }
+            return best;
+        }
+
+        private static bool NameHasParent(Transform t)
+        {
+            string s = SafeName(t);
+            return !string.IsNullOrEmpty(s) && s.IndexOf("parent", System.StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Closest any part of t's body (itself + descendants) comes to point p — a hinge whose mesh is near the grab wins.
+        private static float NearestApproach(Transform t, Vector3 p)
+        {
+            float near = float.MaxValue;
+            Transform[] kids = null; try { kids = t.GetComponentsInChildren<Transform>(true); } catch { }
+            if (kids != null)
+                for (int i = 0; i < kids.Length; i++)
+                {
+                    var k = kids[i]; if (k == null) continue;
+                    float d; try { d = Vector3.Distance(k.position, p); } catch { continue; }
+                    if (d < near) near = d;
+                }
+            if (near == float.MaxValue) { try { near = Vector3.Distance(t.position, p); } catch { near = 0f; } }
+            return near;
+        }
+
+        // Snap a world direction to the hinge's nearest LOCAL axis (±X/±Y/±Z in world), signed to match. Levers in this
+        // rig hinge/slide about an authored local axis, so snapping turns the user's noisy first-shove into a clean,
+        // rig-aligned axis (kills the skewed-diagonal swing and the random slide direction).
+        private Vector3 SnapToPivotAxis(Vector3 dirW)
+        {
+            if (_leverT == null || dirW.sqrMagnitude < 1e-8f) return dirW;
+            Vector3 best = _leverT.right; float bestDot = -1f;
+            Vector3[] axes; try { axes = new[] { _leverT.right, _leverT.up, _leverT.forward }; } catch { return dirW; }
+            for (int i = 0; i < axes.Length; i++)
+            {
+                if (axes[i].sqrMagnitude < 1e-8f) continue;
+                float d = Mathf.Abs(Vector3.Dot(dirW, axes[i].normalized));
+                if (d > bestDot) { bestDot = d; best = axes[i]; }
+            }
+            best = best.normalized;
+            if (Vector3.Dot(dirW, best) < 0f) best = -best;   // sign so swing/slide direction matches the user's intent
+            return best;
+        }
+
+        // Make the held stick follow the hand: ROTATE its hinge to point the grab arm at the hand (default), or SLIDE the
+        // hinge along the pull axis for translate-type controls (e.g. the War Horn pulley). Real-hand driven → visible.
+        private void DriveHeldStick()
+        {
+            if (_leverT == null) return;
+            Vector3 pivotW = _leverParent != null ? _leverParent.TransformPoint(_leverPivotLocal) : _leverT.position;
+
+            if (_leverSlide)
+            {
+                // SLIDE: translate the hinge along ONE axis by the hand's travel (clamped). Work in the PARENT'S LOCAL
+                // frame (localPosition + InverseTransformVector) so the handle RIDES its parent and only adds a bounded
+                // local offset — writing world .position rode the parent's motion amplified and flung it metres away.
+                // PIN rotation to rest so nothing can spin the hinge and sling its far body.
+                try { _leverT.localRotation = _leverRestLocalR; } catch { }
+                Vector3 travelW = _handPos - _leverTip0W;
+                if (!_leverHasSlideAxis && travelW.magnitude >= 0.03f) { _leverSlideAxisW = SnapToPivotAxis(travelW.normalized); _leverHasSlideAxis = true; }
+                if (_leverHasSlideAxis)
+                {
+                    // Range is METRES only when the control is explicitly translate-typed; otherwise it's rotate-degrees,
+                    // so for an auto-detected slide use a fixed reach instead of misreading 25° as 25 m.
+                    float maxSlide = _switchMotion.Translate ? Mathf.Clamp(_switchMotion.Range, 0.03f, 0.4f) : 0.18f;
+                    float off = Mathf.Clamp(Vector3.Dot(travelW, _leverSlideAxisW), 0f, maxSlide);
+                    Vector3 localDelta = _leverParent != null ? _leverParent.InverseTransformVector(_leverSlideAxisW * off) : _leverSlideAxisW * off;
+                    _leverT.localPosition = _leverPivotLocal + localDelta;
+                    if (off > _leverTipTravel) _leverTipTravel = off;   // DIAG: actual slide distance (parent-ride excluded)
+                }
+            }
+            else
+            {
+                // ROTATE: PIN position to rest, then swing about a FIXED hinge axis. The axis is the rig's local axis nearest
+                // the user's first swing (snapped) — a clean hinge axis, not the skewed free cross-product that tilted.
+                try { _leverT.localPosition = _leverPivotLocal; } catch { }
+                Vector3 armW = _leverParent != null ? _leverParent.TransformDirection(_leverArmParentDir) : _leverArmParentDir;
+                Vector3 toHand = _handPos - pivotW;
+                if (armW.sqrMagnitude > 1e-8f && toHand.sqrMagnitude > 1e-8f)
+                {
+                    if (!_leverHasRotAxis)
+                    {
+                        Vector3 a = Vector3.Cross(armW.normalized, toHand.normalized);
+                        if (a.sqrMagnitude >= 2e-3f) { _leverRotAxisW = SnapToPivotAxis(a.normalized); _leverHasRotAxis = true; }
+                    }
+                    if (_leverHasRotAxis)
+                    {
+                        Vector3 ap = Vector3.ProjectOnPlane(armW, _leverRotAxisW);
+                        Vector3 hp = Vector3.ProjectOnPlane(toHand, _leverRotAxisW);
+                        if (ap.sqrMagnitude > 1e-8f && hp.sqrMagnitude > 1e-8f)
+                        {
+                            float swing = Mathf.Clamp(Vector3.SignedAngle(ap, hp, _leverRotAxisW), -_leverMaxAngle, _leverMaxAngle);
+                            Quaternion restW = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
+                            _leverT.rotation = Quaternion.AngleAxis(swing, _leverRotAxisW) * restW;
+                        }
+                    }
+                }
+            }
+            // DIAG (rotate only): world travel of the grabbed point. For slide we report the clamped slide distance above
+            // instead — the TransformPoint readout is inflated by any parent ride, which is what made the horn read 10 m.
+            if (!_leverSlide)
+                try
+                {
+                    Vector3 grabW = _leverT.TransformPoint(_leverGrabLocal);
+                    float td = Vector3.Distance(grabW, _leverTip0W);
+                    if (td > _leverTipTravel) _leverTipTravel = td;
+                }
+                catch { }
+        }
+
+        private void SampleLearnFrame()
+        {
+            if (_scrubTs == null) return;
+            for (int i = 0; i < _scrubTs.Length; i++)
+            {
+                if (_scrubTs[i] == null) continue;
+                if (_scrubTs[i] == _leverT) continue;   // the hinge is OUR synthetic swing — never record it as a mechanism mover
+                float di = Vector3.Distance(_scrubTs[i].localPosition, _scrubRestP[i]) + Quaternion.Angle(_scrubTs[i].localRotation, _scrubRestR[i]) * 0.01f;
+                if (di > _scrubNodePeak[i])
+                {
+                    _scrubNodePeak[i] = di;
+                    _scrubNodePeakPos[i] = _scrubTs[i].localPosition; _scrubNodePeakRot[i] = _scrubTs[i].localRotation;
+                    if (di > _scrubGlobalPeak) _scrubGlobalPeak = di;
+                }
+                if (_scrubRoot != null && _scrubRestRL != null)
+                {
+                    float wd = Vector3.Distance(_scrubRoot.InverseTransformPoint(_scrubTs[i].position), _scrubRestRL[i]);
+                    if (wd > _scrubWorldPeak[i]) _scrubWorldPeak[i] = wd;
+                }
+            }
+        }
+
+        // Build the cache from the captured peaks. Caches the whole moved chain down to ScrubKeepMin, BUT never anything
+        // without its own visible geometry — cameras (driving one moves your VIEW), audio emitters and pure empties are
+        // skipped so the scrub only ever moves meshes.
+        private void FinalizeLearnCache(string key)
+        {
+            if (_scrubTs == null || key == null || _scrubGlobalPeak < ScrubLearnMin) return;
+            var list = new System.Collections.Generic.List<ScrubNode>();
+            var dbg = new System.Text.StringBuilder();
+            int reported = 0, skipped = 0;
+            for (int i = 0; i < _scrubTs.Length; i++)
+            {
+                if (_scrubTs[i] == null || _scrubNodePeak[i] < ScrubKeepMin) continue;
+                // #2: never drive non-geometry. rNONE = no renderer anywhere (camera/empty/audio); also guard Cameras.
+                if (RendererKind(_scrubTs[i]) == "rNONE") { skipped++; continue; }
+                bool isCam = false; try { isCam = _scrubTs[i].GetComponent<Camera>() != null; } catch { }
+                if (isCam) { skipped++; continue; }
+                list.Add(new ScrubNode { T = _scrubTs[i], Leaf = SafeName(_scrubTs[i]), RestPos = _scrubRestP[i], RestRot = _scrubRestR[i], PressPos = _scrubNodePeakPos[i], PressRot = _scrubNodePeakRot[i] });
+                if (_scrubNodePeak[i] >= ScrubLearnMin && reported < 12)
+                {
+                    reported++;
+                    dbg.Append($" [{SafeName(_scrubTs[i])} loc={_scrubNodePeak[i]:0.00} world={_scrubWorldPeak[i]:0.000} {RendererKind(_scrubTs[i])} d{Depth(_scrubTs[i], _scrubRoot)}]");
+                }
+            }
+            if (list.Count > 0)
+            {
+                _scrubCache[key] = list.ToArray();
+                Log.LogInfo($"[manip] learned switch '{key}': {list.Count} kept ({reported} strong, {skipped} non-mesh skipped) —{dbg} — will scrub next grab.");
+            }
+        }
+
+        // Complete the post-release tail: build the cache from the now-full capture, then drop the learn arrays.
+        private void FinalizeLearnTail()
+        {
+            try { FinalizeLearnCache(_learnTailKey); } catch { }
+            _learnTail = false; _learnTailKey = null; _learnTriggered = false;
+            _scrubTs = null; _scrubRestP = null; _scrubRestR = null;
+            _scrubNodePeak = null; _scrubNodePeakPos = null; _scrubNodePeakRot = null;
+            _scrubRoot = null; _scrubRestRL = null; _scrubWorldPeak = null; _scrubGlobalPeak = 0f;
+        }
+
+        // DIAG: dump the control's animator — controller, culling, and every parameter (name/type/value). If there's a
+        // float that ranges 0..1 (a press/blend), driving THAT each frame (animator left enabled) is how the game poses
+        // the mesh incl. IK — the only path that can move an IK-driven lever, since hand-writing rig nodes can't.
+        private void DumpRig(Animator a)
+        {
+            try
+            {
+                if (a == null) { Log.LogInfo("[manip] rig: animator null"); return; }
+                var rac = a.runtimeAnimatorController;
+                Log.LogInfo($"[manip] rig '{SafeName(a.transform)}' en={a.enabled} cull={(int)a.cullingMode} ctrl={(rac != null ? SafeName(rac) : "<null>")}");
+                int pc = 0; try { pc = a.parameterCount; } catch { }
+                var sb = new System.Text.StringBuilder();
+                for (int i = 0; i < pc; i++)
+                {
+                    try
+                    {
+                        var p = a.GetParameter(i);
+                        string val;
+                        switch (p.type)
+                        {
+                            case AnimatorControllerParameterType.Float: val = a.GetFloat(p.nameHash).ToString("0.00"); break;
+                            case AnimatorControllerParameterType.Bool: val = a.GetBool(p.nameHash).ToString(); break;
+                            case AnimatorControllerParameterType.Int: val = a.GetInteger(p.nameHash).ToString(); break;
+                            default: val = "trig"; break;
+                        }
+                        sb.Append($" [{p.name}:{p.type}={val}]");
+                    }
+                    catch { }
+                }
+                Log.LogInfo($"[manip] rig params ({pc}):{sb}");
+                // Also dump current state on layer 0 — the state name hash tells us which clip is live at rest.
+                try { var st = a.GetCurrentAnimatorStateInfo(0); Log.LogInfo($"[manip] rig state0 hash={st.fullPathHash} len={st.length:0.00} nt={st.normalizedTime:0.00}"); } catch { }
+            }
+            catch (Exception e) { Log.LogInfo($"[manip] rig dump err: {e.Message}"); }
+        }
+
+        // Root the learn/scrub at the TOPMOST Animator ancestor of the control. Every node any involved animator can
+        // move is a descendant of some animator, so this subtree contains the WHOLE authored motion — including the
+        // dominant ancestor pivot whose rotation is the visible lever swing (a leaf's local tweak alone barely moves).
+        // Falls back to a single parent climb if the chain has no Animator.
+        private const int ScrubRootMaxClimb = 8;   // don't root above this many levels (avoid scanning the whole vehicle)
+        private static Transform ScrubRoot(Transform lat)
+        {
+            if (lat == null) return lat;
+            Transform top = null, r = lat;
+            for (int i = 0; r != null && i <= ScrubRootMaxClimb; i++)
+            {
+                try { if (r.GetComponent<Animator>() != null) top = r; } catch { }
+                r = r.parent;
+            }
+            if (top != null) return top;
+            var f = lat;
+            for (int i = 0; i < ScrubRootClimb && f != null && f.parent != null; i++) f = f.parent;
+            return f;
+        }
+
+        // PROBE: depth of `t` below `root` (0 = is root, -1 = not under it).
+        private static int Depth(Transform t, Transform root)
+        {
+            if (t == null || root == null) return -1;
+            int d = 0; var r = t;
+            while (r != null) { if (r == root) return d; r = r.parent; d++; if (d > 128) break; }
+            return -1;
+        }
+
+        // PROBE: walk the ancestor chain from the control up to the scene root, logging where Animators and Renderers
+        // live — tells us how high the rig goes and which ancestor carries the press animation.
+        private void DumpAncestors(Transform from)
+        {
+            try
+            {
+                var sb = new System.Text.StringBuilder();
+                var r = from; int d = 0;
+                while (r != null && d < 24)
+                {
+                    bool anim = false, rend = false;
+                    try { anim = r.GetComponent<Animator>() != null; } catch { }
+                    try { rend = r.GetComponent<Renderer>() != null; } catch { }
+                    sb.Append($" {d}:{SafeName(r)}{(anim ? "(A)" : "")}{(rend ? "(R)" : "")}");
+                    r = r.parent; d++;
+                }
+                Log.LogInfo($"[manip] ancestors:{sb}");
+            }
+            catch { }
+        }
+
+        // PROBE: dump every Animator inside the captured subtree (root + descendants) with its controller + param names.
+        private void DumpAnimators(Transform root)
+        {
+            try
+            {
+                if (root == null) return;
+                var anims = root.GetComponentsInChildren<Animator>(true);
+                int n = anims != null ? anims.Length : 0;
+                Log.LogInfo($"[manip] subtree animators: {n}");
+                for (int i = 0; i < n && i < 8; i++) DumpRig(anims[i]);
+            }
+            catch { }
+        }
+
+        // PROBE: what kind of renderer drives this node's pixels — a MeshRenderer follows the node's own transform (so a
+        // hand-written rotation shows), a SkinnedMeshRenderer follows BONES (so writing this transform shows nothing).
+        private static string RendererKind(Transform t)
+        {
+            try
+            {
+                if (t == null) return "r?";
+                if (t.GetComponent<SkinnedMeshRenderer>() != null) return "rSKIN";
+                if (t.GetComponent<MeshRenderer>() != null) return "rMESH";
+                if (t.GetComponentInChildren<SkinnedMeshRenderer>(true) != null) return "rSKINchild";
+                if (t.GetComponentInChildren<MeshRenderer>(true) != null) return "rMESHchild";
+                return "rNONE";
+            }
+            catch { return "r!"; }
+        }
+
+        // PROBE: enumerate every SkinnedMeshRenderer in the learn subtree with its bone count + root bone. If the lever is
+        // skinned, the fix is to drive the BONES (or the game animator), not the rig node — this confirms which.
+        private void DumpSkin()
+        {
+            try
+            {
+                if (_scrubRoot == null) return;
+                var smrs = _scrubRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+                int n = smrs != null ? smrs.Length : 0;
+                Log.LogInfo($"[manip] skinned renderers in subtree: {n}");
+                for (int i = 0; i < n && i < 8; i++)
+                {
+                    var s = smrs[i];
+                    int bones = 0; string rb = "<null>";
+                    try { var ba = s.bones; bones = ba != null ? ba.Length : 0; } catch { }
+                    try { if (s.rootBone != null) rb = SafeName(s.rootBone); } catch { }
+                    Log.LogInfo($"[manip]   smr '{SafeName(s.transform)}' bones={bones} root={rb}");
+                }
+            }
+            catch { }
+        }
+
+        // PROBE: the largest root-local (in-assembly) movers across the WHOLE learn subtree — these are what the eye sees
+        // move on the real click, regardless of where their local-pose delta sits. If the top world-mover isn't in the
+        // cached set (or is an ancestor with tiny local delta), that's the node we must drive to reproduce the swing.
+        private void DumpTopWorldMovers()
+        {
+            try
+            {
+                if (_scrubTs == null || _scrubWorldPeak == null) return;
+                int n = _scrubTs.Length;
+                var idx = new System.Collections.Generic.List<int>();
+                for (int i = 0; i < n; i++) if (_scrubTs[i] != null && _scrubWorldPeak[i] > 0.002f) idx.Add(i);
+                idx.Sort((a, b) => _scrubWorldPeak[b].CompareTo(_scrubWorldPeak[a]));
+                var sb = new System.Text.StringBuilder();
+                for (int j = 0; j < idx.Count && j < 10; j++)
+                {
+                    int i = idx[j];
+                    sb.Append($" [{SafeName(_scrubTs[i])} world={_scrubWorldPeak[i]:0.000} loc={_scrubNodePeak[i]:0.00} d{Depth(_scrubTs[i], _scrubRoot)}]");
+                }
+                Log.LogInfo($"[manip] top world-movers:{sb}");
+            }
+            catch { }
+        }
+
+        // Disable an animator for the scrub (dedup by instance), recording its prior enabled state to restore later.
+        private void DisableScrubAnimator(Animator a)
+        {
+            if (a == null || _scrubAnimators == null) return;
+            for (int i = 0; i < _scrubAnimators.Count; i++)
+                if (_scrubAnimators[i].A != null && _scrubAnimators[i].A.GetInstanceID() == a.GetInstanceID()) return;
+            bool we = false; try { we = a.enabled; a.enabled = false; } catch { }
+            _scrubAnimators.Add(new AnimEntry { A = a, WasEnabled = we });
+        }
+
+        // Re-enable the constraints + animators we disabled for a scrub (idempotent; safe at activation and on release).
+        private void RestoreScrubDrivers()
+        {
+            if (_activeMovers != null)
+                for (int k = 0; k < _activeMovers.Count; k++)
+                {
+                    var m = _activeMovers[k];
+                    try { if (m.Con != null) m.Con.enabled = m.ConWasEnabled; } catch { }
+                }
+            if (_scrubAnimators != null)
+                for (int i = 0; i < _scrubAnimators.Count; i++)
+                {
+                    var e = _scrubAnimators[i];
+                    try { if (e.A != null) e.A.enabled = e.WasEnabled; } catch { }
+                }
+            // Re-enable the held stick's own constraint (if we disabled one to swing it).
+            try { if (_leverCon != null) { _leverCon.constraintActive = _leverConWasActive; } } catch { }
+        }
+
+        // Resolve a learned node on a later grab: among descendants named leaf (already enumerated in `all`), pick the
+        // one whose current local position is closest to the learned rest — disambiguates duplicate names across
+        // instances that can differ in child count.
+        private static Transform FindByLeafNear(Transform[] all, string leaf, Vector3 restPos)
+        {
+            if (all == null || string.IsNullOrEmpty(leaf)) return null;
+            Transform best = null; float bd = float.MaxValue;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i] == null || SafeName(all[i]) != leaf) continue;
+                float d = Vector3.Distance(all[i].localPosition, restPos);
+                if (d < bd) { bd = d; best = all[i]; }
+            }
+            return best;
         }
 
         // End the game's native drag on whatever we hold (mirrors Begin*Drag).
@@ -459,6 +1584,91 @@ namespace IronNestVR
             return a;
         }
 
+        // ---------------- diagnostics ----------------
+
+        // Dump a grabbed switch's hierarchy (3 parents up, full subtree) with each node's IL2CPP component types,
+        // plus its Animator/controller/clip info. Once per switch name. Reveals the real moving part + its driver
+        // so we can drive the right transform when the animator read finds nothing.
+        private void DiagDumpSwitch(LookAtTarget sw)
+        {
+            try
+            {
+                string key = sw.name;
+                if (!_diagDumped.Add(key)) return;
+                Animator anim = null; try { anim = sw.animator; } catch { }
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[manip] === switch '{key}': LAT on '{SafeName(sw.transform)}', sw.animator={(anim != null)}");
+                if (anim != null)
+                {
+                    var rac = anim.runtimeAnimatorController;
+                    var clips = rac != null ? rac.animationClips : null;
+                    sb.Append($", controller={(rac != null ? SafeName(rac) : "null")}, clips={(clips != null ? clips.Length : 0)}");
+                    if (clips != null) for (int i = 0; i < clips.Length; i++) { var cl = clips[i]; if (cl != null) sb.Append($" [{SafeName(cl)} len={cl.length:0.00}]"); }
+                }
+                sb.Append(" ===\n");
+                Transform root = sw.transform;
+                for (int i = 0; i < 3 && root.parent != null; i++) root = root.parent;
+                DumpNode(root, sw.transform, 0, sb);
+                Log.LogInfo(sb.ToString());
+            }
+            catch (Exception e) { Log.LogWarning("[manip] diag: " + e.Message); }
+        }
+
+        private static void DumpNode(Transform t, Transform marker, int depth, System.Text.StringBuilder sb)
+        {
+            if (t == null || depth > 6) return;
+            string indent = new string(' ', depth * 2);
+            sb.Append($"{indent}{(t == marker ? "> " : "  ")}{SafeName(t)} [{CompList(t)}]\n");
+            for (int i = 0; i < t.childCount; i++) DumpNode(t.GetChild(i), marker, depth + 1, sb);
+        }
+
+        // Comma-joined IL2CPP runtime type names of every component on a transform (so game script types show
+        // through, not just the managed UnityEngine proxies).
+        private static string CompList(Transform t)
+        {
+            var cs = t.GetComponents<Component>();
+            if (cs == null) return "";
+            var names = new System.Collections.Generic.List<string>();
+            for (int i = 0; i < cs.Length; i++)
+            {
+                var c = cs[i];
+                if (c == null) continue;
+                // Real IL2CPP class name (the managed proxy collapses game scripts to MonoBehaviour/Object).
+                try
+                {
+                    var klass = IL2CPP.il2cpp_object_get_class(c.Pointer);
+                    names.Add(System.Runtime.InteropServices.Marshal.PtrToStringAnsi(IL2CPP.il2cpp_class_get_name(klass)));
+                }
+                catch { names.Add("?"); }
+            }
+            return string.Join(",", names);
+        }
+
+        // Dump the components on the moved node and each ancestor up to the animator root — so we can see WHAT drives
+        // it (Animator vs a game script that re-poses it each frame, which would overwrite our manual scrub).
+        private static void DumpDrivers(Transform node, Transform root)
+        {
+            try
+            {
+                var sb = new System.Text.StringBuilder("[manip] drivers '" + SafeName(node) + "': ");
+                var cur = node; int guard = 0;
+                while (cur != null && guard++ < 12)
+                {
+                    sb.Append(SafeName(cur) + "[" + CompList(cur) + "] < ");
+                    if (cur == root) break;
+                    cur = cur.parent;
+                }
+                Log.LogInfo(sb.ToString());
+            }
+            catch (Exception e) { Log.LogWarning("[manip] drivers dump: " + e.Message); }
+        }
+
+        // Span-free name read (UnityEngine.Object.name getter is broken in this IL2CPP build; GetName() isn't).
+        private static string SafeName(UnityEngine.Object o)
+        {
+            try { return o != null ? o.GetName() : "null"; } catch { return "?"; }
+        }
+
         // ---------------- helpers ----------------
 
         // Walk up from a hit collider to the first transform carrying component T.
@@ -519,9 +1729,95 @@ namespace IronNestVR
         public void Reset()
         {
             EndDrag();
+            ClearSwitchGrab();
             if (_dialCamGo != null) { try { UnityEngine.Object.Destroy(_dialCamGo); } catch { } _dialCamGo = null; _dialCam = null; }
             _kind = Kind.None; _hand = 0; _dial = null; _lever = null; _prevGrabR = _prevGrabL = false;
-            _switch = null; _switchInteractable = null; _switchLatched = false;
+        }
+
+        // ---------------- switch tuning (VR menu; operates on the last-grabbed switch) ----------------
+        // The menu reads these to show the selected switch's current motion and calls the Switch* methods to
+        // change it. Edits write straight to the registry (Set), so the next grab picks them up and the values
+        // persist on Save. _selSwitchKey survives release, so you can grab a switch, open the menu, and tune it.
+
+        public bool HasSwitchSelection => _selSwitchKey != null;
+        public string SelectedSwitchName => _selSwitchKey ?? "—";
+        // "Auto" = the last grab reproduced the game's own animation, so the manual Axis/Range/Direction rows
+        // below don't apply (they tune only switches with no usable animation).
+        public string SwitchTypeText => !HasSwitchSelection ? "—"
+            : _selAuthored ? "Auto" : (SwitchMotions.Get(_selSwitchKey).Translate ? "Slide" : "Rotate");
+        public string SwitchAxisText => HasSwitchSelection ? AxisName(SwitchMotions.Get(_selSwitchKey).Axis) : "—";
+        public string SwitchDirText => HasSwitchSelection ? (SwitchMotions.Get(_selSwitchKey).Flip ? "-" : "+") : "—";
+        public string SwitchRangeText
+        {
+            get
+            {
+                if (!HasSwitchSelection) return "—";
+                var m = SwitchMotions.Get(_selSwitchKey);
+                return m.Translate ? Mathf.RoundToInt(m.Range * 100f) + " cm" : Mathf.RoundToInt(m.Range) + " deg";
+            }
+        }
+
+        public void SwitchToggleType()
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            m.Translate = !m.Translate;
+            m.Range = m.Translate ? 0.02f : 25f;   // sensible default magnitude for the new mode
+            SwitchMotions.Set(_selSwitchKey, m);
+        }
+
+        public void SwitchCycleAxis(int dir)
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            m.Axis = NextAxis(m.Axis, dir);
+            SwitchMotions.Set(_selSwitchKey, m);
+        }
+
+        public void SwitchAdjustRange(int dir)
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            if (m.Translate) m.Range = Mathf.Clamp(m.Range + dir * 0.005f, 0.005f, 0.12f);
+            else m.Range = Mathf.Clamp(m.Range + dir * 2f, 2f, 90f);
+            SwitchMotions.Set(_selSwitchKey, m);
+        }
+
+        public void SwitchFlipDir()
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            m.Flip = !m.Flip;
+            SwitchMotions.Set(_selSwitchKey, m);
+        }
+
+        public void SwitchRecapturePush()
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            m.HasPush = false; m.PushLocal = Vector3.zero;
+            SwitchMotions.Set(_selSwitchKey, m);
+        }
+
+        public void SwitchResetSelected()
+        {
+            if (HasSwitchSelection) SwitchMotions.Remove(_selSwitchKey);
+        }
+
+        // Name the dominant principal axis of a (near-principal) local vector.
+        private static string AxisName(Vector3 a)
+        {
+            float ax = Mathf.Abs(a.x), ay = Mathf.Abs(a.y), az = Mathf.Abs(a.z);
+            if (ax >= ay && ax >= az) return "X";
+            return ay >= az ? "Y" : "Z";
+        }
+
+        // Cycle a unit principal axis X→Y→Z→X (dir>=0) or X→Z→Y→X (dir<0).
+        private static Vector3 NextAxis(Vector3 a, int dir)
+        {
+            string cur = AxisName(a);
+            if (dir >= 0) return cur == "X" ? Vector3.up : cur == "Y" ? Vector3.forward : Vector3.right;
+            return cur == "X" ? Vector3.forward : cur == "Y" ? Vector3.right : Vector3.up;
         }
     }
 }

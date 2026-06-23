@@ -668,11 +668,13 @@ namespace IronNestVR
         // not drag dials/levers). Grip-grab one with the laser on it, then PHYSICALLY MOVE your hand: once
         // the hand travels past SwitchThrowDistance the control fires its click (as if you flipped it).
         public static bool SwitchGrabEnabled = true;
-        // Metres the grabbed hand must travel from the grab point to trip the switch.
-        public static float SwitchThrowDistance = 0.05f;
+        // Metres the grabbed hand must travel from the grab point to trip the switch. This is also the distance over
+        // which the mechanism SCRUBS with your hand — too short and the motion blows past in a frame and reads as a
+        // snap-trigger; a longer throw lets the lever/locks visibly track your pull the whole way before it fires.
+        public static float SwitchThrowDistance = 0.18f;
         // Once tripped, the hand must return within this distance of the grab point to re-arm — so a
         // back-and-forth flips a toggle on then off within one grab (keep < SwitchThrowDistance).
-        public static float SwitchThrowReset = 0.025f;
+        public static float SwitchThrowReset = 0.06f;
 
         // ---------------- persistence ----------------
         // The plain static fields stay the source of truth; Save/Load just mirror the user-tunable subset
@@ -707,6 +709,7 @@ namespace IronNestVR
                 WF(sb, "FingerCurlSign", FingerCurlSign);
                 WB(sb, "SwitchGrabEnabled", SwitchGrabEnabled);
                 WF(sb, "SwitchThrowDistance", SwitchThrowDistance);
+                SwitchMotions.Save(sb);   // one "SwitchMotion=" line per per-switch motion that's been tuned/seeded
                 WB(sb, "PopupVrEnabled", PopupVrEnabled);
                 WV(sb, "ClipWaistOffset", ClipWaistOffset);
                 WV(sb, "ClipWaistEuler", ClipWaistEuler);
@@ -818,6 +821,8 @@ namespace IronNestVR
                     };
                 return;
             }
+            // Per-switch motion: "SwitchMotion=<name>|<t>|<axis>|<range>|<flip>|<push>|<haspush>" (name in the value).
+            if (k == "SwitchMotion") { SwitchMotions.Apply(v); return; }
             switch (k)
             {
                 case "ClipboardScale": ClipboardScale = PF(v, ClipboardScale); break;

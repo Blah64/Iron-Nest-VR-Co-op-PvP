@@ -60,12 +60,13 @@ namespace IronNestVR
         private CameraRig _rig;
         internal HandVisuals Hands;   // for the in-menu hand Calibrate tool
         internal GrabManager Grab;    // for the clipboard/watch Calibrate tools on the HUD tab
+        internal HandManipulator Manip; // for the per-switch motion tuning on the Switch tab
         private bool _open;
         private int _hoverIndex = -1;
         private bool _prevTrigger;
         private int _layer;
 
-        private enum Page { Settings, Hud, Lobbies }
+        private enum Page { Settings, Hud, Switches, Lobbies }
         private Page _page = Page.Settings;
         private int _scroll;                       // lobby-list scroll offset (windowed view)
         private const int LOBBY_VISIBLE = 6;       // join slots shown at once on the Lobbies tab
@@ -305,6 +306,7 @@ namespace IronNestVR
             _idToRow.Clear();
             if (_page == Page.Lobbies) DefineLobbyRows();
             else if (_page == Page.Hud) DefineHudRows();
+            else if (_page == Page.Switches) DefineSwitchRows();
             else DefineSettingsRows();
         }
 
@@ -359,8 +361,6 @@ namespace IronNestVR
                      d => Config.MoveSpeedScale = Clamp(Config.MoveSpeedScale + d * 0.1f, 0.2f, 3f));
             AddToggle("Laser Always On", () => Config.LaserAlwaysOn ? "On" : "Off",
                       () => Config.LaserAlwaysOn = !Config.LaserAlwaysOn);
-            AddFloat("Switch Throw", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
-                     d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.02f, 0.15f));
 
             // Map magnifier scope (toggled in-world with A right / X left while aiming at the map — no menu
             // on/off row). "Zoom" point-right = zoom IN (smaller framed region); value shows the framed
@@ -385,6 +385,29 @@ namespace IronNestVR
             AddAction("Reset Hand Offsets", () => Hands?.ResetOffsets());
 
             AddAction("Recenter View", () => { _rig?.Recenter(); });
+            AddAction("Close Menu", Close);
+        }
+
+        // Switch tab: global switch-grab settings + per-switch MOTION tuning for the last switch you grabbed.
+        // Grab a click switch (it becomes "Selected"), open this tab, and set how it moves: Rotate vs Slide, the
+        // local Axis, the Range (throw amount), and Direction. "Recapture Push" forgets the activation push so the
+        // next grab re-learns it from your shove. Edits save per switch (by name) and persist. Auto-seeded on
+        // first grab, so an untuned switch still moves — this is just to make it match the real control.
+        private void DefineSwitchRows()
+        {
+            AddToggle("Grab Switches", () => Config.SwitchGrabEnabled ? "On" : "Off",
+                      () => Config.SwitchGrabEnabled = !Config.SwitchGrabEnabled);
+            AddFloat("Throw Distance", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
+                     d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.04f, 0.35f));
+
+            AddToggle("Selected", () => Manip != null ? Manip.SelectedSwitchName : "—", () => { });
+            AddToggle("Motion", () => Manip != null ? Manip.SwitchTypeText : "—", () => Manip?.SwitchToggleType());
+            AddFloat("Axis", () => Manip != null ? Manip.SwitchAxisText : "—", d => Manip?.SwitchCycleAxis(d));
+            AddFloat("Range", () => Manip != null ? Manip.SwitchRangeText : "—", d => Manip?.SwitchAdjustRange(d));
+            AddToggle("Direction", () => Manip != null ? Manip.SwitchDirText : "—", () => Manip?.SwitchFlipDir());
+            AddAction("Recapture Push", () => Manip?.SwitchRecapturePush());
+            AddAction("Reset This Switch", () => Manip?.SwitchResetSelected());
+
             AddAction("Close Menu", Close);
         }
 
@@ -456,7 +479,7 @@ namespace IronNestVR
         // map to the page index in _idToTab (handled in Tick alongside the row colliders).
         private void BuildTabs(float yTop, float zQuad, float zText)
         {
-            string[] names = { "Settings", "HUD", "Lobbies" };
+            string[] names = { "Settings", "HUD", "Switch", "Lobbies" };
             int count = names.Length;
             float usableW = PANEL_W - 0.04f;
             float tabW = usableW / count;

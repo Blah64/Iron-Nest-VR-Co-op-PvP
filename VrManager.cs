@@ -579,7 +579,7 @@ namespace IronNestVR
                 _interactor.Manip = _handManip; // so the interactor can pin a left-held control to the left pointer cam
                 _interactor.Grab = _grab; // so A->[E] yields to the map-tools toggle while the right hand holds the clipboard
                 _handManip.Cockpit = _interactor; // so a left-hand dial/lever grab reads the left pointer cam immediately
-                _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab };
+                _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab, Manip = _handManip };
                 _popup = new VrPopup();
                 _scope = new MapScope();
                 _prevChord = false;
