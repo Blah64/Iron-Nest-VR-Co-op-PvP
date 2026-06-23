@@ -48,6 +48,9 @@ namespace IronNestVR
         internal HandManipulator Manip;   // set by VrManager; queried for the left-held control
         internal GrabManager Grab;        // set by VrManager; queried to know which hand holds the HUD clipboard (left-active pointer)
         internal Camera LeftPointerCam => _camL;   // HandManipulator pins a left-held control to this on grab
+        // The pointer cam currently acting as the game cursor (left when the right hand holds the HUD clipboard,
+        // else right). HandManipulator hands a released dial's raycast camera back to this so hover/laser resume.
+        internal Camera ActiveCursorCam => (Grab != null && Grab.HudClipboardHoldHand == 2 && _camL != null) ? _camL : _cam;
 
         private bool _triggerWasHeld;
         private bool _mapDeleteWasHeld;
@@ -226,12 +229,15 @@ namespace IronNestVR
 
         // Point every control's own raycast camera at the controller. Dials, levers and the hover
         // tooltip each carry their own raycastCamera; without this they keep using the flat camera and
-        // dial twist / tooltips don't follow the laser.
+        // dial twist / tooltips don't follow the laser. EXCEPTION: the dial currently held by the
+        // HandManipulator drives itself from its own orbit-follow camera, so we skip repointing it here
+        // (else this periodic pass would clobber that assignment and the dial would snap back to laser-aim).
         private void RepointInteractionCameras(Camera cam)
         {
-            SetRaycastCameraOn(Il2CppType.Of<DialInteractable>(), cam);
-            SetRaycastCameraOn(Il2CppType.Of<LinearSliderInteractable>(), cam);
-            SetRaycastCameraOn(Il2CppType.Of<HoverTooltip>(), cam);
+            Transform heldDial = Manip != null ? Manip.HeldDialTransform : null;
+            SetRaycastCameraOn(Il2CppType.Of<DialInteractable>(), cam, heldDial);
+            SetRaycastCameraOn(Il2CppType.Of<LinearSliderInteractable>(), cam, null);
+            SetRaycastCameraOn(Il2CppType.Of<HoverTooltip>(), cam, null);
         }
 
         // Pin the game's virtual cursor to screen-centre while we drive interaction, so the UI raycast
@@ -250,14 +256,17 @@ namespace IronNestVR
             catch { }
         }
 
-        private static void SetRaycastCameraOn(Il2CppSystem.Type t, Camera cam)
+        // <paramref name="exempt"/>: a control transform to leave alone (the HandManipulator-held dial, which
+        // owns its raycast camera while grabbed). Null = repoint everything.
+        private static void SetRaycastCameraOn(Il2CppSystem.Type t, Camera cam, Transform exempt)
         {
             var arr = UnityEngine.Object.FindObjectsByType(t, FindObjectsSortMode.None);
             if (arr == null) return;
+            int exemptId = exempt != null ? exempt.GetInstanceID() : 0;
             for (int i = 0; i < arr.Length; i++)
             {
                 var d = arr[i].TryCast<DialInteractable>();
-                if (d != null) { d.raycastCamera = cam; continue; }
+                if (d != null) { if (exemptId == 0 || d.transform.GetInstanceID() != exemptId) d.raycastCamera = cam; continue; }
                 var s = arr[i].TryCast<LinearSliderInteractable>();
                 if (s != null) { s.raycastCamera = cam; continue; }
                 var h = arr[i].TryCast<HoverTooltip>();

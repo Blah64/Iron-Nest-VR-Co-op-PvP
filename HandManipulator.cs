@@ -12,10 +12,13 @@ namespace IronNestVR
     ///
     /// • DRAG controls (<c>DialInteractable</c>/<c>LinearSliderInteractable</c>): start the GAME'S OWN drag
     ///   (<c>BeginDialDrag</c>/<c>BeginSliderDrag</c>) — the exact path the trigger uses, so the control
-    ///   actually turns/slides and the turret reacts. While held the control follows the controller pointer
-    ///   (the <see cref="CockpitInteractor"/> keeps its raycast camera pinned down the holding controller every
-    ///   frame — the right pointer cam for a right-hand grab, the LEFT pointer cam for a left-hand grab) and the
-    ///   hand is stuck RIGIDLY to the control's transform.
+    ///   actually turns/slides and the turret reacts, and the hand is stuck RIGIDLY to the control's transform.
+    ///   A LEVER follows the controller pointer (<see cref="CockpitInteractor"/> keeps its raycast camera pinned
+    ///   down the holding controller — the right pointer cam for a right-hand grab, the LEFT for a left-hand one).
+    ///   A DIAL instead follows the hand's POSITION orbiting the dial centre: we own a dedicated raycast camera
+    ///   (<c>_dialCam</c>) aimed so the native drag's pointer-on-plane point tracks where the controller is around
+    ///   the axis — so the dial turns like a grabbed knob, not from where the laser points. CockpitInteractor skips
+    ///   repointing the held dial (<see cref="HeldDialTransform"/>) so that aim sticks.
     ///
     /// • CLICK switches/buttons (<c>LookAtTarget</c>): there is no drag to ride, so we let you PHYSICALLY
     ///   OPERATE them — the hand follows the controller's travel from the grab point, and once it moves past
@@ -24,8 +27,9 @@ namespace IronNestVR
     ///   manuals — those stay reposition-grabs owned by <see cref="GrabManager"/>.)
     ///
     /// EITHER hand can grab (both controllers have an aim ray). One control at a time; the right hand wins a
-    /// tie. For a left-hand DRAG the held control's raycast camera must follow the LEFT controller — see
-    /// <see cref="LeftHeldControlTransform"/>, which CockpitInteractor reads to pin that control to the left cam.
+    /// tie. For a left-hand LEVER drag the held lever's raycast camera must follow the LEFT controller — see
+    /// <see cref="LeftHeldControlTransform"/>, which CockpitInteractor reads to pin that lever to the left cam.
+    /// A grabbed DIAL (either hand) drives itself from its own <c>_dialCam</c> instead, so it isn't reported there.
     /// </summary>
     internal sealed class HandManipulator
     {
@@ -61,19 +65,45 @@ namespace IronNestVR
         private Vector3 _handPos;
         private Quaternion _handRot;
 
+        // Dedicated raycast camera for a grabbed DIAL. The native dial drag computes the dial's angle from the
+        // pointer point on the dial plane (GetPointerWorldPointOnDialPlane = this camera's centre ray ∩ plane).
+        // We re-aim it every frame so that point's ANGLE around the axis tracks a RIGID grab of the controller —
+        // the dial turns like a grabbed knob, not from the laser aim. We own it; CockpitInteractor excludes the
+        // held dial from its periodic raycast-camera repoint (HeldDialTransform) so this assignment stays put.
+        private GameObject _dialCamGo;
+        private Camera _dialCam;
+        private const float DialPointRadius = 0.1f; // synthetic pointer radius on the dial plane (its ANGLE, not R, drives the dial)
+        private const float DialCamBack = 0.25f;     // how far off the plane the camera sits, looking back along the axis at the point
+
+        // RIGID dial drive state. We accumulate a synthetic pointer angle from TWO contributions, both measured
+        // about the dial axis in a fixed plane basis: (1) TWIST — the controller's roll about the axis, tracked
+        // via a controller-local reference direction captured ⊥-axis at grab (distance-independent, so a far
+        // laser-grab doesn't amplify it); (2) ORBIT — the controller position's angle around the dial centre.
+        // Summing them = "both twisting and moving the hand turn the dial," the rigid-grab feel. Fed to the
+        // native drag as a point at DialPointRadius and DialPointRadius·angle, which it reads as deltas.
+        private Vector3 _dialRefLocal;        // controller-local ⊥-axis reference dir (captured at grab) → twist
+        private float _dialSynthAngleDeg;     // accumulated synthetic pointer angle handed to the native drag
+        private float _dialPrevTwistDeg;      // previous frame's twist reference angle about the axis
+        private float _dialPrevOrbitDeg;      // previous frame's controller-position orbit angle about the axis
+        private bool _dialDriveInit;          // false until the first drive frame seeds the prev angles
+
         public bool Active => _kind != Kind.None;
 
         // Which hand currently holds a control (dial/lever/switch) — 0 none, 1 left, 2 right. CockpitInteractor
         // reads this to hide that hand's pointing laser while it's operating something.
         public int HeldHand => _kind != Kind.None ? _hand : 0;
 
-        // The dial/lever currently held by the LEFT hand (else null). CockpitInteractor pins this control's
-        // own raycast camera to the LEFT pointer cam each frame so its native drag follows the left controller
+        // The LEVER currently held by the LEFT hand (else null). CockpitInteractor pins this control's own
+        // raycast camera to the LEFT pointer cam each frame so its native drag follows the left controller
         // (the periodic repoint otherwise pins every control to the right cam). Switches don't need it (their
-        // activation is camera-independent), so only Dial/Lever are reported.
+        // activation is camera-independent); a DIAL is NOT reported here because we drive it from its own
+        // dedicated <c>_dialCam</c> (orbit follow) instead — see <see cref="HeldDialTransform"/>.
         public Transform LeftHeldControlTransform =>
-            (_hand == 1) ? (_kind == Kind.Dial && _dial != null ? _dial.transform
-                          : _kind == Kind.Lever && _lever != null ? _lever.transform : null) : null;
+            (_hand == 1 && _kind == Kind.Lever && _lever != null) ? _lever.transform : null;
+
+        // The dial currently held by EITHER hand (else null). CockpitInteractor reads this to SKIP its periodic
+        // raycast-camera repoint on that dial, so our dedicated orbit-drive camera (_dialCam) stays assigned.
+        internal Transform HeldDialTransform => (_kind == Kind.Dial && _dial != null) ? _dial.transform : null;
 
         public void Tick(VrInput input, CameraRig rig, HandVisuals hands, bool active)
         {
@@ -161,11 +191,25 @@ namespace IronNestVR
             _kind = Kind.Dial;
             _hand = hand;
             StickTo(hand, dial.transform, hitPoint, input, origin);
-            if (hand == 1) PinLeftCam(c => dial.raycastCamera = c);  // left drag follows the left controller from frame 0
+            // Drive the dial from a RIGID grab of the controller (twist about the axis + orbit of the hand),
+            // not the laser aim: aim the dial's own raycast camera through a synthetic pointer whose angle we
+            // accumulate from the controller's motion. Capture the ⊥-axis twist reference in the controller's
+            // frame, then pose the cam BEFORE BeginDialDrag so the drag's start angle is captured here (no
+            // frame-0 jump). CockpitInteractor won't repoint the held dial (HeldDialTransform).
+            EnsureDialCam();
+            GetWorld(origin, HandGripPose(hand, input), out Vector3 gp, out Quaternion gr);
+            Vector3 axis0 = dial.transform.TransformDirection(dial.rotationAxis);
+            if (axis0.sqrMagnitude < 1e-8f) axis0 = dial.transform.forward;
+            PlaneBasis(axis0.normalized, out Vector3 u0, out _);
+            _dialRefLocal = Quaternion.Inverse(gr) * u0;   // controller-local ⊥-axis reference for twist tracking
+            _dialDriveInit = false;                         // first DriveDialCam seeds the prev angles
+            _dialSynthAngleDeg = 0f;
+            DriveDialCam(dial, gp, gr);
+            if (_dialCam != null) dial.raycastCamera = _dialCam;
             try { dial.BeginDialDrag(); } catch (Exception e) { Log.LogWarning("[manip] BeginDialDrag: " + e.Message); }
             hands.SetGrab(hand == 2, _handPos, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-            Log.LogInfo($"[manip] grabbed dial '{dial.name}' ({(hand == 2 ? "right" : "left")}, native drag).");
+            Log.LogInfo($"[manip] grabbed dial '{dial.name}' ({(hand == 2 ? "right" : "left")}, rigid drag).");
         }
 
         private void EngageLever(int hand, LinearSliderInteractable lever, Vector3 hitPoint, VrInput input, Transform origin, HandVisuals hands)
@@ -227,6 +271,16 @@ namespace IronNestVR
             Transform ctrl = _kind == Kind.Dial ? (_dial != null ? _dial.transform : null)
                            : _kind == Kind.Lever ? (_lever != null ? _lever.transform : null) : null;
             if (ctrl == null) { Release(input, hands, "control gone"); return; }
+
+            // DIAL: re-aim its dedicated raycast camera each frame so the native drag's pointer angle tracks the
+            // rigid grab (controller twist about the axis + hand orbit) — the dial follows the controller's
+            // motion, not where the laser points. (LEVER keeps the controller-pointer drive via CockpitInteractor.)
+            if (_kind == Kind.Dial && _dial != null)
+            {
+                GetWorld(origin, HandGripPose(_hand, input), out Vector3 gp, out Quaternion gr);
+                DriveDialCam(_dial, gp, gr);
+                if (_dialCam != null && _dial.raycastCamera != _dialCam) _dial.raycastCamera = _dialCam;
+            }
 
             // The game turns/slides the control from the controller pointer (native drag); we only keep
             // the hand stuck to the moving knob/handle.
@@ -300,8 +354,102 @@ namespace IronNestVR
         // End the game's native drag on whatever we hold (mirrors Begin*Drag).
         private void EndDrag()
         {
-            try { if (_kind == Kind.Dial && _dial != null) _dial.EndDialDrag(); } catch { }
+            if (_kind == Kind.Dial && _dial != null)
+            {
+                try { _dial.EndDialDrag(); } catch { }
+                // Hand the dial's raycast camera back to the cursor pointer cam so the laser/hover work again.
+                // (CockpitInteractor's periodic repoint would also restore it within ~0.5s once it's no longer held.)
+                try { var c = Cockpit != null ? Cockpit.ActiveCursorCam : null; if (c != null) _dial.raycastCamera = c; } catch { }
+            }
             try { if (_kind == Kind.Lever && _lever != null) _lever.EndSliderDrag(); } catch { }
+        }
+
+        // ---------------- dial orbit-drive camera ----------------
+
+        // Lazily create the dedicated camera that drives a grabbed dial. Renders nothing (cullingMask 0,
+        // clearFlags Nothing) but stays enabled so ScreenPointToRay has a valid viewport — same setup as the
+        // CockpitInteractor pointer cams. Unique depth (eye cams ≈ main-10, pointer cams -100/-101, scope -97.5):
+        // the game's Ultimate LOD System spams a per-frame LogError when two active cameras share a depth.
+        private void EnsureDialCam()
+        {
+            if (_dialCamGo != null) return;
+            _dialCamGo = new GameObject("IronNestVR_DialCam");
+            UnityEngine.Object.DontDestroyOnLoad(_dialCamGo);
+            _dialCamGo.hideFlags = HideFlags.HideAndDontSave;
+            _dialCam = _dialCamGo.AddComponent<Camera>();
+            _dialCam.clearFlags = CameraClearFlags.Nothing;
+            _dialCam.cullingMask = 0;
+            _dialCam.depth = -102f;
+            _dialCam.nearClipPlane = 0.01f;
+            _dialCam.fieldOfView = 60f;
+        }
+
+        // Re-aim the dial-drive camera so the native drag reads the RIGID-grab angle. We accumulate a synthetic
+        // pointer angle from the controller's TWIST about the axis (its roll, via the ⊥-axis reference captured
+        // at grab — distance-independent) plus its ORBIT (the controller position's angle around the dial centre),
+        // both measured in a fixed plane basis and summed as per-frame deltas. The camera is then placed off the
+        // plane along +axis, looking back along -axis at the synthetic point, so its centre ray ∩ plane = that
+        // point — and the native drag turns the dial by that point's angle.
+        private void DriveDialCam(DialInteractable dial, Vector3 ctrlPos, Quaternion ctrlRot)
+        {
+            if (_dialCam == null || dial == null) return;
+            Transform t = dial.transform;
+            if (t == null) return;
+            Vector3 axis = t.TransformDirection(dial.rotationAxis);
+            if (axis.sqrMagnitude < 1e-8f) axis = t.forward;
+            axis = axis.normalized;
+            Vector3 center = t.position;
+            PlaneBasis(axis, out Vector3 u, out Vector3 v);
+
+            float twist = AngleOnPlane(ctrlRot * _dialRefLocal, axis, u, v);   // controller roll about the axis
+            float orbit = AngleOnPlane(ctrlPos - center, axis, u, v);          // controller position around the centre
+
+            if (!_dialDriveInit)
+            {
+                _dialPrevTwistDeg = twist; _dialPrevOrbitDeg = orbit; _dialDriveInit = true;
+            }
+            else
+            {
+                if (!float.IsNaN(twist) && !float.IsNaN(_dialPrevTwistDeg)) _dialSynthAngleDeg += WrapDeg(twist - _dialPrevTwistDeg);
+                if (!float.IsNaN(orbit) && !float.IsNaN(_dialPrevOrbitDeg)) _dialSynthAngleDeg += WrapDeg(orbit - _dialPrevOrbitDeg);
+                if (!float.IsNaN(twist)) _dialPrevTwistDeg = twist;
+                if (!float.IsNaN(orbit)) _dialPrevOrbitDeg = orbit;
+            }
+
+            float a = _dialSynthAngleDeg * Mathf.Deg2Rad;
+            Vector3 p = center + (Mathf.Cos(a) * u + Mathf.Sin(a) * v) * DialPointRadius;
+            Vector3 camPos = p + axis * DialCamBack;
+            Vector3 up = Mathf.Abs(Vector3.Dot(axis, Vector3.up)) > 0.95f ? Vector3.forward : Vector3.up;
+            _dialCam.transform.SetPositionAndRotation(camPos, Quaternion.LookRotation(-axis, up));
+        }
+
+        // A stable orthonormal basis (u, v) spanning the plane ⊥ to <paramref name="axis"/>. Deterministic from
+        // axis, so it's consistent frame-to-frame (the axis world direction is invariant under the dial's own
+        // rotation about it), which keeps the accumulated angle deltas meaningful.
+        private static void PlaneBasis(Vector3 axis, out Vector3 u, out Vector3 v)
+        {
+            u = Vector3.Cross(axis, Vector3.up);
+            if (u.sqrMagnitude < 1e-6f) u = Vector3.Cross(axis, Vector3.right);
+            u = u.normalized;
+            v = Vector3.Cross(axis, u);   // unit (axis ⟂ u, both normalized)
+        }
+
+        // Signed angle (deg) of a world vector around <paramref name="axis"/>, measured in the (u, v) basis.
+        // Returns NaN if the vector is (near) parallel to the axis — caller skips that contribution this frame.
+        private static float AngleOnPlane(Vector3 w, Vector3 axis, Vector3 u, Vector3 v)
+        {
+            Vector3 p = w - Vector3.Dot(w, axis) * axis;
+            if (p.sqrMagnitude < 1e-10f) return float.NaN;
+            return Mathf.Atan2(Vector3.Dot(p, v), Vector3.Dot(p, u)) * Mathf.Rad2Deg;
+        }
+
+        // Wrap an angle delta to (-180, 180] so a frame's accumulation never jumps a full turn.
+        private static float WrapDeg(float a)
+        {
+            a %= 360f;
+            if (a > 180f) a -= 360f;
+            else if (a < -180f) a += 360f;
+            return a;
         }
 
         // ---------------- helpers ----------------
@@ -364,6 +512,7 @@ namespace IronNestVR
         public void Reset()
         {
             EndDrag();
+            if (_dialCamGo != null) { try { UnityEngine.Object.Destroy(_dialCamGo); } catch { } _dialCamGo = null; _dialCam = null; }
             _kind = Kind.None; _hand = 0; _dial = null; _lever = null; _prevGrabR = _prevGrabL = false;
             _switch = null; _switchInteractable = null; _switchLatched = false;
         }
