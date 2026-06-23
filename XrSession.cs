@@ -60,7 +60,7 @@ namespace IronNestVR
         private delegate void RenderEventAndData(int eventId, IntPtr data);
 
         private const int RtCopyEvent = 0x4953; // 'IS'
-        private static readonly RenderEventAndData _rtcDel = OnCopyRelease; // static-kept-alive (else dangles)
+        private static readonly RenderEventAndData _rtcDel = OnRenderThreadEvent; // static-kept-alive (else dangles)
         private static IntPtr _rtcCbPtr;
         private static volatile bool _rtcActive;
         private static volatile int _rtcFires;
@@ -71,6 +71,21 @@ namespace IronNestVR
         private bool _rtcInit;
         private UnityEngine.Rendering.CommandBuffer[] _rtcCb;
         private int _rtcNextLog;
+
+        // ---- Phase 1: render-thread xrEndFrame + completion gate ----
+        private const int RtEndFrameEvent = 0x4546;   // 'EF'
+        private const int RtGateTimeoutMs = 34;        // ~2.4 frames @72Hz; proceed (frame may discard) if exceeded
+        private static Session _rtcSession;
+        private static volatile int _rtcEndDone;       // ++ on the render thread after xrEndFrame
+        private int _rtcEndQueued;                     // ++ on the main thread when an endframe event is queued
+        private int _rtcLastGateWarn;
+        // Persistent native FrameEndInfo tree for the threaded endframe (single buffer — the gate guarantees
+        // frame N's endframe finishes reading this before frame N+1 overwrites it).
+        private IntPtr _efFei;       // FrameEndInfo*
+        private IntPtr _efLayerArr;  // CompositionLayerBaseHeader** (1 entry → _efProj)
+        private IntPtr _efProj;      // CompositionLayerProjection*
+        private IntPtr _efViews;     // CompositionLayerProjectionView[2]
+        private UnityEngine.Rendering.CommandBuffer _rtcEndCb;
 
         private int _lastRcWarnTick;
         // Finite swapchain wait. The old long.MaxValue could freeze the whole game (the wait runs on
@@ -310,6 +325,10 @@ namespace IronNestVR
             LastWaitResult = Result.Success;
             if (!_running) return false;
 
+            // Phase 1 completion gate: the previous frame's render-thread xrEndFrame must finish before this
+            // frame's xrBeginFrame (matched begin/end). No-op in Direct mode (endframe ran synchronously).
+            if (Config.RenderThreadCopy && _rtcActive) WaitForEndframeDrain();
+
             bool tr = _submitFrames < 30;
             if (tr) Dbg.Step("WaitFrame >>");
             var fwi = new FrameWaitInfo { Type = StructureType.TypeFrameWaitInfo };
@@ -546,24 +565,32 @@ namespace IronNestVR
             }
             Dbg.Beat($"f{f} SubmitProjection");
             if (tr) Dbg.Step("submit: SubmitProjection");
-            SubmitProjection();
+            if (Config.RenderThreadCopy && _rtcInit) SubmitProjectionThreaded();
+            else SubmitProjection();
             if (Config.RenderThreadCopy && _rtcActive && f >= _rtcNextLog)
             {
                 _rtcNextLog = f + 120;
-                Log.LogInfo($"[rtcopy] frame={f} fires={_rtcFires} mode={UnityEngine.SystemInfo.renderingThreadingMode}");
+                Log.LogInfo($"[rtcopy] frame={f} fires={_rtcFires} endDone={_rtcEndDone}/{_rtcEndQueued} mode={UnityEngine.SystemInfo.renderingThreadingMode}");
             }
             if (tr) Dbg.Step("submit: frame done");
         }
 
         // Runs on the render-command-stream thread: the MAIN thread in Direct mode, the RENDER thread once
         // -force-gfx-direct is dropped. MUST stay minimal — only raw native calls (CopyResource via the
-        // bridge, xrReleaseSwapchainImage) and an int counter. No managed allocation, no Unity main-thread
-        // APIs, no logging. An exception must never cross back into native render code.
-        private static void OnCopyRelease(int eventId, IntPtr data)
+        // bridge, xrReleaseSwapchainImage, xrEndFrame) and int counters. No managed allocation, no Unity
+        // main-thread APIs, no logging. An exception must never propagate across the native boundary.
+        // Two event kinds, replayed in stream order: per-eye copy+release, then (after both) endframe.
+        private static void OnRenderThreadEvent(int eventId, IntPtr data)
         {
             if (!_rtcActive || data == IntPtr.Zero) return;
             try
             {
+                if (eventId == RtEndFrameEvent)
+                {
+                    _rtcXr.EndFrame(_rtcSession, (FrameEndInfo*)data); // ordered AFTER both eyes' release
+                    _rtcEndDone++;                                      // single writer (render thread)
+                    return;
+                }
                 var d = (CopyReleaseData*)data;
                 _rtcBridge.CopyTexture(d->Dst, d->Src);            // proven raw CopyResource (immediate ctx)
                 var ri = new SwapchainImageReleaseInfo { Type = StructureType.TypeSwapchainImageReleaseInfo };
@@ -571,6 +598,31 @@ namespace IronNestVR
                 _rtcFires++;
             }
             catch { /* swallow: never propagate across the native boundary */ }
+        }
+
+        // Block until every queued render-thread xrEndFrame has completed, so this frame's xrBeginFrame can't
+        // outrun the previous frame's xrEndFrame (OpenXR requires matched begin/end). In Direct mode the event
+        // already ran synchronously → returns immediately. Bounded: if the render thread stalls we proceed
+        // after a timeout (xrBeginFrame then returns the benign FRAME_DISCARDED, already handled).
+        private void WaitForEndframeDrain()
+        {
+            int target = _rtcEndQueued;
+            if (_rtcEndDone >= target) return;
+            int start = Environment.TickCount;
+            var sw = new System.Threading.SpinWait();
+            while (_rtcEndDone < target)
+            {
+                if (Environment.TickCount - start > RtGateTimeoutMs)
+                {
+                    if (Environment.TickCount - _rtcLastGateWarn > 2000)
+                    {
+                        _rtcLastGateWarn = Environment.TickCount;
+                        Log.LogWarning($"[rtcopy] endframe gate timeout {RtGateTimeoutMs}ms (done={_rtcEndDone} target={target}); proceeding.");
+                    }
+                    return;
+                }
+                sw.SpinOnce();
+            }
         }
 
         // Lazily arm the render-thread copy path on first use (single session, so static stash is safe).
@@ -588,6 +640,16 @@ namespace IronNestVR
                 new UnityEngine.Rendering.CommandBuffer { name = "IronNestVR_CopyRelease0" },
                 new UnityEngine.Rendering.CommandBuffer { name = "IronNestVR_CopyRelease1" }
             };
+
+            // Phase 1: persistent FrameEndInfo tree for the threaded xrEndFrame, wired once.
+            _rtcSession = _session;
+            _efFei = Marshal.AllocHGlobal(sizeof(FrameEndInfo));
+            _efLayerArr = Marshal.AllocHGlobal(IntPtr.Size);
+            _efProj = Marshal.AllocHGlobal(sizeof(CompositionLayerProjection));
+            _efViews = Marshal.AllocHGlobal(sizeof(CompositionLayerProjectionView) * 2);
+            ((CompositionLayerBaseHeader**)_efLayerArr)[0] = (CompositionLayerBaseHeader*)_efProj;
+            _rtcEndCb = new UnityEngine.Rendering.CommandBuffer { name = "IronNestVR_EndFrame" };
+
             _rtcActive = true;
             Log.LogInfo($"[rtcopy] Phase 0 armed: copy+release via IssuePluginEventAndData. mode={UnityEngine.SystemInfo.renderingThreadingMode}");
         }
@@ -626,6 +688,58 @@ namespace IronNestVR
             EndFrame(&lp, 1);
         }
 
+        // Phase 1 threaded tail: marshal the projection layer into the persistent FrameEndInfo tree and queue
+        // xrEndFrame as a render-stream event ordered AFTER both eyes' copy+release. The main thread does NOT
+        // block here — the next frame's BeginFrameLocateViews gate (WaitForEndframeDrain) enforces ordering.
+        private void SubmitProjectionThreaded()
+        {
+            var views = (CompositionLayerProjectionView*)_efViews;
+            for (int i = 0; i < 2; i++)
+            {
+                views[i] = new CompositionLayerProjectionView
+                {
+                    Type = StructureType.TypeCompositionLayerProjectionView,
+                    Pose = Views[i].Pose,
+                    Fov = Views[i].Fov,
+                    SubImage = new SwapchainSubImage
+                    {
+                        Swapchain = _swapchains[i],
+                        ImageArrayIndex = 0,
+                        ImageRect = new Rect2Di
+                        {
+                            Offset = new Offset2Di { X = 0, Y = 0 },
+                            Extent = new Extent2Di { Width = (int)EyeWidth, Height = (int)EyeHeight }
+                        }
+                    }
+                };
+            }
+            var proj = (CompositionLayerProjection*)_efProj;
+            *proj = new CompositionLayerProjection
+            {
+                Type = StructureType.TypeCompositionLayerProjection,
+                LayerFlags = CompositionLayerFlags.None,
+                Space = _localSpace,
+                ViewCount = 2,
+                Views = views
+            };
+            ((CompositionLayerBaseHeader**)_efLayerArr)[0] = (CompositionLayerBaseHeader*)proj; // re-assert (cheap)
+            var fei = (FrameEndInfo*)_efFei;
+            *fei = new FrameEndInfo
+            {
+                Type = StructureType.TypeFrameEndInfo,
+                DisplayTime = PredictedDisplayTime,
+                EnvironmentBlendMode = EnvironmentBlendMode.Opaque,
+                LayerCount = 1,
+                Layers = (CompositionLayerBaseHeader**)_efLayerArr
+            };
+
+            _inFrame = false;           // logically ending the frame now; the gate guarantees it completes
+            _rtcEndQueued++;
+            _rtcEndCb.Clear();
+            _rtcEndCb.IssuePluginEventAndData(_rtcCbPtr, RtEndFrameEvent, _efFei);
+            UnityEngine.Graphics.ExecuteCommandBuffer(_rtcEndCb);
+        }
+
         // -------- helpers --------
 
         // Report an unexpected OpenXR result. Always drops a crash-proof breadcrumb (the heartbeat
@@ -660,8 +774,13 @@ namespace IronNestVR
                 _rtcActive = false;
                 _rtcXr = null; _rtcBridge = null; _rtcSwapchains = null;
                 if (_rtcCb != null) { foreach (var cb in _rtcCb) { try { cb?.Dispose(); } catch { } } _rtcCb = null; }
+                try { _rtcEndCb?.Dispose(); } catch { } _rtcEndCb = null;
                 if (_rtcData0 != IntPtr.Zero) { Marshal.FreeHGlobal(_rtcData0); _rtcData0 = IntPtr.Zero; }
                 if (_rtcData1 != IntPtr.Zero) { Marshal.FreeHGlobal(_rtcData1); _rtcData1 = IntPtr.Zero; }
+                if (_efFei != IntPtr.Zero) { Marshal.FreeHGlobal(_efFei); _efFei = IntPtr.Zero; }
+                if (_efLayerArr != IntPtr.Zero) { Marshal.FreeHGlobal(_efLayerArr); _efLayerArr = IntPtr.Zero; }
+                if (_efProj != IntPtr.Zero) { Marshal.FreeHGlobal(_efProj); _efProj = IntPtr.Zero; }
+                if (_efViews != IntPtr.Zero) { Marshal.FreeHGlobal(_efViews); _efViews = IntPtr.Zero; }
 
                 if (_inFrame) EndFrame(null, 0);
                 _input.Dispose();
