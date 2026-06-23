@@ -20,6 +20,7 @@ namespace IronNestVR
         public bool Flip;          // reverse the motion direction
         public Vector3 PushLocal;  // local-space hand-push direction that activates it (captured from the throw)
         public bool HasPush;       // whether PushLocal has been captured yet
+        public bool ManualAxis;    // player dialled Axis in the VR menu → the follow uses it instead of auto-inferring
 
         public static SwitchMotion Default => new SwitchMotion
         {
@@ -29,6 +30,7 @@ namespace IronNestVR
             Flip = false,
             PushLocal = Vector3.zero,
             HasPush = false,
+            ManualAxis = false,
         };
     }
 
@@ -65,7 +67,8 @@ namespace IronNestVR
                   .Append(F(m.Range)).Append('|')
                   .Append(m.Flip ? '1' : '0').Append('|')
                   .Append(F(m.PushLocal.x)).Append(' ').Append(F(m.PushLocal.y)).Append(' ').Append(F(m.PushLocal.z)).Append('|')
-                  .Append(m.HasPush ? '1' : '0').AppendLine();
+                  .Append(m.HasPush ? '1' : '0').Append('|')
+                  .Append(m.ManualAxis ? '1' : '0').AppendLine();
             }
         }
 
@@ -84,6 +87,7 @@ namespace IronNestVR
                 Flip = p[4] == "1",
                 PushLocal = V(p[5], Vector3.zero),
                 HasPush = p[6] == "1",
+                ManualAxis = p.Length > 7 && p[7] == "1",   // older saves omit this field → defaults to auto-infer
             };
         }
 

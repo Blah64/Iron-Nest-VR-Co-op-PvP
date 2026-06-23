@@ -282,7 +282,10 @@ namespace IronNestVR
             // all hits for the nearest grabbable control restores parity with the trigger; a closer pick-up
             // manual still yields to GrabManager's reposition grab.
             if (!RaycastControl(ao, dir, out RaycastHit hit, out Transform t))
+            {
+                DumpGripMiss(ao, dir);   // grip pressed but no grabbable control on the ray — log what it DID hit
                 return;
+            }
 
             var dial = FindUp<DialInteractable>(t);
             if (dial != null)
@@ -988,8 +991,55 @@ namespace IronNestVR
                         if (c == null || c == grabbed) continue;
                         Log.LogInfo($"[stick] sib {DescribeStickNode(c, grabPoint)}");
                     }
+                // Buried controls (Reload Cylinder, Shell Rammer, Punchcard) hinge on a node reached up-and-over through
+                // the assembly — NOT an ancestor/sibling — so the lines above never show it. Scan the whole assembly for
+                // lever-named nodes nearest the grab to reveal the real movable handle (origin-near small = a local hinge).
+                DumpLeverCandidates(grabbed, grabPoint);
             }
             catch (Exception e) { Log.LogWarning("[stick] dump: " + e.Message); }
+        }
+
+        // PROBE: across the control's assembly, list every lever-named node and how near its PIVOT ORIGIN sits to the grab.
+        // For a buried control whose hinge isn't a sibling, the real handle is the lever-named node with a small origin-near
+        // and an extent that reaches toward the grab — that's what we drive next. One-time per control (gated upstream).
+        private void DumpLeverCandidates(Transform grabbed, Vector3 grabPoint)
+        {
+            try
+            {
+                // Assembly root: highest ancestor whose subtree is still bounded — don't scan the whole turret (thousands).
+                Transform root = grabbed, probe = grabbed; int climb = 0;
+                while (probe != null && climb <= 6)
+                {
+                    int sz = int.MaxValue; try { sz = probe.GetComponentsInChildren<Transform>(true).Length; } catch { }
+                    if (sz <= 1200) root = probe; else break;
+                    probe = probe.parent; climb++;
+                }
+                Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { }
+                if (all == null) return;
+                int named = 0; for (int i = 0; i < all.Length; i++) if (all[i] != null && LeverNameHint(all[i])) named++;
+                Log.LogInfo($"[stick] lever-candidates under '{SafeName(root)}' ({all.Length} nodes, {named} named):");
+                int shown = 0;
+                for (int i = 0; i < all.Length && shown < 40; i++)
+                {
+                    var t = all[i]; if (t == null || t == grabbed || !LeverNameHint(t)) continue;
+                    Vector3 o = Vector3.zero; try { o = t.position; } catch { }
+                    float oNear = Vector3.Distance(o, grabPoint);
+                    Log.LogInfo($"[stick]   cand {DescribeStickNode(t, grabPoint)} origin-near={oNear:0.000} d{Depth(t, root)}");
+                    shown++;
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[stick] lever-candidates: " + e.Message); }
+        }
+
+        // Name hint that a node is (or carries) a movable handle/hinge — used only to surface candidates in the dump.
+        private static bool LeverNameHint(Transform t)
+        {
+            string s = SafeName(t); if (string.IsNullOrEmpty(s)) return false;
+            s = s.ToLowerInvariant();
+            return s.Contains("parent") || s.Contains("lever") || s.Contains("handle") || s.Contains("crank")
+                || s.Contains("pull") || s.Contains("swing") || s.Contains("rotate") || s.Contains("ram")
+                || s.Contains("valve") || s.Contains("wheel") || s.Contains("pump") || s.Contains("pivot")
+                || s.Contains("hinge");
         }
 
         private void DumpStickChildren(Transform t, Vector3 grabPoint, string pre, int depth)
@@ -1051,7 +1101,6 @@ namespace IronNestVR
                 Log.LogInfo($"[manip] held-stick follow: hinge '{SafeName(pivot)}' arm<3cm ({arm:0.000}) — no swing.");
                 return;
             }
-
             _leverT = pivot; _leverParent = pivot.parent;
             _leverPivotLocal = pivot.localPosition; _leverRestLocalR = pivot.localRotation;
             Vector3 armW = grabPoint - pivot.position;
@@ -1064,6 +1113,24 @@ namespace IronNestVR
             _leverHasSlideAxis = false; _leverSlideAxisW = Vector3.zero;
             _leverHasRotAxis = false; _leverRotAxisW = Vector3.zero;
             _leverArmed = false;
+
+            // MANUAL AXIS OVERRIDE (VR menu): if the player has dialled in an axis for this control, lock it NOW from the
+            // hinge's rest frame instead of inferring it from the first hand shove (the inference snapped to whichever
+            // local axis was nearest the noisy first swing, which landed off-true on hinges whose local axes aren't
+            // world-aligned — Calculate, coffee). The menu cycles SwitchMotion.Axis through the hinge's ±X/±Y/±Z, so the
+            // player tunes each control until it swings true; left unset, the old auto-inference still runs.
+            if (_switchMotion.ManualAxis)
+            {
+                Quaternion restW = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
+                Vector3 axW = restW * _switchMotion.Axis;
+                if (_switchMotion.Flip) axW = -axW;
+                if (axW.sqrMagnitude > 1e-8f)
+                {
+                    axW = axW.normalized;
+                    if (_leverSlide) { _leverSlideAxisW = axW; _leverHasSlideAxis = true; }
+                    else { _leverRotAxisW = axW; _leverHasRotAxis = true; }
+                }
+            }
 
             // If a ParentConstraint pins the hinge, our rotation would be overwritten — disable it for the grab and
             // restore on release. (Null-check only; we never read its sources — that API hard-crashes this runtime.)
@@ -1110,6 +1177,69 @@ namespace IronNestVR
                     if (n < bestNear) { bestNear = n; best = c; }
                 }
             }
+            // Some controls hinge on a '<Name> Parent' nested under a SIBLING (a nephew), not an ancestor or direct
+            // sibling — e.g. Calculate's '.Calculate Lever Parent'. Only when the close search finds nothing, fall back
+            // to a bounded assembly scan for the nearest local hinge.
+            if (best == null) best = FindAssemblyParentHinge(grabbed, grabPoint);
+            // Reject a hinge that governs OTHER controls (a shared assembly/console parent). The Review Console switches
+            // sit under '.Review Console Parent', which also carries every other switch — swinging it moved the WHOLE
+            // console. A real per-control hinge carries only this control's own button.
+            if (best != null && HingeGovernsForeignSwitch(best, grabbed))
+            {
+                Log.LogInfo($"[manip] held-stick follow: hinge '{SafeName(best)}' governs other controls (shared console) — no swing.");
+                best = null;
+            }
+            return best;
+        }
+
+        // True if the hinge's subtree contains a LookAtTarget that ISN'T the grabbed control (nor a sub-part of it) —
+        // i.e. the node is a shared console/assembly pivot, not this one control's hinge. Driving it would move siblings.
+        private static bool HingeGovernsForeignSwitch(Transform hinge, Transform grabbed)
+        {
+            LookAtTarget[] lats = null; try { lats = hinge.GetComponentsInChildren<LookAtTarget>(true); } catch { }
+            if (lats == null) return false;
+            for (int i = 0; i < lats.Length; i++)
+            {
+                var lt = lats[i]; if (lt == null) continue;
+                Transform t = null; try { t = lt.transform; } catch { }
+                if (t == null || t == grabbed) continue;
+                if (IsDescendantOf(t, grabbed)) continue;   // a sub-part of the grabbed control is fine
+                return true;
+            }
+            return false;
+        }
+
+        private static bool IsDescendantOf(Transform t, Transform ancestor)
+        {
+            for (Transform p = t; p != null; p = p.parent) if (p == ancestor) return true;
+            return false;
+        }
+
+
+        // Fallback hinge finder: scan the control's bounded assembly for the '*Parent' node whose pivot ORIGIN sits
+        // nearest the grab, accepting only a genuinely LOCAL hinge (origin within reach). This catches nephew hinges the
+        // ancestor/sibling walk misses, while correctly rejecting far mechanism arms (the reload console's
+        // '.Rammer Carrage Parent' is metres from the grab) so we never swing a remote part again.
+        private Transform FindAssemblyParentHinge(Transform grabbed, Vector3 grabPoint)
+        {
+            Transform root = grabbed, probe = grabbed; int climb = 0;
+            while (probe != null && climb <= 6)
+            {
+                int sz = int.MaxValue; try { sz = probe.GetComponentsInChildren<Transform>(true).Length; } catch { }
+                if (sz <= 1200) root = probe; else break;
+                probe = probe.parent; climb++;
+            }
+            Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { }
+            if (all == null) return null;
+            Transform best = null; float bestOrigin = float.MaxValue;
+            for (int i = 0; i < all.Length; i++)
+            {
+                var n = all[i]; if (n == null || n == grabbed || !NameHasParent(n)) continue;
+                float o; try { o = Vector3.Distance(n.position, grabPoint); } catch { continue; }
+                if (o < bestOrigin) { bestOrigin = o; best = n; }
+            }
+            if (best == null || bestOrigin > 0.6f) return null;   // no local hinge in this assembly → no swing (safe)
+            Log.LogInfo($"[manip] held-stick follow: assembly hinge '{SafeName(best)}' (origin {bestOrigin:0.000}m from grab).");
             return best;
         }
 
@@ -1718,6 +1848,46 @@ namespace IronNestVR
             return true;
         }
 
+        // PROBE: a grip was pressed with no grabbable control on the ray. Log every collider the ray passed through and
+        // the nearest LookAtTarget/pickup/dial/slider above it (+ active/enabled state) — so a control that refuses to
+        // grab (e.g. the right-cannon equivalents) reveals WHY: no collider there, an inactive node, or no LookAtTarget.
+        private static float _lastGripMissT;
+        private static void DumpGripMiss(Vector3 ao, Vector3 dir)
+        {
+            try
+            {
+                float now = Time.time;
+                if (now - _lastGripMissT < 0.4f) return;   // collapse a held grip's frames into one report
+                _lastGripMissT = now;
+                var hits = Physics.RaycastAll(ao, dir, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide);
+                int n = hits != null ? hits.Length : 0;
+                Log.LogInfo($"[gripmiss] no control on ray ({n} hits) from ({ao.x:0.00},{ao.y:0.00},{ao.z:0.00}) dir ({dir.x:0.00},{dir.y:0.00},{dir.z:0.00}):");
+                for (int i = 0; i < n; i++)
+                    for (int j = i + 1; j < n; j++)
+                        if (hits[j].distance < hits[i].distance) { var tmp = hits[i]; hits[i] = hits[j]; hits[j] = tmp; }
+                int shown = 0;
+                for (int i = 0; i < n && shown < 12; i++)
+                {
+                    var col = hits[i].collider; if (col == null) continue;
+                    var ht = col.transform; if (ht == null) continue;
+                    var lat = FindUp<LookAtTarget>(ht);
+                    var pick = FindUp<PickUpZoomTarget>(ht);
+                    var dial = FindUp<DialInteractable>(ht);
+                    var slide = FindUp<LinearSliderInteractable>(ht);
+                    string tag;
+                    if (lat != null) { bool a = false, e2 = false; try { a = lat.gameObject.activeInHierarchy; } catch { } try { e2 = lat.enabled; } catch { } tag = $"LAT '{SafeName(lat.transform)}' active={a} en={e2}"; }
+                    else if (pick != null) tag = "pickup-manual";
+                    else if (dial != null) tag = "dial";
+                    else if (slide != null) tag = "slider";
+                    else tag = "—";
+                    bool trig = false; try { trig = col.isTrigger; } catch { }
+                    Log.LogInfo($"[gripmiss]   {hits[i].distance:0.00}m '{SafeName(ht)}'{(trig ? " (trigger)" : "")} -> {tag}");
+                    shown++;
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[gripmiss] " + e.Message); }
+        }
+
         private static void GetWorld(Transform origin, Posef pose, out Vector3 pos, out Quaternion rot)
         {
             var lp = new Vector3(pose.Position.X, pose.Position.Y, -pose.Position.Z);
@@ -1771,6 +1941,7 @@ namespace IronNestVR
             if (!HasSwitchSelection) return;
             var m = SwitchMotions.Get(_selSwitchKey);
             m.Axis = NextAxis(m.Axis, dir);
+            m.ManualAxis = true;   // dialling the axis pins it: the follow now uses this axis instead of auto-inferring
             SwitchMotions.Set(_selSwitchKey, m);
         }
 
