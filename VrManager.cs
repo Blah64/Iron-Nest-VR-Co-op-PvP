@@ -520,7 +520,7 @@ namespace IronNestVR
 
                 // Map magnifier "scope": a zoomed view of the map around where the controller points. Render-
                 // only; suppressed while a VR menu/popup owns the trigger. Hides itself when not over the map.
-                _scope.Tick(_xr.Input, _rig, active && !uiModal);
+                _scope.Tick(_xr.Input, _rig, _grab, active && !uiModal);
 
                 if (shouldRender) _xr.RenderAndSubmit(_rig, _bridge);
                 else { Dbg.Beat("endFrame(noRender)"); _xr.EndFrame(); }

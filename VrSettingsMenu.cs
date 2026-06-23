@@ -362,10 +362,9 @@ namespace IronNestVR
             AddFloat("Switch Throw", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
                      d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.02f, 0.15f));
 
-            // Map magnifier scope. "Zoom" point-right = zoom IN (smaller framed region); value shows the
-            // framed half-size in cm. Size = the floating panel's world size; Height = its lift above the spot.
-            AddToggle("Map Scope", () => Config.MapScopeEnabled ? "On" : "Off",
-                      () => Config.MapScopeEnabled = !Config.MapScopeEnabled);
+            // Map magnifier scope (toggled in-world with A right / X left while aiming at the map — no menu
+            // on/off row). "Zoom" point-right = zoom IN (smaller framed region); value shows the framed
+            // half-size in cm. Size = the floating panel's world size; Height = its lift above the spot.
             AddFloat("Scope Zoom", () => Mathf.RoundToInt(Config.MapScopeZoom * 100f) + " cm",
                      d => Config.MapScopeZoom = Clamp(Config.MapScopeZoom - d * 0.01f, 0.02f, 0.30f));
             AddFloat("Scope Panel Size", () => Config.MapScopeSize.ToString("0.00") + " m",

@@ -46,11 +46,10 @@ namespace IronNestVR
         private LineRenderer _laserL;
         private bool _hoverColorL;
         internal HandManipulator Manip;   // set by VrManager; queried for the left-held control
-        internal GrabManager Grab;        // set by VrManager; queried so A->[E] yields to the map-tools toggle while right-holding the clipboard
+        internal GrabManager Grab;        // set by VrManager; queried to know which hand holds the HUD clipboard (left-active pointer)
         internal Camera LeftPointerCam => _camL;   // HandManipulator pins a left-held control to this on grab
 
         private bool _triggerWasHeld;
-        private bool _interactWasHeld;
         private bool _mapDeleteWasHeld;
         private Interactable _pressTarget;
         private bool _inMission;
@@ -172,7 +171,6 @@ namespace IronNestVR
                 else
                 {
                     HandleClick(input, leftActive);
-                    HandleInteract(input);
                     HandleMapDelete(input);
                 }
             }
@@ -447,34 +445,11 @@ namespace IronNestVR
             _triggerWasHeld = held;
         }
 
-        // Right A -> 'E' key (synthesized) for items that interact via [E] instead of a click.
-        private void HandleInteract(VrInput input)
-        {
-            bool held = input.InteractHeld;
-            // While the RIGHT hand holds the HUD clipboard, the A button is the map-tools palette toggle
-            // (MapTools), not [E] — suppress the synthesized E down-edge so the two don't both fire. The up-edge
-            // still releases any E already sent, so a press made before grabbing can't get stuck down.
-            bool rightHoldsClip = Grab != null && Grab.HudClipboardHoldHand == 2;
-            if (held && !_interactWasHeld && !rightHoldsClip)
-            {
-                Win32Input.SendKey(Win32Input.VK_E, true);
-                input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
-                Log.LogInfo("[interact] [E] interact pressed (OS key)");
-            }
-            else if (!held && _interactWasHeld)
-            {
-                Win32Input.SendKey(Win32Input.VK_E, false);
-            }
-            _interactWasHeld = held;
-        }
-
         private void EndAllInput()
         {
             if (_triggerWasHeld) InputSynth.SetMouseLeft(false);
-            if (_interactWasHeld) Win32Input.SendKey(Win32Input.VK_E, false);
             if (_pressTarget != null) ReleasePress();
             _triggerWasHeld = false;
-            _interactWasHeld = false;
             _mapDeleteWasHeld = false;
         }
 

@@ -46,19 +46,47 @@ namespace IronNestVR
         private bool _visible;
         private bool _everShown;
 
-        public void Tick(VrInput input, CameraRig rig, bool active)
+        // Runtime on/off latch, flipped by A (right) / X (left) while that controller is aiming at the map.
+        // The scope no longer auto-shows on hover — you toggle it up. (Config.MapScopeEnabled is the master
+        // switch; this is the per-session user toggle.)
+        private bool _enabled;
+        private bool _prevA, _prevX;
+
+        public void Tick(VrInput input, CameraRig rig, GrabManager grab, bool active)
         {
             try
             {
-                if (!Config.MapScopeEnabled || !active) { Hide(); return; }
+                bool aBtn = input != null && input.InteractHeld;    // right A
+                bool xBtn = input != null && input.MapToolsLHeld;   // left X
+
+                if (!Config.MapScopeEnabled || !active) { Hide(); _prevA = aBtn; _prevX = xBtn; return; }
                 var origin = rig.OriginTransform;
-                if (origin == null) { Hide(); return; }
+                if (origin == null) { Hide(); _prevA = aBtn; _prevX = xBtn; return; }
 
                 ResolveSurface();
-                if (_rect == null) { Hide(); Diag("no map surface (MapMarkerPlacer.mapRect / grid canvas) in scene"); return; }
+                if (_rect == null) { Hide(); _prevA = aBtn; _prevX = xBtn; Diag("no map surface (MapMarkerPlacer.mapRect / grid canvas) in scene"); return; }
 
-                if (!AimMapHit(input, origin, out Vector3 hit, out Vector3 normal, out Vector3 inPlaneUp))
-                { Hide(); Diag($"not over map (aimR={input.AimValid} aimL={input.AimValidL})"); return; }
+                // Per-hand aim → map-surface hits. Right is the usual pointer; left works when the right hand
+                // holds the HUD clipboard. Each hand's button only toggles while THAT hand is over the map.
+                bool rightOver = TryRectRay(input.AimValid,  input.AimPose,  origin, out Vector3 hitR, out Vector3 nR, out Vector3 upR);
+                bool leftOver  = TryRectRay(input.AimValidL, input.AimPoseL, origin, out Vector3 hitL, out Vector3 nL, out Vector3 upL);
+
+                // A (right) / X (left) toggle the scope, gated to "this hand is aiming at the map AND is not
+                // holding the HUD clipboard" — holding the clipboard, the same button is the map-tools toggle.
+                int hold = grab != null ? grab.HudClipboardHoldHand : 0;   // 0 none, 1 left, 2 right
+                if (aBtn && !_prevA && rightOver && hold != 2) { _enabled = !_enabled; Buzz(input); Log.LogInfo($"[scope] toggled {(_enabled ? "ON" : "OFF")} (right A)"); }
+                else if (xBtn && !_prevX && leftOver && hold != 1) { _enabled = !_enabled; Buzz(input); Log.LogInfo($"[scope] toggled {(_enabled ? "ON" : "OFF")} (left X)"); }
+                _prevA = aBtn; _prevX = xBtn;
+
+                // Pick the framed hit: right hand preferred, else left.
+                Vector3 hit, normal, inPlaneUp;
+                bool over;
+                if (rightOver) { over = true; hit = hitR; normal = nR; inPlaneUp = upR; }
+                else if (leftOver) { over = true; hit = hitL; normal = nL; inPlaneUp = upL; }
+                else { over = false; hit = Vector3.zero; normal = Vector3.up; inPlaneUp = Vector3.forward; }
+
+                if (!_enabled) { Hide(); Diag("scope OFF (press A right / X left while aiming at the map to show)"); return; }
+                if (!over) { Hide(); Diag($"not over map (aimR={input.AimValid} aimL={input.AimValidL})"); return; }
 
                 Diag($"OVER MAP at ({hit.x:0.00},{hit.y:0.00},{hit.z:0.00}) -> showing");
                 EnsureObjects();
@@ -123,6 +151,7 @@ namespace IronNestVR
             try { if (_rt != null) { _rt.Release(); UnityEngine.Object.Destroy(_rt); } } catch { }
             _panelGo = null; _camGo = null; _cam = null; _rt = null; _panelMat = null;
             _rect = null; _rectIid = -1; _visible = false; _hasSm = false;
+            _enabled = false; _prevA = false; _prevX = false;
         }
 
         // ---------------- map surface resolution ----------------
@@ -179,18 +208,11 @@ namespace IronNestVR
 
         // ---------------- aim → map hit ----------------
 
-        // Where (if anywhere) a controller is pointing at the map surface. Tries the RIGHT controller first
-        // (the usual pointer), then the LEFT (so it still works when the right hand holds the HUD clipboard).
-        // Intersects the aim ray with the canvas plane and confirms the hit is inside the rect — the same
-        // surface the lines/grid live on, so it fires exactly when you're over the drawable map.
-        private bool AimMapHit(VrInput input, Transform origin, out Vector3 hit, out Vector3 normal, out Vector3 inPlaneUp)
-        {
-            hit = Vector3.zero; normal = Vector3.up; inPlaneUp = Vector3.forward;
-            if (_rect == null) return false;
-            return TryRectRay(input.AimValid, input.AimPose, origin, out hit, out normal, out inPlaneUp)
-                || TryRectRay(input.AimValidL, input.AimPoseL, origin, out hit, out normal, out inPlaneUp);
-        }
+        private static void Buzz(VrInput input)
+        { try { input.Haptic(Config.HapticAmplitude, Config.HapticSeconds); } catch { } }
 
+        // Intersects a controller's aim ray with the map canvas plane and confirms the hit is inside the
+        // rect — the same surface the lines/grid live on, so it reports "over the drawable map".
         private bool TryRectRay(bool valid, Posef pose, Transform origin, out Vector3 hit, out Vector3 normal, out Vector3 inPlaneUp)
         {
             hit = Vector3.zero; normal = Vector3.up; inPlaneUp = Vector3.forward;
