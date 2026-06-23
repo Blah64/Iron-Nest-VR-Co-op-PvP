@@ -35,6 +35,11 @@ namespace IronNestVR
 
         public bool Ready => _ready;
 
+        /// <summary>The real scene culling mask captured from Main Camera when the eye cameras were created —
+        /// i.e. what the headset actually renders. Use this instead of <c>Camera.main.cullingMask</c>, which
+        /// the desktop-mirror blank zeroes while in VR. -1 (all layers) until the eyes exist.</summary>
+        public int SceneCullMask => _eyeMask;
+
         /// <summary>The seated rig origin (game camera pose + recenter yaw). Controllers are placed
         /// relative to this so they line up with the rendered world. Null until cameras exist.</summary>
         public Transform OriginTransform => _origin != null ? _origin.transform : null;

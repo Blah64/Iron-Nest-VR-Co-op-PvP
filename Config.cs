@@ -570,6 +570,35 @@ namespace IronNestVR
         // focus-camera move. Trigger = A (right) / X (left) while that hand holds the HUD clipboard. See MapTools.
         public static bool MapToolsOnDemand = true;
 
+        // --- Tactical map magnifier "scope" (MapScope) ---
+        // While a controller's aim ray lands on the world-space map, float a zoomed-in view of the map
+        // around the pointed-at spot on a billboard panel above the aim point. A dedicated orthographic
+        // camera renders the map region into a RenderTexture; render-only + VR-only (never touches state),
+        // and the camera only renders while the scope is up. All live-tunable in the settings menu / cfg.
+        public static bool MapScopeEnabled = true;
+        // Half-height of the framed region in metres — SMALLER = more zoom (the captured square is 2x this).
+        public static float MapScopeZoom = 0.06f;
+        // Panel size in the world (metres, square).
+        public static float MapScopeSize = 0.22f;
+        // Panel lift above the aim point (metres, world up) and pull toward the player (metres, horizontal),
+        // so it sits comfortably between you and the spot without occluding it.
+        public static float MapScopeHeight = 0.32f;
+        public static float MapScopeToward = 0.12f;
+        // Magnifier camera standoff above the map along its normal, and how far past the surface it still
+        // renders (so tokens sitting on the board are captured, but the floor below isn't). Metres.
+        public static float MapScopeCamHeight = 0.5f;
+        public static float MapScopeDepthBelow = 0.25f;
+        // Spin the framed image (deg) to match how you read the map, and a handedness flip if the panel
+        // ends up mirrored/backwards (rotates it 180° about up).
+        public static float MapScopeRotationDeg = 0f;
+        public static bool MapScopeFlip = false;
+        // Framing smoothing time-constant (s) to damp hand tremor; 0 = instant. RenderTexture size (px).
+        public static float MapScopeSmooth = 0.06f;
+        public static int MapScopeResolution = 512;
+        // Extra padding (map-local units) on the "is the ray over the map?" bounds test — lets you frame
+        // right up to (or slightly past) the board edge.
+        public static float MapScopeEdgePad = 0f;
+
         // --- Interaction diagnostics ---
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).
         public static bool LogInteractGeometry = true;
@@ -687,6 +716,17 @@ namespace IronNestVR
                 WV(sb, "ManualHeldEulerL", ManualHeldEulerL);
                 WV(sb, "WatchWristOffset", WatchWristOffset);
                 WV(sb, "WatchWristEuler", WatchWristEuler);
+                WB(sb, "MapScopeEnabled", MapScopeEnabled);
+                WF(sb, "MapScopeZoom", MapScopeZoom);
+                WF(sb, "MapScopeSize", MapScopeSize);
+                WF(sb, "MapScopeHeight", MapScopeHeight);
+                WF(sb, "MapScopeToward", MapScopeToward);
+                WF(sb, "MapScopeCamHeight", MapScopeCamHeight);
+                WF(sb, "MapScopeDepthBelow", MapScopeDepthBelow);
+                WF(sb, "MapScopeRotationDeg", MapScopeRotationDeg);
+                WB(sb, "MapScopeFlip", MapScopeFlip);
+                WF(sb, "MapScopeSmooth", MapScopeSmooth);
+                WI(sb, "MapScopeResolution", MapScopeResolution);
                 WB(sb, "CoopGasMask", CoopGasMask);
                 WF(sb, "CoopMaskScale", CoopMaskScale);
                 WV(sb, "CoopMaskOffset", CoopMaskOffset);
@@ -818,6 +858,17 @@ namespace IronNestVR
                 case "ManualHeldEulerL": ManualHeldEulerL = PV(v, ManualHeldEulerL); break;
                 case "WatchWristOffset": WatchWristOffset = PV(v, WatchWristOffset); break;
                 case "WatchWristEuler": WatchWristEuler = PV(v, WatchWristEuler); break;
+                case "MapScopeEnabled": MapScopeEnabled = PB(v, MapScopeEnabled); break;
+                case "MapScopeZoom": MapScopeZoom = PF(v, MapScopeZoom); break;
+                case "MapScopeSize": MapScopeSize = PF(v, MapScopeSize); break;
+                case "MapScopeHeight": MapScopeHeight = PF(v, MapScopeHeight); break;
+                case "MapScopeToward": MapScopeToward = PF(v, MapScopeToward); break;
+                case "MapScopeCamHeight": MapScopeCamHeight = PF(v, MapScopeCamHeight); break;
+                case "MapScopeDepthBelow": MapScopeDepthBelow = PF(v, MapScopeDepthBelow); break;
+                case "MapScopeRotationDeg": MapScopeRotationDeg = PF(v, MapScopeRotationDeg); break;
+                case "MapScopeFlip": MapScopeFlip = PB(v, MapScopeFlip); break;
+                case "MapScopeSmooth": MapScopeSmooth = PF(v, MapScopeSmooth); break;
+                case "MapScopeResolution": MapScopeResolution = PI(v, MapScopeResolution); break;
                 case "CoopGasMask": CoopGasMask = PB(v, CoopGasMask); break;
                 case "CoopMaskScale": CoopMaskScale = PF(v, CoopMaskScale); break;
                 case "CoopMaskOffset": CoopMaskOffset = PV(v, CoopMaskOffset); break;

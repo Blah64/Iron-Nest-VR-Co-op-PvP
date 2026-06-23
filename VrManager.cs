@@ -30,6 +30,7 @@ namespace IronNestVR
         private HandManipulator _handManip;
         private VrSettingsMenu _menu;
         private VrPopup _popup;
+        private MapScope _scope;
         private bool _prevChord;
         private float _appliedRenderScale;
         private bool _xrReady;
@@ -517,6 +518,10 @@ namespace IronNestVR
                 bool uiModal = _menu.IsOpen || _popup.Active;
                 _interactor.Apply(_xr.Input, _rig, dt, active, active && (uiModal || _handManip.Active), uiModal);
 
+                // Map magnifier "scope": a zoomed view of the map around where the controller points. Render-
+                // only; suppressed while a VR menu/popup owns the trigger. Hides itself when not over the map.
+                _scope.Tick(_xr.Input, _rig, active && !uiModal);
+
                 if (shouldRender) _xr.RenderAndSubmit(_rig, _bridge);
                 else { Dbg.Beat("endFrame(noRender)"); _xr.EndFrame(); }
 
@@ -576,6 +581,7 @@ namespace IronNestVR
                 _handManip.Cockpit = _interactor; // so a left-hand dial/lever grab reads the left pointer cam immediately
                 _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab };
                 _popup = new VrPopup();
+                _scope = new MapScope();
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
                 _frameFailStreak = 0;
@@ -632,6 +638,8 @@ namespace IronNestVR
             _menu = null;
             try { _popup?.Dispose(); } catch { }
             _popup = null;
+            try { _scope?.Dispose(); } catch { }
+            _scope = null;
             try { Notify.DisposeVr(); } catch { }
             try { _rig?.Destroy(); } catch { }
             _rig = null;

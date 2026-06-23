@@ -362,6 +362,17 @@ namespace IronNestVR
             AddFloat("Switch Throw", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
                      d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.02f, 0.15f));
 
+            // Map magnifier scope. "Zoom" point-right = zoom IN (smaller framed region); value shows the
+            // framed half-size in cm. Size = the floating panel's world size; Height = its lift above the spot.
+            AddToggle("Map Scope", () => Config.MapScopeEnabled ? "On" : "Off",
+                      () => Config.MapScopeEnabled = !Config.MapScopeEnabled);
+            AddFloat("Scope Zoom", () => Mathf.RoundToInt(Config.MapScopeZoom * 100f) + " cm",
+                     d => Config.MapScopeZoom = Clamp(Config.MapScopeZoom - d * 0.01f, 0.02f, 0.30f));
+            AddFloat("Scope Panel Size", () => Config.MapScopeSize.ToString("0.00") + " m",
+                     d => Config.MapScopeSize = Clamp(Config.MapScopeSize + d * 0.02f, 0.08f, 0.50f));
+            AddFloat("Scope Height", () => Config.MapScopeHeight.ToString("0.00") + " m",
+                     d => Config.MapScopeHeight = Clamp(Config.MapScopeHeight + d * 0.02f, 0f, 0.80f));
+
             // --- Hand calibration (live) ---
             // Calibrate: tap to arm, then hold the OPPOSITE controller's grip and move the hand into
             // place (like grabbing the clipboard); release to keep, tap again to finish. (Hands on/off,
