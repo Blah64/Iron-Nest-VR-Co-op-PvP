@@ -1136,8 +1136,10 @@ namespace IronNestVR
             // restore on release. (Null-check only; we never read its sources — that API hard-crashes this runtime.)
             try { _leverCon = pivot.GetComponent<UnityEngine.Animations.ParentConstraint>(); } catch { _leverCon = null; }
             if (_leverCon != null) { try { _leverConWasActive = _leverCon.constraintActive; _leverCon.constraintActive = false; } catch { } }
-            // Disable any animator on the hinge so nothing re-poses it over our writes.
-            try { DisableScrubAnimator(pivot.GetComponent<Animator>()); } catch { }
+            // Disable the animator(s) that would re-pose the hinge over our writes — on the hinge, on the grabbed control,
+            // and the local-assembly rig ABOVE the hinge (the reload console / arming rig idles the lever back to rest,
+            // which is why reload cylinder & arming lever computed a swing but never moved). Bounded so the turret is safe.
+            try { DisableAssemblyAnimators(grabbed, pivot); } catch { }
 
             Log.LogInfo($"[manip] held-stick follow: {(_leverSlide ? "sliding" : "swinging")} hinge '{SafeName(pivot)}' (arm={arm:0.000}m, con={_leverCon != null}).");
         }
@@ -1222,13 +1224,7 @@ namespace IronNestVR
         // '.Rammer Carrage Parent' is metres from the grab) so we never swing a remote part again.
         private Transform FindAssemblyParentHinge(Transform grabbed, Vector3 grabPoint)
         {
-            Transform root = grabbed, probe = grabbed; int climb = 0;
-            while (probe != null && climb <= 6)
-            {
-                int sz = int.MaxValue; try { sz = probe.GetComponentsInChildren<Transform>(true).Length; } catch { }
-                if (sz <= 1200) root = probe; else break;
-                probe = probe.parent; climb++;
-            }
+            Transform root = BoundedAssemblyRoot(grabbed);
             Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { }
             if (all == null) return null;
             Transform best = null; float bestOrigin = float.MaxValue;
@@ -1241,6 +1237,44 @@ namespace IronNestVR
             if (best == null || bestOrigin > 0.6f) return null;   // no local hinge in this assembly → no swing (safe)
             Log.LogInfo($"[manip] held-stick follow: assembly hinge '{SafeName(best)}' (origin {bestOrigin:0.000}m from grab).");
             return best;
+        }
+
+        // Highest ancestor of `from` whose whole subtree is still bounded (≤1200 nodes) — the control's local assembly,
+        // never the whole turret. Used to scope hinge search and animator disabling so we never freeze the turret rig.
+        private static Transform BoundedAssemblyRoot(Transform from)
+        {
+            Transform root = from, probe = from; int climb = 0;
+            while (probe != null && climb <= 6)
+            {
+                int sz = int.MaxValue; try { sz = probe.GetComponentsInChildren<Transform>(true).Length; } catch { }
+                if (sz <= 1200) root = probe; else break;
+                probe = probe.parent; climb++;
+            }
+            return root;
+        }
+
+        // Disable every animator from the grabbed control AND from the hinge up to (and including) the local-assembly
+        // root — the reloading-console / arming rigs idle their lever back to REST every frame, overwriting our swing, and
+        // that animator sits ABOVE the hinge (not on it), so the on-hinge disable alone missed it. Bounded at the assembly
+        // root so the turret rig is never touched. Recorded in _scrubAnimators → RestoreScrubDrivers re-enables on release.
+        private void DisableAssemblyAnimators(Transform grabbed, Transform pivot)
+        {
+            if (_scrubAnimators == null) _scrubAnimators = new System.Collections.Generic.List<AnimEntry>();
+            Transform stop = BoundedAssemblyRoot(grabbed);
+            DisableAnimatorsUpTo(grabbed, stop);
+            DisableAnimatorsUpTo(pivot, stop);
+        }
+
+        private void DisableAnimatorsUpTo(Transform from, Transform stop)
+        {
+            Transform t = from; int guard = 0;
+            while (t != null && guard++ < 32)
+            {
+                Animator a = null; try { a = t.GetComponent<Animator>(); } catch { }
+                if (a != null) DisableScrubAnimator(a);
+                if (t == stop) break;
+                t = t.parent;
+            }
         }
 
         private static bool NameHasParent(Transform t)
@@ -1949,7 +1983,7 @@ namespace IronNestVR
         {
             if (!HasSwitchSelection) return;
             var m = SwitchMotions.Get(_selSwitchKey);
-            if (m.Translate) m.Range = Mathf.Clamp(m.Range + dir * 0.005f, 0.005f, 0.12f);
+            if (m.Translate) m.Range = Mathf.Clamp(m.Range + dir * 0.01f, 0.01f, 0.40f);   // slide up to 40 cm (shell rammer needs the reach)
             else m.Range = Mathf.Clamp(m.Range + dir * 2f, 2f, 90f);
             SwitchMotions.Set(_selSwitchKey, m);
         }
