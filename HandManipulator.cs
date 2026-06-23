@@ -1090,9 +1090,24 @@ namespace IronNestVR
             // .Hatch Lever Barbet Parent.001). Find the one nearest the grab — ancestors up to the assembly, then the
             // grabbed node's siblings — and rotate THAT so its child stick swings about the correct hinge.
             Transform pivot = FindPivotNode(grabbed, grabPoint);
+            // GRABBED-NODE FALLBACK: some controls have no carrying '*Parent' hinge — their visible handle IS the grabbed
+            // button itself, a long node whose OWN origin is the hinge and whose cap sits well out at the tip (the game's
+            // own animator swings the whole button — its cap travels 0.6-1.2 m). Covers reload cylinder, charge rammer,
+            // dispensers, punchcard submit. Driving a separate internal mechanism ('.RotateLever', gears, number drums)
+            // moved parts the player never sees; driving the grabbed node about its origin swings the handle they hold.
             if (pivot == null)
             {
-                Log.LogInfo($"[manip] held-stick follow: no '…Parent' hinge near '{SafeName(grabbed)}' — no swing this control.");
+                float gExt = NodeExtent(grabbed);
+                float gArm = 0f; try { gArm = Vector3.Distance(grabPoint, grabbed.position); } catch { }
+                if (gExt >= 0.15f && gArm >= 0.10f)
+                {
+                    pivot = grabbed;
+                    Log.LogInfo($"[manip] held-stick follow: driving grabbed node '{SafeName(grabbed)}' as its own lever (ext={gExt:0.00}m, arm={gArm:0.00}m).");
+                }
+            }
+            if (pivot == null)
+            {
+                Log.LogInfo($"[manip] held-stick follow: no hinge for '{SafeName(grabbed)}' — no swing this control.");
                 return;
             }
             float arm = 0f; try { arm = Vector3.Distance(grabPoint, pivot.position); } catch { }
@@ -1115,14 +1130,12 @@ namespace IronNestVR
             _leverArmed = false;
 
             // MANUAL AXIS OVERRIDE (VR menu): if the player has dialled in an axis for this control, lock it NOW from the
-            // hinge's rest frame instead of inferring it from the first hand shove (the inference snapped to whichever
-            // local axis was nearest the noisy first swing, which landed off-true on hinges whose local axes aren't
-            // world-aligned — Calculate, coffee). The menu cycles SwitchMotion.Axis through the hinge's ±X/±Y/±Z, so the
-            // player tunes each control until it swings true; left unset, the old auto-inference still runs.
+            // hinge's rest frame instead of inferring it from the first hand shove. The menu cycles SwitchMotion.Axis
+            // through the hinge's ±X/±Y/±Z; left unset, the auto-inference at drive time still runs.
             if (_switchMotion.ManualAxis)
             {
-                Quaternion restW = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
-                Vector3 axW = restW * _switchMotion.Axis;
+                Quaternion frame = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
+                Vector3 axW = frame * _switchMotion.Axis;
                 if (_switchMotion.Flip) axW = -axW;
                 if (axW.sqrMagnitude > 1e-8f)
                 {
@@ -1141,7 +1154,17 @@ namespace IronNestVR
             // which is why reload cylinder & arming lever computed a swing but never moved). Bounded so the turret is safe.
             try { DisableAssemblyAnimators(grabbed, pivot); } catch { }
 
-            Log.LogInfo($"[manip] held-stick follow: {(_leverSlide ? "sliding" : "swinging")} hinge '{SafeName(pivot)}' (arm={arm:0.000}m, con={_leverCon != null}).");
+            // DIAG: list the hinge's immediate children — confirms the visible lever (e.g. reload's '.RotateLever') is
+            // actually UNDER the hinge we rotate. If it isn't, rotating the hinge can't move it (wrong node picked).
+            string kidNames = "";
+            try
+            {
+                int cc = pivot.childCount; var ksb = new System.Text.StringBuilder();
+                for (int i = 0; i < cc && i < 6; i++) { var c = pivot.GetChild(i); ksb.Append(SafeName(c)); ksb.Append(i < cc - 1 && i < 5 ? "," : ""); }
+                kidNames = $" kids[{cc}]: {ksb}";
+            }
+            catch { }
+            Log.LogInfo($"[manip] held-stick follow: {(_leverSlide ? "sliding" : "swinging")} hinge '{SafeName(pivot)}' (arm={arm:0.000}m, con={_leverCon != null}).{kidNames}");
         }
 
         // Name hint that a control TRANSLATES rather than rotates (pulley/horn/chain). The menu Translate flag overrides.
@@ -1227,16 +1250,39 @@ namespace IronNestVR
             Transform root = BoundedAssemblyRoot(grabbed);
             Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { }
             if (all == null) return null;
-            Transform best = null; float bestOrigin = float.MaxValue;
+            // Require the hinge's BODY (not just its origin) to reach the grab — a real per-control hinge's lever passes
+            // through your hand (Calculate's '.Calculate Lever Parent' body is 0.13 m away), while an internal mechanism
+            // arm we must NOT grab (reload's '.RotateLeverParent' drives a rod separate from the handle) stays farther.
+            Transform best = null; float bestNear = float.MaxValue;
             for (int i = 0; i < all.Length; i++)
             {
                 var n = all[i]; if (n == null || n == grabbed || !NameHasParent(n)) continue;
                 float o; try { o = Vector3.Distance(n.position, grabPoint); } catch { continue; }
-                if (o < bestOrigin) { bestOrigin = o; best = n; }
+                if (o > 0.6f) continue;                       // cheap pre-filter: hinge origin must be local
+                float nr = NearestApproach(n, grabPoint);     // does the hinge's body actually reach the grab?
+                if (nr < bestNear) { bestNear = nr; best = n; }
             }
-            if (best == null || bestOrigin > 0.6f) return null;   // no local hinge in this assembly → no swing (safe)
-            Log.LogInfo($"[manip] held-stick follow: assembly hinge '{SafeName(best)}' (origin {bestOrigin:0.000}m from grab).");
+            if (best == null || bestNear > 0.2f) return null;   // no local hinge whose lever reaches the grab → no swing
+            Log.LogInfo($"[manip] held-stick follow: assembly hinge '{SafeName(best)}' (body {bestNear:0.000}m from grab).");
             return best;
+        }
+
+        // Max distance from a node's own origin to any descendant body point — how far the node's mesh reaches. A long
+        // value means the grabbed node is itself a lever (handle out at the tip, hinge at the origin).
+        private static float NodeExtent(Transform t)
+        {
+            if (t == null) return 0f;
+            Vector3 o; try { o = t.position; } catch { return 0f; }
+            float ext = 0f;
+            Transform[] kids = null; try { kids = t.GetComponentsInChildren<Transform>(true); } catch { }
+            if (kids != null)
+                for (int i = 0; i < kids.Length; i++)
+                {
+                    var k = kids[i]; if (k == null) continue;
+                    float d; try { d = Vector3.Distance(k.position, o); } catch { continue; }
+                    if (d > ext) ext = d;
+                }
+            return ext;
         }
 
         // Highest ancestor of `from` whose whole subtree is still bounded (≤1200 nodes) — the control's local assembly,
@@ -1263,6 +1309,10 @@ namespace IronNestVR
             Transform stop = BoundedAssemblyRoot(grabbed);
             DisableAnimatorsUpTo(grabbed, stop);
             DisableAnimatorsUpTo(pivot, stop);
+            // Also every animator INSIDE the hinge's subtree — the lever mesh's driver can sit on/below the hinge (the
+            // reload console has 15 animators), which the upward climbs above don't reach.
+            Animator[] kids = null; try { kids = pivot.GetComponentsInChildren<Animator>(true); } catch { }
+            if (kids != null) for (int i = 0; i < kids.Length; i++) DisableScrubAnimator(kids[i]);
         }
 
         private void DisableAnimatorsUpTo(Transform from, Transform stop)
