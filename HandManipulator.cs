@@ -72,20 +72,22 @@ namespace IronNestVR
         // held dial from its periodic raycast-camera repoint (HeldDialTransform) so this assignment stays put.
         private GameObject _dialCamGo;
         private Camera _dialCam;
-        private const float DialPointRadius = 0.1f; // synthetic pointer radius on the dial plane (its ANGLE, not R, drives the dial)
-        private const float DialCamBack = 0.25f;     // how far off the plane the camera sits, looking back along the axis at the point
+        private const float DialPointRadius = 0.1f;     // synthetic pointer radius on the dial plane (its ANGLE, not R, drives the dial)
+        private const float DialCamBack = 0.25f;        // how far off the plane the camera sits, looking back along the axis at the point
+        private const float DialMinGrabRadius = 0.03f;  // floor for the grab arm length, so a grab AT the pivot isn't hypersensitive
 
-        // RIGID dial drive state. We accumulate a synthetic pointer angle from TWO contributions, both measured
-        // about the dial axis in a fixed plane basis: (1) TWIST — the controller's roll about the axis, tracked
-        // via a controller-local reference direction captured ⊥-axis at grab (distance-independent, so a far
-        // laser-grab doesn't amplify it); (2) ORBIT — the controller position's angle around the dial centre.
-        // Summing them = "both twisting and moving the hand turn the dial," the rigid-grab feel. Fed to the
-        // native drag as a point at DialPointRadius and DialPointRadius·angle, which it reads as deltas.
-        private Vector3 _dialRefLocal;        // controller-local ⊥-axis reference dir (captured at grab) → twist
+        // RIGID dial drive state. The grabbed point is reconstructed each frame from the controller's RIGID motion
+        // at the captured grab radius (NOT the far laser-reach): rotate the grab arm by the controller's rotation
+        // (TWIST about the axis, 1:1) and add its translation (CRANK tangentially, scaled by the grab radius). The
+        // arm length = the grab point's distance from the dial pivot, so translation actually turns the dial in
+        // proportion to how a real grab there would (the "orbit" that was missing when measured off the far grip),
+        // and big-radius wheels crank gently while small knobs respond to small motions. We feed the native drag a
+        // synthetic point at the accumulated angle, which it reads as deltas.
+        private Vector3 _dialArmLocal;        // grab arm (pivot→grab point, on the plane), fixed in the controller frame at grab
+        private Vector3 _dialGrabCtrlPos;     // controller position at grab — translation since then is the crank
         private float _dialSynthAngleDeg;     // accumulated synthetic pointer angle handed to the native drag
-        private float _dialPrevTwistDeg;      // previous frame's twist reference angle about the axis
-        private float _dialPrevOrbitDeg;      // previous frame's controller-position orbit angle about the axis
-        private bool _dialDriveInit;          // false until the first drive frame seeds the prev angles
+        private float _dialPrevAngleDeg;      // previous frame's reconstructed grab-point angle about the axis
+        private bool _dialDriveInit;          // false until the first drive frame seeds the prev angle
 
         public bool Active => _kind != Kind.None;
 
@@ -191,18 +193,28 @@ namespace IronNestVR
             _kind = Kind.Dial;
             _hand = hand;
             StickTo(hand, dial.transform, hitPoint, input, origin);
-            // Drive the dial from a RIGID grab of the controller (twist about the axis + orbit of the hand),
-            // not the laser aim: aim the dial's own raycast camera through a synthetic pointer whose angle we
-            // accumulate from the controller's motion. Capture the ⊥-axis twist reference in the controller's
-            // frame, then pose the cam BEFORE BeginDialDrag so the drag's start angle is captured here (no
-            // frame-0 jump). CockpitInteractor won't repoint the held dial (HeldDialTransform).
+            // Drive the dial from a RIGID grab of the controller (twist about the axis + translation crank at the
+            // grab radius), not the laser aim: aim the dial's own raycast camera through a synthetic pointer whose
+            // angle we accumulate from the controller's motion. Capture the grab arm (pivot→grab point, on the
+            // dial plane) in the controller's frame + the controller position, then pose the cam BEFORE
+            // BeginDialDrag so the drag's start angle is captured here (no frame-0 jump). CockpitInteractor won't
+            // repoint the held dial (HeldDialTransform).
             EnsureDialCam();
             GetWorld(origin, HandGripPose(hand, input), out Vector3 gp, out Quaternion gr);
             Vector3 axis0 = dial.transform.TransformDirection(dial.rotationAxis);
             if (axis0.sqrMagnitude < 1e-8f) axis0 = dial.transform.forward;
-            PlaneBasis(axis0.normalized, out Vector3 u0, out _);
-            _dialRefLocal = Quaternion.Inverse(gr) * u0;   // controller-local ⊥-axis reference for twist tracking
-            _dialDriveInit = false;                         // first DriveDialCam seeds the prev angles
+            axis0 = axis0.normalized;
+            Vector3 arm0 = hitPoint - dial.transform.position;
+            arm0 -= Vector3.Dot(arm0, axis0) * axis0;       // project the grab arm onto the dial plane
+            if (arm0.sqrMagnitude < DialMinGrabRadius * DialMinGrabRadius)
+            {
+                PlaneBasis(axis0, out Vector3 ub, out _);    // grabbed at/near the pivot: floor the arm so it isn't hypersensitive
+                Vector3 dir = arm0.sqrMagnitude > 1e-10f ? arm0.normalized : ub;
+                arm0 = dir * DialMinGrabRadius;
+            }
+            _dialArmLocal = Quaternion.Inverse(gr) * arm0;  // grab arm rigidly fixed in the controller frame
+            _dialGrabCtrlPos = gp;                           // controller position at grab (translation since = crank)
+            _dialDriveInit = false;                          // first DriveDialCam seeds the prev angle
             _dialSynthAngleDeg = 0f;
             DriveDialCam(dial, gp, gr);
             if (_dialCam != null) dial.raycastCamera = _dialCam;
@@ -384,12 +396,13 @@ namespace IronNestVR
             _dialCam.fieldOfView = 60f;
         }
 
-        // Re-aim the dial-drive camera so the native drag reads the RIGID-grab angle. We accumulate a synthetic
-        // pointer angle from the controller's TWIST about the axis (its roll, via the ⊥-axis reference captured
-        // at grab — distance-independent) plus its ORBIT (the controller position's angle around the dial centre),
-        // both measured in a fixed plane basis and summed as per-frame deltas. The camera is then placed off the
-        // plane along +axis, looking back along -axis at the synthetic point, so its centre ray ∩ plane = that
-        // point — and the native drag turns the dial by that point's angle.
+        // Re-aim the dial-drive camera so the native drag reads the RIGID-grab angle. The grabbed point is
+        // reconstructed from the controller's rigid motion at the captured grab radius: rotate the grab arm by the
+        // controller's current rotation (so a roll about the axis turns the dial 1:1 — TWIST) and add the
+        // controller's translation since grab (so moving the hand cranks it tangentially, scaled by the arm length
+        // — CRANK). Its angle about the axis is accumulated (deltas, so wrap-safe) and fed to the native drag via a
+        // synthetic point; the camera sits off the plane along +axis looking back along -axis at it, so its centre
+        // ray ∩ plane = that point.
         private void DriveDialCam(DialInteractable dial, Vector3 ctrlPos, Quaternion ctrlRot)
         {
             if (_dialCam == null || dial == null) return;
@@ -398,26 +411,20 @@ namespace IronNestVR
             Vector3 axis = t.TransformDirection(dial.rotationAxis);
             if (axis.sqrMagnitude < 1e-8f) axis = t.forward;
             axis = axis.normalized;
-            Vector3 center = t.position;
+            Vector3 pivot = t.position;
             PlaneBasis(axis, out Vector3 u, out Vector3 v);
 
-            float twist = AngleOnPlane(ctrlRot * _dialRefLocal, axis, u, v);   // controller roll about the axis
-            float orbit = AngleOnPlane(ctrlPos - center, axis, u, v);          // controller position around the centre
-
-            if (!_dialDriveInit)
+            // Grabbed point relative to the pivot = rotated arm (twist) + controller translation (crank).
+            Vector3 grabVec = ctrlRot * _dialArmLocal + (ctrlPos - _dialGrabCtrlPos);
+            float ang = AngleOnPlane(grabVec, axis, u, v);
+            if (!float.IsNaN(ang))
             {
-                _dialPrevTwistDeg = twist; _dialPrevOrbitDeg = orbit; _dialDriveInit = true;
-            }
-            else
-            {
-                if (!float.IsNaN(twist) && !float.IsNaN(_dialPrevTwistDeg)) _dialSynthAngleDeg += WrapDeg(twist - _dialPrevTwistDeg);
-                if (!float.IsNaN(orbit) && !float.IsNaN(_dialPrevOrbitDeg)) _dialSynthAngleDeg += WrapDeg(orbit - _dialPrevOrbitDeg);
-                if (!float.IsNaN(twist)) _dialPrevTwistDeg = twist;
-                if (!float.IsNaN(orbit)) _dialPrevOrbitDeg = orbit;
+                if (!_dialDriveInit) { _dialPrevAngleDeg = ang; _dialDriveInit = true; }
+                else { _dialSynthAngleDeg += WrapDeg(ang - _dialPrevAngleDeg); _dialPrevAngleDeg = ang; }
             }
 
             float a = _dialSynthAngleDeg * Mathf.Deg2Rad;
-            Vector3 p = center + (Mathf.Cos(a) * u + Mathf.Sin(a) * v) * DialPointRadius;
+            Vector3 p = pivot + (Mathf.Cos(a) * u + Mathf.Sin(a) * v) * DialPointRadius;
             Vector3 camPos = p + axis * DialCamBack;
             Vector3 up = Mathf.Abs(Vector3.Dot(axis, Vector3.up)) > 0.95f ? Vector3.forward : Vector3.up;
             _dialCam.transform.SetPositionAndRotation(camPos, Quaternion.LookRotation(-axis, up));
