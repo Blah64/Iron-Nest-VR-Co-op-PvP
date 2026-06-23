@@ -40,6 +40,19 @@ namespace IronNestVR
         /// the desktop-mirror blank zeroes while in VR. -1 (all layers) until the eyes exist.</summary>
         public int SceneCullMask => _eyeMask;
 
+        /// <summary>Make the eye cameras also render <paramref name="layer"/> — folded into the captured scene
+        /// mask so the per-frame <see cref="SetEyeSceneRender"/> keeps it. Used so the map-scope panel (on its
+        /// own layer, excluded from the magnifier camera so it doesn't film itself) stays visible in the
+        /// headset. Idempotent; no-op until the eyes exist.</summary>
+        public void IncludeLayerInEyes(int layer)
+        {
+            if (layer < 0 || layer > 31) return;
+            int bit = 1 << layer;
+            if ((_eyeMask & bit) != 0) return;
+            _eyeMask |= bit;
+            for (int i = 0; i < 2; i++) if (_cam[i] != null) _cam[i].cullingMask |= bit;
+        }
+
         /// <summary>The seated rig origin (game camera pose + recenter yaw). Controllers are placed
         /// relative to this so they line up with the rendered world. Null until cameras exist.</summary>
         public Transform OriginTransform => _origin != null ? _origin.transform : null;

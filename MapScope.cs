@@ -63,6 +63,12 @@ namespace IronNestVR
                 Diag($"OVER MAP at ({hit.x:0.00},{hit.y:0.00},{hit.z:0.00}) -> showing");
                 EnsureObjects();
 
+                // Keep the panel on its dedicated layer (so the magnifier can exclude it) and make sure the
+                // eyes render that layer (else the panel would be invisible in the headset).
+                int panelLayer = Mathf.Clamp(Config.MapScopePanelLayer, 0, 31);
+                if (_panelGo.layer != panelLayer) _panelGo.layer = panelLayer;
+                rig.IncludeLayerInEyes(panelLayer);
+
                 // Smooth the framed point so the zoomed view doesn't shimmer with hand tremor.
                 float tc = Config.MapScopeSmooth;
                 if (!_hasSm || tc <= 0f) { _smHit = hit; _hasSm = true; }
@@ -82,9 +88,11 @@ namespace IronNestVR
                 _cam.nearClipPlane = 0.01f;
                 _cam.farClipPlane = standoff + Mathf.Max(0.02f, Config.MapScopeDepthBelow);
                 // The REAL scene cull mask (the eyes'), NOT Camera.main's — the desktop-mirror blank zeroes
-                // main's mask while in VR, which would make the magnifier render nothing.
+                // main's mask while in VR, which would make the magnifier render nothing. EXCLUDE the panel's
+                // own layer so the camera never films its own output (the duplicate-map-inside-the-scope bug).
                 int mask = rig.SceneCullMask;
-                _cam.cullingMask = mask != 0 ? mask : ~0;
+                if (mask == 0) mask = ~0;
+                _cam.cullingMask = mask & ~(1 << panelLayer);
 
                 // --- billboard panel: lifted above the aim point and pulled toward the player, facing them ---
                 rig.TryGetHeadPose(out var hp, out _);

@@ -598,6 +598,11 @@ namespace IronNestVR
         // Extra padding (map-local units) on the "is the ray over the map?" bounds test — lets you frame
         // right up to (or slightly past) the board edge.
         public static float MapScopeEdgePad = 0f;
+        // The scope panel renders on its OWN layer so the magnifier camera can EXCLUDE it — otherwise the
+        // camera films its own output (the panel shows a map view) and you get a duplicate map inside the
+        // scope. The layer is added to the eye cameras so you still see the panel. Pick a layer nothing else
+        // uses (31 is conventionally free).
+        public static int MapScopePanelLayer = 31;
 
         // --- Interaction diagnostics ---
         // Throttled per-frame log of head/controller geometry + hover target (for tuning aim).
