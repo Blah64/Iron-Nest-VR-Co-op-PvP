@@ -176,9 +176,11 @@ namespace IronNestVR
         // ROTATE: lock the swing PLANE from the first real movement so the lever swings about one fixed hinge axis,
         // instead of a free point-at-hand that tilts about the wrong axis when the hand drifts sideways.
         private Vector3 _leverRotAxisW; private bool _leverHasRotAxis;
-        // FIRE-ON-RELEASE: while a stick is hand-followed, don't fire the click mid-pull (the game's animation would rip
-        // it out of your hand) — arm it when you pull past the threshold and fire when you LET GO, so the whole pull is
-        // hand-driven and the scripted animation only plays after the hand is gone.
+        // FIRE-MID-PULL: a hand-followed lever fires its EFFECT the moment you pull it to the bottom of its throw (so the
+        // action happens while it's in your hand), then we SILENCE the canned animation for the rest of the hold so the
+        // game's playback can't rip the lever out of your grip — DriveHeldStick keeps owning the visible lever. On release
+        // the animator is re-enabled and plays through to settle the lever at its authored end (back to rest, or staying
+        // down). _leverArmed latches the one-and-only fire per grab (jitter near the bottom can't double-fire).
         private bool _leverArmed;
 
 
@@ -818,9 +820,19 @@ namespace IronNestVR
             {
                 if (_leverT != null)
                 {
-                    // FOLLOW control: DON'T fire mid-pull — the game's animation would rip the lever out of your hand.
-                    // Arm it (a haptic tick marks the activation point); the click fires on RELEASE, after the hand is gone.
-                    if (!_leverArmed) { _leverArmed = true; input.Haptic(Config.HapticAmplitude, Mathf.Max(Config.HapticSeconds, 0.04f)); }
+                    // FOLLOW control: fire the EFFECT the moment the lever reaches the bottom of its throw, so the action
+                    // happens WHILE it's in your hand (not deferred to release). To stop the game's canned animation from
+                    // ripping the lever out of your grip, SILENCE its animator now — DriveHeldStick keeps owning the visible
+                    // lever for the rest of the hold. On release ClearSwitchGrab re-enables the animator, which then plays
+                    // through to settle the lever at its authored end (back to rest, or staying down — whatever it authored).
+                    if (!_leverArmed)
+                    {
+                        Activate(_switch, _switchInteractable);
+                        _leverArmed = true;
+                        if (!_scrubManual) _learnTriggered = true;   // learn: capture the click's tail after release
+                        SilenceLeverAnimator();
+                        input.Haptic(Config.HapticAmplitude, Mathf.Max(Config.HapticSeconds, 0.04f));
+                    }
                     _switchLatched = true;
                 }
                 else
@@ -839,8 +851,9 @@ namespace IronNestVR
             }
             else if (_switchLatched && progress <= 0.30f)
             {
-                _switchLatched = false;          // pushed back — ready to flip again
-                if (_leverT != null) _leverArmed = false;  // pulled back before release → don't fire on release
+                _switchLatched = false;          // pushed back — ready to flip again (non-follow toggles)
+                // Followed levers fire once per grab: _leverArmed stays latched so jitter near the bottom can't re-fire
+                // the effect, and the silenced animator stays silenced until release. Re-grab to operate it again.
             }
         }
 
@@ -1028,6 +1041,16 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[manip] switch activate: " + e.Message); }
         }
 
+        // Freeze the lever's canned animation the instant its effect fires mid-pull, so for the rest of the hold the
+        // hand-follow (DriveHeldStick) is the only thing posing the visible lever — the game's playback can't yank it out
+        // of your grip. The click's animator triggers were already set by Activate (called just before this, while the
+        // animator was still enabled), so they're buffered; ClearSwitchGrab re-enables the animator on release, and it
+        // plays through from there to settle the lever at its authored end pose. Idempotent and null-safe.
+        private void SilenceLeverAnimator()
+        {
+            if (_switchAnimator != null) { try { _switchAnimator.enabled = false; } catch { } }
+        }
+
         // ---------------- release ----------------
 
         private void Release(VrInput input, HandVisuals hands, string why)
@@ -1074,14 +1097,11 @@ namespace IronNestVR
                 try { if (_leverT != null) { _leverT.localRotation = _leverRestLocalR; _leverT.localPosition = _leverPivotLocal; } } catch { }
                 if (_switchAnimator != null) _switchAnimator.enabled = _switchAnimatorWasEnabled;
 
-                // FOLLOW control fired on RELEASE: you pulled past the threshold, so fire the click NOW (hand already gone
-                // → the scripted animation plays without yanking the lever). Set _learnTriggered so the tail still captures.
-                if (_leverT != null && _leverArmed && _switch != null)
-                {
-                    Activate(_switch, _switchInteractable);
-                    if (!_scrubManual) _learnTriggered = true;
-                    Log.LogInfo($"[manip] held-stick '{_switchKey}': fired click on release (pulled past threshold).");
-                }
+                // FOLLOW control already fired its click mid-pull (at the bottom of the throw), so there's nothing to fire
+                // here. Re-enabling the animator just above lets the game's canned animation now play through to settle the
+                // lever at its authored end pose (back to rest, or staying down) — the "finish the motion on release" feel.
+                if (_leverT != null && _leverArmed)
+                    Log.LogInfo($"[manip] held-stick '{_switchKey}': effect fired mid-pull; releasing to canned settle.");
 
                 // LEARN: if the click fired, the animation is still playing — keep the rig snapshot alive and sample a
                 // TAIL after release (in Tick) so the FULL animation is captured regardless of how fast you let go. The
