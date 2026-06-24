@@ -144,6 +144,12 @@ namespace IronNestVR
         private Vector3 _riderRestLocal, _riderSlideAxisW; private float _riderTravel;
         private Vector3 _riderRestPosW; private Quaternion _riderRestRotW;   // orb world pose at grab — co-moved with the stick delta
         private UnityEngine.Animations.ParentConstraint _riderCon; private bool _riderConWasActive;
+        // EXTRA RIDERS: the WHOLE handle is a small cluster of nearby meshes (stick + orb + connector), each constraint-
+        // glued by the game and re-posed every frame, so co-moving only ONE leaves the others dead (console: stick swings
+        // but its orb stays; punchcard: orb slides but its connector stays). Co-move EVERY nearby constraint-driven visible
+        // handle part rigidly with the stick's delta. Captured world pose at grab; their constraints disabled, restored on release.
+        private struct RiderX { public Transform T; public Vector3 RestPosW; public Quaternion RestRotW; public UnityEngine.Animations.ParentConstraint Con; public bool ConWasActive; }
+        private System.Collections.Generic.List<RiderX> _riders;
         // The stick's transform delta THIS frame, world space, for DriveRider to apply to the rider: a rotation _leverSwingDqW
         // about _leverPivotW (rotate path), or a translation _leverSlideDeltaW (slide path).
         private Vector3 _leverPivotW; private Quaternion _leverSwingDqW = Quaternion.identity; private Vector3 _leverSlideDeltaW;
@@ -1187,6 +1193,7 @@ namespace IronNestVR
         {
             _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f; _leverArmed = false; _leverBuried = false; _capSlideFollow = false; _leverStickArchetype = false;
             _riderT = null; _riderParent = null; _riderCon = null; _riderTravel = 0f; _leverFollowFrac = 0f;
+            if (_riders != null) _riders.Clear();   // their constraints were already re-enabled by RestoreScrubDrivers on the prior release
             if (!HeldStickFollow) return;   // structure-dump build: don't drive any node until the real stick is identified
             if (grabbed == null) return;
 
@@ -1397,6 +1404,10 @@ namespace IronNestVR
             catch { }
             Log.LogInfo($"[manip] held-stick follow: {(_leverSlide ? "sliding" : "swinging")} hinge '{SafeName(pivot)}' (arm={arm:0.000}m, con={_leverCon != null}).{kidNames}");
 
+            // Co-move the REST of the handle cluster with the stick: the console's orb-light on the lever tip, the punchcard's
+            // connector beside the orb-cap — separate constraint-driven meshes that otherwise stay put while the stick moves.
+            try { GatherExtraRiders(grabbed, grabPoint); } catch { }
+
             // DIAG TINT: paint the node we DRIVE bright red (and the orb-rider green) so the user can SEE which mesh we
             // think is the stick. Our writes provably move these transforms with no animator override, yet the user reports
             // "no change" — so either the tinted mesh IS the stick and moves (perception), or it ISN'T (wrong node). Restored
@@ -1405,6 +1416,7 @@ namespace IronNestVR
             {
                 TintNode(_leverT, new Color(1f, 0.1f, 0.1f, 1f));
                 if (_riderT != null) TintNode(_riderT, new Color(0.1f, 1f, 0.1f, 1f));
+                if (_riders != null) for (int i = 0; i < _riders.Count; i++) TintNode(_riders[i].T, new Color(0.2f, 0.5f, 1f, 1f));   // blue = extra handle parts
             }
         }
 
@@ -1596,11 +1608,35 @@ namespace IronNestVR
             return s.Contains("lever") || s.Contains("handle") || s.Contains("crank") || s.Contains("pull");
         }
 
+        private static bool IsWiringName(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            s = s.ToLowerInvariant();
+            return s.Contains("bezier") || s.Contains("bézier") || s.Contains("curve") || s.Contains("cable") || s.Contains("wire") || s.Contains("spline");
+        }
+
         // True if a 'lever'-named node's ONLY visible mesh is a Bézier/cable/wire/spline curve — i.e. it's cosmetic WIRING
         // running along a stick, not the stick itself. The charge rammer's 'BigLever.001' has a single child 'BézierCurve.010';
         // we drove it and the user saw "the wiring move, not the lever stick." Reject so the real rod '.PowderRamLever' wins.
         private static bool IsWiringLever(Transform t)
         {
+            // STRUCTURAL DECOY: a lever-named node whose every DIRECT CHILD is a wiring curve is a wiring bracket, not a rod —
+            // even when its OWN renderer is a small enabled stub that the visible-mesh test below would keep. 'BigLever.001'
+            // (sole child 'BézierCurve.010') is exactly this; the real rod '.PowderRamLever' has a 'Cube.030' rod child + LODs,
+            // and every WORKING lever has a real mesh child (.RotateLever/.ShellRamLever/.ChargeLever/.LeverLock.005/...). So
+            // this rejects the charge-rammer decoy on the FIRST grab (no learn capture needed) without touching any real lever.
+            int cc = 0; try { cc = t.childCount; } catch { cc = 0; }
+            if (cc > 0)
+            {
+                bool allWiring = true;
+                for (int i = 0; i < cc; i++)
+                {
+                    Transform c = null; try { c = t.GetChild(i); } catch { }
+                    if (c == null) continue;
+                    if (!IsWiringName(SafeName(c))) { allWiring = false; break; }
+                }
+                if (allWiring) return true;
+            }
             Renderer[] rs = null; try { rs = t.GetComponentsInChildren<Renderer>(true); } catch { }
             if (rs == null || rs.Length == 0) return false;
             bool sawEnabled = false;
@@ -1611,12 +1647,7 @@ namespace IronNestVR
                 if (!en) continue;   // only meshes that actually RENDER count
                 sawEnabled = true;
                 string s = null; try { s = r.transform.name; } catch { }
-                bool wiringName = false;
-                if (!string.IsNullOrEmpty(s))
-                {
-                    s = s.ToLowerInvariant();
-                    wiringName = s.Contains("bezier") || s.Contains("bézier") || s.Contains("curve") || s.Contains("cable") || s.Contains("wire") || s.Contains("spline");
-                }
+                bool wiringName = IsWiringName(s);
                 // 'BigLever.001's own renderer is enabled but its mesh is visually NEGLIGIBLE (a tiny stub) — so a name test
                 // alone kept it. Also treat a renderer with tiny world bounds as non-stick: a real rod is ≥~0.1 m across.
                 float size = 1f; try { size = r.bounds.size.magnitude; } catch { }
@@ -1826,6 +1857,83 @@ namespace IronNestVR
             try { _riderCon = rider.GetComponent<UnityEngine.Animations.ParentConstraint>(); } catch { _riderCon = null; }
             if (_riderCon != null) { try { _riderConWasActive = _riderCon.constraintActive; _riderCon.constraintActive = false; } catch { } }
             Log.LogInfo($"[manip] held-stick follow: + rider '{SafeName(rider)}' co-moves with the stick (glued to the tip).");
+        }
+
+        // Register an extra handle part as a rigid rider: capture its world pose now and disable its constraint so our writes
+        // hold. Skips the driven stick, the primary rider, and duplicates. RestoreScrubDrivers re-enables the constraint on release.
+        private void AddRider(Transform t)
+        {
+            if (t == null || t == _leverT || t == _riderT) return;
+            if (_riders == null) _riders = new System.Collections.Generic.List<RiderX>();
+            for (int i = 0; i < _riders.Count; i++) if (_riders[i].T == t) return;
+            var e = new RiderX { T = t };
+            try { e.RestPosW = t.position; e.RestRotW = t.rotation; } catch { }
+            try { e.Con = t.GetComponent<UnityEngine.Animations.ParentConstraint>(); } catch { e.Con = null; }
+            if (e.Con != null) { try { e.ConWasActive = e.Con.constraintActive; e.Con.constraintActive = false; } catch { } }
+            _riders.Add(e);
+            Log.LogInfo($"[manip] held-stick follow: + extra rider '{SafeName(t)}' co-moves with the handle.");
+        }
+
+        // Gather the REST of the handle cluster so the WHOLE thing tracks the hand, not just the one node we drive. Two
+        // passes, both tightly gated (small, visible, right at the grab, not under the driven stick, never an ancestor of the
+        // grab = the console body): (1) GEOMETRIC — nearby constraint-driven meshes (orb-lights/caps the game glues to a
+        // tip); works on the 1st grab. (2) CAPTURED — on a 2nd+ grab the learn cache lists every node the game moves; add the
+        // visible small ones near the handle (a slider connector with no constraint of its own that our animator-disable would
+        // otherwise freeze). Each becomes a rigid rider co-moved by the stick's delta in DriveRider.
+        private void GatherExtraRiders(Transform grabbed, Vector3 grabPoint)
+        {
+            if (grabbed == null || _leverT == null) return;
+            // CRITICAL: never sweep the broad assembly — the reloading console packs a 'Cylinder.001' orb on EVERY control,
+            // so a radius search around the grab dragged ADJACENT controls' orbs (the pass-26 regression). Both passes below
+            // are NEIGHBOUR-SAFE by construction: pass A is scoped to THIS control's own learn capture (keyed by control),
+            // pass B to the grabbed control's OWN descendants — neither can reach a different control's handle.
+            Vector3 leverPos; try { leverPos = _leverT.position; } catch { return; }
+
+            // PASS A — CAPTURED, PER-CONTROL: a constraint-driven mover in THIS control's cache, mounted on the driven lever
+            // (small + near its body). The console's orb 'Cylinder.001' (captured, world-moves 0.39m, glued by a
+            // ParentConstraint) is held OFF the lever we drive so it sits dead — co-move it. The doors / rail-cart in the same
+            // capture have NO constraint and are large → excluded (they keep moving via the scrub, paced by _leverFollowFrac).
+            if (_scrubKey != null && _scrubCache.TryGetValue(_scrubKey, out var nodes) && nodes != null)
+                for (int k = 0; k < nodes.Length; k++)
+                {
+                    Transform t = nodes[k].T;
+                    if (!RiderCandidate(t, grabbed)) continue;
+                    bool hasCon = false; try { hasCon = t.GetComponent<UnityEngine.Animations.ParentConstraint>() != null; } catch { }
+                    if (!hasCon) continue;
+                    // Measure to the GRAB POINT (the handle tip the orb sits at), NOT the lever's hinge ORIGIN — the console
+                    // lever hinges ~0.78m down at its base, so a tip-origin gate wrongly excluded the orb. Generous radius is
+                    // safe: this pass only sees THIS control's own captured movers, so it can never reach a neighbour's orb.
+                    if (NearestApproach(t, grabPoint) > 0.40f) continue;
+                    AddRider(t);
+                }
+
+            // PASS B — GRABBED SUBTREE ONLY: a visible part TOUCHING the driven node that the game does NOT animate (absent
+            // from the capture) — the punchcard's connector stick beside the sliding orb-cap. Scoped to the grabbed control's
+            // own descendants and required to physically touch the driven node, so it can never reach an adjacent handle.
+            Transform[] kids = null; try { kids = grabbed.GetComponentsInChildren<Transform>(true); } catch { }
+            if (kids != null)
+                for (int i = 0; i < kids.Length; i++)
+                {
+                    Transform t = kids[i];
+                    if (!RiderCandidate(t, grabbed)) continue;
+                    float toLever = NearestApproach(t, leverPos);
+                    float toGrab; try { toGrab = Vector3.Distance(t.position, grabPoint); } catch { toGrab = float.MaxValue; }
+                    if (toLever > 0.10f && toGrab > 0.10f) continue;      // must physically touch the driven node / grab
+                    AddRider(t);
+                }
+        }
+
+        // A mesh qualifies as a co-moving handle part: not the stick/its subtree, not the grabbed control or an ancestor of
+        // it (the console body), small (an orb/cap/connector, not a panel), and actually rendering. Proximity/scope are
+        // applied by the caller per pass.
+        private bool RiderCandidate(Transform t, Transform grabbed)
+        {
+            if (t == null || t == _leverT || t == _riderT) return false;
+            if (IsDescendantOf(t, _leverT)) return false;                 // under the driven stick → rides for free
+            if (t == grabbed || IsDescendantOf(grabbed, t)) return false; // never an ancestor of the grab (the console body)
+            if (!HasVisibleEnabledMesh(t)) return false;
+            if (NodeExtent(t) > 0.30f) return false;                      // small handle parts only
+            return true;
         }
 
         // The in-hand orb-cap ('Cylinder.001') the user actually holds: a mesh DESCENDANT of the grabbed button carrying a
@@ -2101,20 +2209,38 @@ namespace IronNestVR
         // so the write holds; on release they restore and it returns to the game's control.
         private void DriveRider()
         {
-            if (_riderT == null) return;
-            try
+            if (_riderT != null)
             {
-                if (_leverSlide)
+                try
                 {
-                    _riderT.position = _riderRestPosW + _leverSlideDeltaW;
+                    if (_leverSlide)
+                        _riderT.position = _riderRestPosW + _leverSlideDeltaW;
+                    else
+                    {
+                        _riderT.position = _leverPivotW + _leverSwingDqW * (_riderRestPosW - _leverPivotW);
+                        _riderT.rotation = _leverSwingDqW * _riderRestRotW;
+                    }
                 }
-                else
-                {
-                    _riderT.position = _leverPivotW + _leverSwingDqW * (_riderRestPosW - _leverPivotW);
-                    _riderT.rotation = _leverSwingDqW * _riderRestRotW;
-                }
+                catch { }
             }
-            catch { }
+            // Every extra handle part co-moves by the SAME delta (slide translation or swing about the hinge) — drives the
+            // console orb / punchcard connector even when there's no single primary rider (_riderT == null).
+            if (_riders != null)
+                for (int i = 0; i < _riders.Count; i++)
+                {
+                    var e = _riders[i]; if (e.T == null) continue;
+                    try
+                    {
+                        if (_leverSlide)
+                            e.T.position = e.RestPosW + _leverSlideDeltaW;
+                        else
+                        {
+                            e.T.position = _leverPivotW + _leverSwingDqW * (e.RestPosW - _leverPivotW);
+                            e.T.rotation = _leverSwingDqW * e.RestRotW;
+                        }
+                    }
+                    catch { }
+                }
         }
 
         private void SampleLearnFrame()
@@ -2384,6 +2510,10 @@ namespace IronNestVR
             try { if (_leverCon != null) { _leverCon.constraintActive = _leverConWasActive; } } catch { }
             // Re-enable the rider's constraint (charge rammer orb-light) so it returns to the game's control.
             try { if (_riderCon != null) { _riderCon.constraintActive = _riderConWasActive; } } catch { }
+            // Re-enable every extra handle-part rider's constraint too (the list is cleared at the next grab, mirroring _riderT).
+            if (_riders != null)
+                for (int i = 0; i < _riders.Count; i++)
+                    try { if (_riders[i].Con != null) _riders[i].Con.constraintActive = _riders[i].ConWasActive; } catch { }
             // DIAG: undo the held-stick tint.
             try { RestoreTints(); } catch { }
         }
