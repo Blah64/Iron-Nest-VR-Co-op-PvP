@@ -51,6 +51,16 @@ namespace IronNestVR
             return SwitchMotion.Default;
         }
 
+        // Whether an explicit motion has been stored for this key (vs Get returning the shared Default).
+        public static bool Has(string key) => key != null && Map.ContainsKey(key);
+
+        // Like Get, but reports whether the key actually exists (Default is a value type, so Get can't say).
+        public static bool TryGet(string key, out SwitchMotion m)
+        {
+            if (key != null && Map.TryGetValue(key, out m)) return true;
+            m = SwitchMotion.Default; return false;
+        }
+
         public static void Set(string key, SwitchMotion m) { if (!string.IsNullOrEmpty(key)) Map[key] = m; }
         public static void Remove(string key) { if (key != null) Map.Remove(key); }
 

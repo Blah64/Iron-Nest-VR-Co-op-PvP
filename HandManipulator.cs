@@ -458,11 +458,23 @@ namespace IronNestVR
             // dragged into SLIDE and barely moved (0.002 m vs 0.283 m rotating). Disambiguate ONLY the generic names by the
             // PARENT name (stable across sessions, unlike InstanceID), so each physical control owns its motion. Uniquely
             // named controls (shell rammer etc.) keep the bare name → their saved menu settings still load (no regression).
-            _switchKey = sw.name;
-            if (IsGenericControlName(_switchKey))
+            // The base game reuses the same control NAMES across physically distinct controls: every mirrored
+            // left/right cannon control shares a name ('Universal Button Move Cylinder', 'Button Dispencer (N)',
+            // shell/charge rammers — all under 'Gun System Left' vs 'Gun System Right'), and 'Universal Switch Button
+            // Variant' is BOTH the power lever AND every review-console switch. Keying the SwitchMotion by name alone
+            // made those distinct controls share ONE entry: editing one's axis in the menu changed the others, and one
+            // control's captured push direction (in ITS local frame) leaked onto its mirror, whose throw then projected
+            // too small to ever reach the activation threshold (the right cannon "grabbed but never fired"). Build a key
+            // that's UNIQUE per physical control yet STABLE across sessions: the control's name plus a few ancestor names
+            // (names don't change between runs; the side container / parent switch differs per physical control).
+            _switchKey = BuildSwitchKey(sw);
+            if (!SwitchMotions.Has(_switchKey) && TryGetLegacyMotion(sw, out var legacy))
             {
-                string par = null; try { if (sw.transform.parent != null) par = sw.transform.parent.name; } catch { }
-                if (!string.IsNullOrEmpty(par)) _switchKey = _switchKey + "@" + par;
+                // First time we've seen this per-control key: migrate any tuning saved under the OLD name-only key so a
+                // deliberately-set slide/axis isn't lost — but RESET the captured push so each physical control (incl.
+                // each mirrored side) seeds its OWN activation direction instead of inheriting a sibling's.
+                legacy.HasPush = false; legacy.PushLocal = Vector3.zero;
+                SwitchMotions.Set(_switchKey, legacy);
             }
             _selSwitchKey = _switchKey;
             int swId = 0; try { swId = sw.GetInstanceID(); } catch { swId = 0; }
@@ -1340,8 +1352,10 @@ namespace IronNestVR
             _leverArmed = false;
             _capSlideFollow = capSlideFollow;   // remember for DriveSwitch (syncs the scrub movers to the cap's travel)
 
-            // SLIDE: a captured-cap follow (tier 4) slides; else the menu Translate flag or a name hint.
-            _leverSlide = capSlideFollow || _switchMotion.Translate || NameSlideHint(pivot) || NameSlideHint(grabbed);
+            // SLIDE: a captured-cap follow (tier 4) slides; else the menu Translate flag or a name hint (the hint
+            // climbs the grabbed control's ancestors so the War Horn — grabbed node 'universal button', slide hint on
+            // its 'War Horn' parent — is detected as a slide rather than rotating).
+            _leverSlide = capSlideFollow || _switchMotion.Translate || NameSlideHint(pivot) || NameSlideHintChain(grabbed);
 
             // THROW LIMIT: both toggle and buried levers swing up to 70°, but a buried mechanism lever is ONE-DIRECTIONAL
             // (rest→press; enforced by swingLo in DriveHeldStick) while a named toggle hinge swings ±70°. Slide distance is
@@ -1424,12 +1438,31 @@ namespace IronNestVR
             try { GatherExtraRiders(grabbed, grabPoint); } catch { }
         }
 
-        // A control name shared by many unrelated controls (so its per-name SwitchMotion must be disambiguated by parent,
-        // or one control's slide/axis tuning leaks onto all the others). The whole turret reuses these two generic prefabs.
-        private static bool IsGenericControlName(string s)
+        // Unique-per-physical-control, session-stable SwitchMotion key: the control's own name plus a few ancestor
+        // names. GameObject names don't change between runs, so this is stable; the differing ancestor (the per-side
+        // 'Gun System Left/Right' container, or the distinct parent switch under '.Review Console Parent', or the
+        // 'Power Lever' the power switch hangs on) makes every physical control resolve to its own entry — so menu
+        // tuning and the captured push direction stay per control instead of bleeding across same-named siblings.
+        private static string BuildSwitchKey(LookAtTarget sw)
         {
-            if (string.IsNullOrEmpty(s)) return false;
-            return s == "Universal Button" || s == "Universal Switch Button";
+            var sb = new System.Text.StringBuilder(SafeName(sw.transform));
+            Transform t = null; try { t = sw.transform.parent; } catch { }
+            for (int i = 0; i < 3 && t != null; i++)
+            {
+                sb.Append('@').Append(SafeName(t));
+                try { t = t.parent; } catch { t = null; }
+            }
+            return sb.ToString();
+        }
+
+        // Look up tuning saved under an OLDER key scheme so it can migrate to the new per-control key: builds keyed by
+        // the bare name, or (for the two generic prefabs) by name@parent. Returns the first that exists.
+        private static bool TryGetLegacyMotion(LookAtTarget sw, out SwitchMotion m)
+        {
+            string bare = SafeName(sw.transform);
+            string par = null; try { if (sw.transform.parent != null) par = SafeName(sw.transform.parent); } catch { }
+            if (!string.IsNullOrEmpty(par) && SwitchMotions.TryGet(bare + "@" + par, out m)) return true;
+            return SwitchMotions.TryGet(bare, out m);
         }
 
         // Name hint that a control TRANSLATES rather than rotates (pulley/horn/chain). The menu Translate flag overrides.
@@ -1438,6 +1471,19 @@ namespace IronNestVR
             string s = SafeName(t); if (string.IsNullOrEmpty(s)) return false;
             s = s.ToLowerInvariant();
             return s.Contains("horn") || s.Contains("pulley") || s.Contains("chain") || s.Contains("rope") || s.Contains("cord");
+        }
+
+        // Some translate-type controls are named generically at the grab point and only an ANCESTOR carries the hint —
+        // the War Horn's grabbed switch is 'universal button' but its parents are 'War Horn'/'War Horn Parent', so the
+        // node-only NameSlideHint missed it and the horn rotated instead of sliding. Climb a few levels to catch it.
+        private static bool NameSlideHintChain(Transform t)
+        {
+            for (int i = 0; i < 5 && t != null; i++)
+            {
+                if (NameSlideHint(t)) return true;
+                try { t = t.parent; } catch { t = null; }
+            }
+            return false;
         }
 
         // If the chosen hinge carries BOTH a lever-named child AND other large meshes, drive only the LEVER child (about
@@ -2923,7 +2969,16 @@ namespace IronNestVR
         // persist on Save. _selSwitchKey survives release, so you can grab a switch, open the menu, and tune it.
 
         public bool HasSwitchSelection => _selSwitchKey != null;
-        public string SelectedSwitchName => _selSwitchKey ?? "—";
+        // The key is a name@ancestor@… path (unique per physical control); show only the leaf control name in the menu.
+        public string SelectedSwitchName
+        {
+            get
+            {
+                if (_selSwitchKey == null) return "—";
+                int at = _selSwitchKey.IndexOf('@');
+                return at > 0 ? _selSwitchKey.Substring(0, at) : _selSwitchKey;
+            }
+        }
         // "Auto" = the last grab reproduced the game's own animation, so the manual Axis/Range/Direction rows
         // below don't apply (they tune only switches with no usable animation).
         public string SwitchTypeText => !HasSwitchSelection ? "—"
