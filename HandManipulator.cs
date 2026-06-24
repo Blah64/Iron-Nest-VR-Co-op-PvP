@@ -131,9 +131,19 @@ namespace IronNestVR
         // and allow the swing BOTH ways (bidirectional), so the visible stick actually sweeps toward the hand.
         private bool _leverStickArchetype;
         // DIAG: paint the driven node red / rider green on grab so the user can confirm WHICH mesh we move. Flip off to ship.
-        private const bool TintHeldStick = true;
+        private const bool TintHeldStick = false;
         private struct TintEntry { public Renderer R; public Color C; }
         private System.Collections.Generic.List<TintEntry> _tints;
+        // FORCE-ENABLE: the punchcard handle ('BigLever') is GPU-instanced — its per-object renderers are DISABLED (the
+        // 'GPUGridInstancer_Animated' draws them), so co-moving its transform shows nothing. Enable its renderers for the
+        // grab so the real mesh draws at our co-moved pose; restore on release. Saved (Renderer, wasEnabled) pairs.
+        private struct RendEntry { public Renderer R; public bool En; }
+        private System.Collections.Generic.List<RendEntry> _forcedRends;
+        // FORCE-ACTIVATE: the punchcard handle subtree ('Locking Lever'/'BigLever') is an INACTIVE GameObject (active=False)
+        // — a renderer-enable can't show it. SetActive(true) on it (+ inactive ancestors) for the grab so the real mesh
+        // renders at our co-moved pose; restore on release. Saved (GameObject, wasActiveSelf) pairs.
+        private struct ActEntry { public GameObject GO; public bool Was; }
+        private System.Collections.Generic.List<ActEntry> _forcedActive;
         private bool _capSlideFollow;         // tier-4 charge-rammer cap: drive the cap 1:1 and sync the scrub movers to its travel
         private float _leverFollowFrac;       // 0..1 progress of the held stick's own swing/slide this frame (paces the rider + synced movers)
         // RIDER: a tip mesh that physically RIDES the swung stick but lives OUTSIDE its subtree (charge rammer's orb-light
@@ -1194,6 +1204,8 @@ namespace IronNestVR
             _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f; _leverArmed = false; _leverBuried = false; _capSlideFollow = false; _leverStickArchetype = false;
             _riderT = null; _riderParent = null; _riderCon = null; _riderTravel = 0f; _leverFollowFrac = 0f;
             if (_riders != null) _riders.Clear();   // their constraints were already re-enabled by RestoreScrubDrivers on the prior release
+            if (_forcedRends != null) _forcedRends.Clear();   // renderer-enable already restored by RestoreScrubDrivers on the prior release
+            if (_forcedActive != null) _forcedActive.Clear();   // SetActive already restored by RestoreScrubDrivers on the prior release
             if (!HeldStickFollow) return;   // structure-dump build: don't drive any node until the real stick is identified
             if (grabbed == null) return;
 
@@ -1242,13 +1254,16 @@ namespace IronNestVR
             if (pivot == null)
             {
                 pivot = FindAssemblyLever(grabbed, grabPoint);       // tier 3a: a lever-named handle in a SIBLING subtree
-                // Only drive a lever that actually RENDERS. The punchcard's 'Locking Lever' is a logical/hidden node (its
-                // subtree renders nothing — nothing turned red); driving it moved an invisible transform. Reject it so the
-                // orb-cap SLIDE path (tier 4) takes over — the user says the punchcard handle slides along its base.
+                // PUNCHCARD: the visible handle ('Locking Lever') is GPU-instanced and only renders while the game's OWN
+                // submit animation actively plays — it cannot be hand-followed (proven over passes 26-34: it ignores
+                // transform writes AND a held/disabled animator; an enabled animator gets reverted to idle by the game every
+                // frame). Per the user, leave this lever as a plain THRESHOLD TRIGGER with no custom visual movement: don't
+                // drive a held stick (leave _leverT null) so DriveSwitch fires the click when the hand pulls a set distance
+                // in the slide/push direction, exactly like the base control.
                 if (pivot != null && !HasVisibleEnabledMesh(pivot))
                 {
-                    Log.LogInfo($"[manip] held-stick follow: assembly lever '{SafeName(pivot)}' renders nothing (hidden mechanism) — skip; use the orb-cap slide.");
-                    pivot = null;
+                    Log.LogInfo($"[manip] held-stick follow: '{SafeName(grabbed)}' handle '{SafeName(pivot)}' is GPU-instanced (renders only during the game's own animation) — activate-only threshold trigger, no visual follow.");
+                    return;
                 }
                 if (pivot != null)
                 {
@@ -1407,17 +1422,6 @@ namespace IronNestVR
             // Co-move the REST of the handle cluster with the stick: the console's orb-light on the lever tip, the punchcard's
             // connector beside the orb-cap — separate constraint-driven meshes that otherwise stay put while the stick moves.
             try { GatherExtraRiders(grabbed, grabPoint); } catch { }
-
-            // DIAG TINT: paint the node we DRIVE bright red (and the orb-rider green) so the user can SEE which mesh we
-            // think is the stick. Our writes provably move these transforms with no animator override, yet the user reports
-            // "no change" — so either the tinted mesh IS the stick and moves (perception), or it ISN'T (wrong node). Restored
-            // on release. Reading/setting Renderer.material.color is IL2CPP-safe (URP Lit maps .color → _BaseColor).
-            if (TintHeldStick)
-            {
-                TintNode(_leverT, new Color(1f, 0.1f, 0.1f, 1f));
-                if (_riderT != null) TintNode(_riderT, new Color(0.1f, 1f, 0.1f, 1f));
-                if (_riders != null) for (int i = 0; i < _riders.Count; i++) TintNode(_riders[i].T, new Color(0.2f, 0.5f, 1f, 1f));   // blue = extra handle parts
-            }
         }
 
         // A control name shared by many unrelated controls (so its per-name SwitchMotion must be disambiguated by parent,
@@ -1897,7 +1901,7 @@ namespace IronNestVR
                 for (int k = 0; k < nodes.Length; k++)
                 {
                     Transform t = nodes[k].T;
-                    if (!RiderCandidate(t, grabbed)) continue;
+                    if (!RiderCandidate(t, grabbed, 0.30f)) continue;
                     bool hasCon = false; try { hasCon = t.GetComponent<UnityEngine.Animations.ParentConstraint>() != null; } catch { }
                     if (!hasCon) continue;
                     // Measure to the GRAB POINT (the handle tip the orb sits at), NOT the lever's hinge ORIGIN — the console
@@ -1908,31 +1912,85 @@ namespace IronNestVR
                 }
 
             // PASS B — GRABBED SUBTREE ONLY: a visible part TOUCHING the driven node that the game does NOT animate (absent
-            // from the capture) — the punchcard's connector stick beside the sliding orb-cap. Scoped to the grabbed control's
-            // own descendants and required to physically touch the driven node, so it can never reach an adjacent handle.
+            // from the capture) — a connector stick beside the sliding orb-cap. Scoped to the grabbed control's own
+            // descendants and required to physically touch the driven node, so it can never reach an adjacent handle.
             Transform[] kids = null; try { kids = grabbed.GetComponentsInChildren<Transform>(true); } catch { }
             if (kids != null)
                 for (int i = 0; i < kids.Length; i++)
                 {
                     Transform t = kids[i];
-                    if (!RiderCandidate(t, grabbed)) continue;
+                    if (!RiderCandidate(t, grabbed, 0.30f)) continue;
                     float toLever = NearestApproach(t, leverPos);
                     float toGrab; try { toGrab = Vector3.Distance(t.position, grabPoint); } catch { toGrab = float.MaxValue; }
                     if (toLever > 0.10f && toGrab > 0.10f) continue;      // must physically touch the driven node / grab
                     AddRider(t);
                 }
+
+        }
+
+        // Enable every renderer in t's subtree for the grab (saving prior state), so a mesh the game draws via GPU instancing
+        // (per-object renderer disabled) shows at the transform we co-move. RestoreScrubDrivers puts the enables back on release.
+        private void ForceEnableRenderers(Transform t)
+        {
+            if (t == null) return;
+            if (_forcedRends == null) _forcedRends = new System.Collections.Generic.List<RendEntry>();
+            Renderer[] rs = null; try { rs = t.GetComponentsInChildren<Renderer>(true); } catch { }
+            if (rs == null) return;
+            for (int i = 0; i < rs.Length; i++)
+            {
+                var r = rs[i]; if (r == null) continue;
+                bool en = false; try { en = r.enabled; } catch { }
+                _forcedRends.Add(new RendEntry { R = r, En = en });
+                try { r.enabled = true; } catch { }
+            }
+        }
+
+        // SetActive(true) on t's whole subtree AND every inactive ancestor up to (and including) stopRoot, so a switched-off
+        // mesh becomes active-in-hierarchy and renders at the pose we co-move. Saved → RestoreScrubDrivers switches them back
+        // on release. Logs the chain it had to turn on (reveals how deep the inactivity goes).
+        private void ForceActivate(Transform t, Transform stopRoot)
+        {
+            if (t == null) return;
+            if (_forcedActive == null) _forcedActive = new System.Collections.Generic.List<ActEntry>();
+            int turnedOn = 0;
+            Transform[] subs = null; try { subs = t.GetComponentsInChildren<Transform>(true); } catch { }
+            if (subs != null)
+                for (int i = 0; i < subs.Length; i++)
+                {
+                    var go = subs[i] == null ? null : subs[i].gameObject; if (go == null) continue;
+                    bool a = true; try { a = go.activeSelf; } catch { }
+                    if (!a) { _forcedActive.Add(new ActEntry { GO = go, Was = false }); try { go.SetActive(true); turnedOn++; } catch { } }
+                }
+            Transform p = t.parent; int guard = 0;
+            while (p != null && guard++ < 32)
+            {
+                var go = p.gameObject;
+                bool a = true; try { a = go.activeSelf; } catch { }
+                if (!a) { _forcedActive.Add(new ActEntry { GO = go, Was = false }); try { go.SetActive(true); turnedOn++; } catch { } Log.LogInfo($"[stickC] force-activate ancestor '{SafeName(p)}'"); }
+                if (p == stopRoot) break;
+                p = p.parent;
+            }
+            Log.LogInfo($"[stickC] force-activate '{SafeName(t)}' turned on {turnedOn} GameObject(s)");
+        }
+
+        // True if any renderer exists ANYWHERE in t's subtree, enabled or not — distinguishes a real mesh node from a pure
+        // logic/transform node, without requiring it to currently render (GPU-instanced handles read as not-enabled).
+        private static bool HasAnyRenderer(Transform t)
+        {
+            Renderer[] rs = null; try { rs = t == null ? null : t.GetComponentsInChildren<Renderer>(true); } catch { }
+            return rs != null && rs.Length > 0;
         }
 
         // A mesh qualifies as a co-moving handle part: not the stick/its subtree, not the grabbed control or an ancestor of
-        // it (the console body), small (an orb/cap/connector, not a panel), and actually rendering. Proximity/scope are
-        // applied by the caller per pass.
-        private bool RiderCandidate(Transform t, Transform grabbed)
+        // it (the console body), rendering, and no larger than maxExt (an orb/cap/connector or short handle, not a panel).
+        // Proximity/scope are applied by the caller per pass.
+        private bool RiderCandidate(Transform t, Transform grabbed, float maxExt)
         {
             if (t == null || t == _leverT || t == _riderT) return false;
             if (IsDescendantOf(t, _leverT)) return false;                 // under the driven stick → rides for free
             if (t == grabbed || IsDescendantOf(grabbed, t)) return false; // never an ancestor of the grab (the console body)
             if (!HasVisibleEnabledMesh(t)) return false;
-            if (NodeExtent(t) > 0.30f) return false;                      // small handle parts only
+            if (NodeExtent(t) > maxExt) return false;
             return true;
         }
 
@@ -2191,6 +2249,7 @@ namespace IronNestVR
                 }
             }
             DriveRider();   // a tip mesh outside the stick's subtree (charge rammer orb-light) rides the swing, synced
+
             // DIAG (rotate only): world travel of the grabbed point. For slide we report the clamped slide distance above
             // instead — the TransformPoint readout is inflated by any parent ride, which is what made the horn read 10 m.
             if (!_leverSlide)
@@ -2514,6 +2573,14 @@ namespace IronNestVR
             if (_riders != null)
                 for (int i = 0; i < _riders.Count; i++)
                     try { if (_riders[i].Con != null) _riders[i].Con.constraintActive = _riders[i].ConWasActive; } catch { }
+            // Put back the renderer-enable state we forced for a GPU-instanced handle (punchcard 'BigLever').
+            if (_forcedRends != null)
+                for (int i = 0; i < _forcedRends.Count; i++)
+                    try { if (_forcedRends[i].R != null) _forcedRends[i].R.enabled = _forcedRends[i].En; } catch { }
+            // Switch the handle subtree/ancestors we force-activated back OFF (reverse order: children before parents).
+            if (_forcedActive != null)
+                for (int i = _forcedActive.Count - 1; i >= 0; i--)
+                    try { if (_forcedActive[i].GO != null) _forcedActive[i].GO.SetActive(_forcedActive[i].Was); } catch { }
             // DIAG: undo the held-stick tint.
             try { RestoreTints(); } catch { }
         }
