@@ -764,6 +764,9 @@ namespace IronNestVR
 
         public static void Load()
         {
+            // Seed baked-in switch calibration FIRST, so it applies even when there's no cfg yet (fresh install); any
+            // saved "SwitchMotion=" lines below then override it with the player's own tuning.
+            SwitchMotions.SeedDefaults();
             try
             {
                 if (!File.Exists(SettingsPath)) return;

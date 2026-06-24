@@ -82,6 +82,21 @@ namespace IronNestVR
             }
         }
 
+        // Baked-in calibration (user-tuned 2026-06-24) for the review-console switches + power lever, so a fresh install
+        // or a deleted cfg still gets their correct rotation axes / ranges out of the box. Uses the same line format as
+        // the cfg and goes through Apply, so it's seeded into the Map BEFORE Config.Load reads the cfg — meaning a saved
+        // cfg line (the player's own later re-tuning) overrides these. Call once at the very start of Config.Load.
+        public static void SeedDefaults()
+        {
+            Apply("Universal Switch Button Variant@Power Lever@Power Lever Parent@Power Box|0|1 0 0|90|1|-0.02621307 -0.020732565 0.9994414|1|1");
+            Apply("Universal Switch Button@.Check Switch@.Review Console Parent@.Trigger Console Floor|0|0 0 1|90|0|0.8146251 -0.24210104 -0.52704173|1|1");
+            Apply("Universal Switch Button Variant@.Check Switch.001@.Review Console Parent@.Trigger Console Floor|0|0 0 1|90|1|-0.6298143 0.68924737 -0.35815063|1|1");
+            Apply("Universal Switch Button Variant@.Check Switch.002@.Review Console Parent@.Trigger Console Floor|0|0 0 1|90|1|0.7263866 -0.54266137 -0.4217597|1|1");
+            Apply("Universal Switch Button Variant@.Check Switch.003@.Review Console Parent@.Trigger Console Floor|0|0 0 1|90|1|0.647286 -0.6134182 -0.45248073|1|1");
+            Apply("Universal Switch Button Variant@.Check Switch.004@.Review Console Parent@.Trigger Console Floor|0|0 0 1|90|1|0 0 0|0|1");
+            Apply("Universal Button Move Cylinder@--Reloading Console@Gun System Right|0|0 1 0|90|1|-0.007311628 0.19845298 -0.9800831|1|1");
+        }
+
         // Parse one line's value (everything after "SwitchMotion=").
         public static void Apply(string value)
         {

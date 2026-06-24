@@ -742,6 +742,20 @@ namespace IronNestVR
             // The held stick follows the hand on EVERY grab (learn or scrub) — independent of the mechanism replay below.
             DriveHeldStick();
 
+            // A FOLLOWED lever also activates by how far the LEVER ITSELF actually swung/slid (its tip travel / deflection),
+            // not only by hand travel projected onto the captured push direction. That auto-seeded PushLocal can land along
+            // the hinge axis — the ONE direction the lever doesn't move — so the projection stays ~0 no matter how far you
+            // pull (the right cannon's reload lever: push captured as -Z while the lever rotates ABOUT Z, so it never
+            // reached threshold). Tip travel reflects the real deflection, so a deliberate pull fires regardless of a bad
+            // push capture. Big levers deflect far (this path fires them); tiny toggles barely deflect (so it stays dormant
+            // for them and they keep using the push projection above). Computed AFTER DriveHeldStick so it sees this frame.
+            if (_leverT != null)
+            {
+                float leverThrow = Mathf.Max(0.04f, Config.SwitchThrowDistance * 2f);
+                float byDeflect = Mathf.Clamp01(_leverTipTravel / leverThrow);
+                if (byDeflect > progress) { progress = byDeflect; _switchProgress = progress; if (progress > _scrubProgMax) _scrubProgMax = progress; }
+            }
+
             if (_scrubManual)
             {
                 // SCRUB pass: hand-drive every learned node rest→pressed by progress (animator + constraints off).
@@ -1233,13 +1247,18 @@ namespace IronNestVR
             //     '.Check Switch') — TOGGLE; the orb-cap/knob head rides it since they're under the pivot;
             //  4) a captured lever/cap outside the grabbed subtree (charge rammer) — last resort, needs a capture.
             // 2 & 3 are BURIED mechanism levers: ONE-DIRECTIONAL (rest→press), not the ±70° bidirectional toggle.
+            // Pull-chain controls (War Horn) must slide the WHOLE assembly — cover + handle + chain — as one rigid unit, so
+            // do NOT refine the high '<Name> Parent' hinge down to the buried internal lever (that left the cover/horn body
+            // behind, moving only the trigger). The high node is reset to rest on release (ClearSwitchGrab), so the whole
+            // horn returns cleanly and no per-mesh riders are needed. Gated to slide-hint controls → other levers unaffected.
+            bool slideAssembly = NameSlideHintChain(grabbed);
             Transform pivot = FindPivotNode(grabbed, grabPoint);     // tier 1: ancestor/sibling '<Name> Parent' (toggle)
-            if (pivot != null) pivot = RefinePivotToLeverChild(pivot, grabPoint);
+            if (pivot != null && !slideAssembly) pivot = RefinePivotToLeverChild(pivot, grabPoint);
             if (pivot == null)
             {
                 pivot = FindAssemblyParentHinge(grabbed, grabPoint); // tier 2: '*Parent' nested in the assembly
                 if (pivot != null && HingeGovernsForeignSwitch(pivot, grabbed)) pivot = null;
-                if (pivot != null) { pivot = RefinePivotToLeverChild(pivot, grabPoint); _leverBuried = true; }
+                if (pivot != null) { if (!slideAssembly) pivot = RefinePivotToLeverChild(pivot, grabPoint); _leverBuried = true; }
             }
             if (pivot == null)
             {
@@ -1435,6 +1454,7 @@ namespace IronNestVR
 
             // Co-move the REST of the handle cluster with the stick: the console's orb-light on the lever tip, the punchcard's
             // connector beside the orb-cap — separate constraint-driven meshes that otherwise stay put while the stick moves.
+            // (The War Horn doesn't need this: its slide drives the whole assembly node, so the cover/handle/chain all ride it.)
             try { GatherExtraRiders(grabbed, grabPoint); } catch { }
         }
 
