@@ -67,6 +67,12 @@ namespace IronNestVR
         private float _switchProgress;
         private string _switchKey;
         private string _selSwitchKey;
+        // Scrub-cache key. DISTINCT from _switchKey: many physical controls share a display name ('Universal Button' is
+        // used by every floor hatch AND the requisition-console submit/raise levers), so keying the learn cache by name
+        // alone cross-contaminates them — grabbing the console lever found the HATCH's cached drivers and never learned its
+        // own geometry. We append the control's instance id so each physical control caches independently, while _switchKey
+        // stays the bare name for SwitchMotions persistence + the menu (which ARE meant to share across same-named controls).
+        private string _scrubKey;
 
         // SCRUB the game's OWN animation with the hand: we can't pre-read the authored pose (manual Animator.Update
         // writes nothing in this build), but the engine's normal animation phase DOES apply a Played state — so we
@@ -114,6 +120,33 @@ namespace IronNestVR
         private Vector3 _leverArmParentDir;  // pivot→grabPoint direction in PARENT-local space (rebuilt to world each frame)
         private Vector3 _leverGrabLocal;     // the grab point in STICK-local space (a fixed point on the stick we aim at the hand)
         private float _leverMaxAngle;        // clamp the swing so the stick can't fold through itself
+        // BURIED mechanism lever (driven by a captured lever-mover or the grabbed node itself, not a named ancestor hinge):
+        // one-directional from rest (no bidirectional toggle) and clamped to its real captured throw, so it can't be pushed
+        // the wrong way or past its stop the way the unbounded ±70° toggle hinges can.
+        private bool _leverBuried;
+        // ORB-STICK ARCHETYPE (punchcard 'Locking Lever', charge rammer 'BigLever.001'): the lever the user holds by an
+        // orb-cap, found by tier 3a/4. These have NO captured clip motion (the game drives them natively), so the hinge
+        // axis can't come from a capture — the cross-product inference snapped to the lever's LONG axis and merely TWISTED
+        // the rod in place (only the offset orb appeared to move). For these we lock a STABLE axis perpendicular to the rod
+        // and allow the swing BOTH ways (bidirectional), so the visible stick actually sweeps toward the hand.
+        private bool _leverStickArchetype;
+        // DIAG: paint the driven node red / rider green on grab so the user can confirm WHICH mesh we move. Flip off to ship.
+        private const bool TintHeldStick = true;
+        private struct TintEntry { public Renderer R; public Color C; }
+        private System.Collections.Generic.List<TintEntry> _tints;
+        private bool _capSlideFollow;         // tier-4 charge-rammer cap: drive the cap 1:1 and sync the scrub movers to its travel
+        private float _leverFollowFrac;       // 0..1 progress of the held stick's own swing/slide this frame (paces the rider + synced movers)
+        // RIDER: a tip mesh that physically RIDES the swung stick but lives OUTSIDE its subtree (charge rammer's orb-light
+        // 'Cylinder.001' is under the grabbed button, not under '.PowderRamLever'), so it won't move when we rotate the
+        // stick. We RIGIDLY CO-MOVE it with the stick's exact transform delta this frame (rotate about the hinge / slide),
+        // so it stays glued to the stick tip — driving it by its own captured travel made it decouple and fly off.
+        private Transform _riderT, _riderParent;
+        private Vector3 _riderRestLocal, _riderSlideAxisW; private float _riderTravel;
+        private Vector3 _riderRestPosW; private Quaternion _riderRestRotW;   // orb world pose at grab — co-moved with the stick delta
+        private UnityEngine.Animations.ParentConstraint _riderCon; private bool _riderConWasActive;
+        // The stick's transform delta THIS frame, world space, for DriveRider to apply to the rider: a rotation _leverSwingDqW
+        // about _leverPivotW (rotate path), or a translation _leverSlideDeltaW (slide path).
+        private Vector3 _leverPivotW; private Quaternion _leverSwingDqW = Quaternion.identity; private Vector3 _leverSlideDeltaW;
         private UnityEngine.Animations.ParentConstraint _leverCon; // a constraint pinning the stick (disabled while held), if any
         private bool _leverConWasActive;
         private Vector3 _leverTip0W;          // grab-point world position at grab (for the visible-travel readout)
@@ -122,6 +155,7 @@ namespace IronNestVR
         // per-control Translate flag (VR menu, persisted), auto-defaulted from a name hint. Slide axis locks after the
         // first real shove (like PushLocal) so the handle slides along one line instead of drifting in 3D.
         private bool _leverSlide;
+        private float _leverSlideMax;        // max slide distance (m): captured throw for a captured mover, else menu/auto
         private Vector3 _leverSlideAxisW; private bool _leverHasSlideAxis;
         // ROTATE: lock the swing PLANE from the first real movement so the lever swings about one fixed hinge axis,
         // instead of a free point-at-hand that tilts about the wrong axis when the hand drifts sideways.
@@ -263,6 +297,22 @@ namespace IronNestVR
             }
         }
 
+        // Re-assert the held STICK's pose in LateUpdate — AFTER the game's own Update/animator/interaction scripts have run
+        // this frame — so the end-of-frame eye render sees OUR swing, not the game's. The held-prop holders do the same via
+        // GrabManager.LateApply. This is why a confirmed-correct lever node ('.Hatch lever.002') moved in our Update log yet
+        // showed "no change": the game re-poses the very nodes it animates (the lever meshes) after our Update. The working
+        // '*Parent'-hinge controls don't need it (the game doesn't touch the parent), but re-applying their identical pose
+        // here is harmless. Runs only while actively holding a click-switch lever; _handPos is this frame's cached grab.
+        public void LateApply()
+        {
+            try
+            {
+                if (_kind != Kind.Switch || _switch == null || _leverT == null) return;
+                DriveHeldStick();
+            }
+            catch (Exception e) { Log.LogWarning("[manip] LateApply " + e.Message); }
+        }
+
         // ---------------- per-hand input helpers ----------------
 
         private static bool HandGrab(int hand, VrInput input) => hand == 2 ? input.GrabR : input.GrabL;
@@ -302,10 +352,22 @@ namespace IronNestVR
 
             // Click switch/button (LookAtTarget). Skip manuals (PickUpZoomTarget) — those are reposition
             // grabs owned by GrabManager, and their LookAtTarget click is the read-zoom we don't want here.
-            if (Config.SwitchGrabEnabled && FindUp<PickUpZoomTarget>(t) == null)
+            if (Config.SwitchGrabEnabled)
             {
-                var sw = FindUp<LookAtTarget>(t);
-                if (sw != null) EngageSwitch(hand, sw, hit.point, input, origin, hands);
+                var pz = FindUp<PickUpZoomTarget>(t);
+                if (pz != null)
+                {
+                    // DIAG: a control we hand off to GrabManager — these never enter the follow system, which is why the
+                    // punchcard submit / raise-review-console lever don't track (the game repositions them). Log so we can
+                    // confirm which deferred controls are PickUpZoomTarget manuals (the follow can't drive them as-is).
+                    var lat0 = FindUp<LookAtTarget>(t);
+                    Log.LogInfo($"[manip] grip over manual '{SafeName(pz.transform)}' (PickUpZoomTarget — GrabManager owns it, follow skipped; LAT={(lat0 != null ? SafeName(lat0.transform) : "—")}).");
+                }
+                else
+                {
+                    var sw = FindUp<LookAtTarget>(t);
+                    if (sw != null) EngageSwitch(hand, sw, hit.point, input, origin, hands);
+                }
             }
         }
 
@@ -374,8 +436,21 @@ namespace IronNestVR
             // follows the controller through the throw, and crossing the threshold fires the REAL click — the game
             // then plays the control's OWN authored depress/flip. We keep the SwitchMotion only for the activation
             // push DIRECTION (auto-seeded from the first shove) and remember the switch for the menu.
+            // The GENERIC control names ('Universal Button', 'Universal Switch Button') are reused by DOZENS of unrelated
+            // controls (every floor hatch, the punchcard, the raise console…). SwitchMotion is persisted BY NAME, so a slide
+            // seeded on one generic 'Universal Button' poisoned ALL of them — the raise-console lever (correct node) got
+            // dragged into SLIDE and barely moved (0.002 m vs 0.283 m rotating). Disambiguate ONLY the generic names by the
+            // PARENT name (stable across sessions, unlike InstanceID), so each physical control owns its motion. Uniquely
+            // named controls (shell rammer etc.) keep the bare name → their saved menu settings still load (no regression).
             _switchKey = sw.name;
-            _selSwitchKey = sw.name;
+            if (IsGenericControlName(_switchKey))
+            {
+                string par = null; try { if (sw.transform.parent != null) par = sw.transform.parent.name; } catch { }
+                if (!string.IsNullOrEmpty(par)) _switchKey = _switchKey + "@" + par;
+            }
+            _selSwitchKey = _switchKey;
+            int swId = 0; try { swId = sw.GetInstanceID(); } catch { swId = 0; }
+            _scrubKey = _switchKey + "#" + swId;   // per-instance so same-named controls don't share a learn cache
             _switchMotion = SwitchMotions.Get(_switchKey);
             _switchProgress = 0f;
             _switchMovers = null;   // no mesh driving — ApplySwitchPose is a no-op while the mover set is null
@@ -403,7 +478,7 @@ namespace IronNestVR
             // constraint instead of being flung around on their own. Never reads constraint sources (that API crashes here).
             if (_switchAnimator != null)
             {
-                if (_scrubCache.TryGetValue(_switchKey, out var nodes) && nodes != null && nodes.Length > 0)
+                if (_scrubCache.TryGetValue(_scrubKey, out var nodes) && nodes != null && nodes.Length > 0)
                 {
                     // SCRUB pass: drive the DRIVERS (no follow-constraint) hand-paced; LEAVE followers (constrained) alone
                     // so they ride their driver. Disable only the drivers' animators so our writes hold.
@@ -501,6 +576,18 @@ namespace IronNestVR
             // Runs on EVERY grab (learn or scrub) — it needs only the grab geometry, not the captured mechanism, so the
             // stick follows on the very first grab. The captured movers (hatch/cylinders) replay separately on scrubs.
             SelectHeldStick(sw.transform, hitPoint);
+
+            // PLAIN-CLICK FALLBACK: if no genuine in-hand stick was resolved (tiers 1-4 all declined) but we set up a SCRUB
+            // of captured movers, those movers are the REMOTE mechanism this control actuates — the review console raises
+            // its own hatch/ceiling machinery; the charge rammer drives a deep ram rod. Hand-pacing them swings a big far
+            // object around the cockpit, which reads as "the wrong thing follows my hand." Worse than the game's own click
+            // animation. So restore the animators we disabled and drop the scrub → the control fires a clean click instead.
+            if (_leverT == null && _scrubManual)
+            {
+                Log.LogInfo($"[manip] held-stick follow: '{sw.name}' has no in-hand stick — restoring animators, plain click (no remote-mechanism follow).");
+                try { RestoreScrubDrivers(); } catch { }
+                _activeMovers = null; _scrubManual = false; _scrubAnimators = null;
+            }
 
             GetWorld(origin, HandGripPose(hand, input), out Vector3 gp, out Quaternion gr);
             _switchGrabGripPos = gp;     // controller anchor — throw is measured from here
@@ -619,7 +706,7 @@ namespace IronNestVR
             // Followed levers are bidirectional toggles: pulling EITHER way from rest counts, so a control left in its
             // 'on' state can be pulled back the other way to turn it off (and vice-versa). PushLocal is locked to the
             // first-ever direction, so without abs the return pull reads as negative progress and never arms.
-            if (_leverT != null) along = Mathf.Abs(along);
+            if (_leverT != null && !_leverBuried) along = Mathf.Abs(along);   // buried mechanism levers are one-way, not toggles
             float progress = Mathf.Clamp(along / Mathf.Max(0.01f, Config.SwitchThrowDistance), 0f, 1f);
             _switchProgress = progress;
             if (progress > _scrubProgMax) _scrubProgMax = progress;
@@ -636,8 +723,11 @@ namespace IronNestVR
                     {
                         var m = _activeMovers[k];
                         if (m.T == null) continue;
-                        // The held stick is driven separately (point-at-hand) — never also replay it as a mechanism mover.
-                        if (_leverT != null && m.T == _leverT) continue;
+                        // The held stick (and everything rigidly under it) is driven separately (point-at-hand) — never also
+                        // replay it as a mechanism mover, or the scrub loop's local-pose writes fight the hand-drive and the
+                        // lever "tracks once then stops" on the 2nd grab. Only movers OUTSIDE the lever subtree (drums,
+                        // needles, gears that animate on their own) are scrub-driven.
+                        if (_leverT != null && (m.T == _leverT || IsDescendantOf(m.T, _leverT))) continue;
                         // DIAG: how far did the node drift from what we wrote last frame? ~0 = our write holds (so if the
                         // visual still doesn't move, we've got the wrong node); large = something re-poses it after Update.
                         if (m.WroteOnce)
@@ -647,7 +737,12 @@ namespace IronNestVR
                         }
                         // DEBUG OSCILLATE: ignore the throw and cycle the FULL rest↔press range on a slow timer while held,
                         // so we can see — independent of push speed / activation — whether these writes render at all.
-                        float drive = ScrubDebugOscillate ? Mathf.PingPong(Time.time * 0.6f, 1f) : progress;
+                        // CAP-FOLLOW (charge rammer): the in-hand cap is slid 1:1 by DriveHeldStick; pace these movers (the
+                        // ram arm/gears) by the cap's OWN travel fraction so they stay attached to it, not by the throw
+                        // progress (which is 10×+ faster and would race the arm ahead of the hand-held cap).
+                        float drive = ScrubDebugOscillate ? Mathf.PingPong(Time.time * 0.6f, 1f)
+                                    : _capSlideFollow ? Mathf.Clamp01(_leverTipTravel / Mathf.Max(_leverSlideMax, 1e-3f))
+                                    : progress;
                         Vector3 fromP = ScrubDebugOscillate ? m.RestPos : m.StartLocal;
                         Quaternion fromR = ScrubDebugOscillate ? m.RestRot : m.StartLocalR;
                         Vector3 toP = ScrubDebugOscillate ? m.PressPos : m.TgtPos;
@@ -925,7 +1020,11 @@ namespace IronNestVR
                     string mode = _leverSlide
                         ? $"SLIDE axis=({_leverSlideAxisW.x:0.00},{_leverSlideAxisW.y:0.00},{_leverSlideAxisW.z:0.00}) locked={_leverHasSlideAxis}"
                         : $"ROTATE axis=({_leverRotAxisW.x:0.00},{_leverRotAxisW.y:0.00},{_leverRotAxisW.z:0.00}) locked={_leverHasRotAxis}";
-                    Log.LogInfo($"[manip] held-stick result '{_switchKey}': hinge '{SafeName(_leverT)}' {mode} grab-point moved {_leverTipTravel:0.000} m.");
+                    // DIAG: any animator STILL enabled in the lever subtree re-poses the lever AFTER our write each frame —
+                    // that would make "grab-point moved" report motion the user never sees (write applied, then overwritten).
+                    int liveAnim = 0;
+                    try { var aa = _leverT.GetComponentsInChildren<Animator>(true); if (aa != null) for (int i = 0; i < aa.Length; i++) if (aa[i] != null && aa[i].enabled) liveAnim++; } catch { }
+                    Log.LogInfo($"[manip] held-stick result '{_switchKey}': hinge '{SafeName(_leverT)}' {mode} grab-point moved {_leverTipTravel:0.000} m. live-anim={liveAnim} arch={_leverStickArchetype}");
                 }
 
                 RestoreScrubDrivers();
@@ -945,16 +1044,16 @@ namespace IronNestVR
                 // LEARN: if the click fired, the animation is still playing — keep the rig snapshot alive and sample a
                 // TAIL after release (in Tick) so the FULL animation is captured regardless of how fast you let go. The
                 // cache is built when the tail completes. If the click never fired, there's nothing to capture.
-                if (!_scrubManual && _scrubTs != null && _learnTriggered && _switchKey != null)
+                if (!_scrubManual && _scrubTs != null && _learnTriggered && _scrubKey != null)
                 {
-                    _learnTail = true; _learnTailKey = _switchKey; _learnTailUntil = Time.time + LearnTailSeconds;
+                    _learnTail = true; _learnTailKey = _scrubKey; _learnTailUntil = Time.time + LearnTailSeconds;
                 }
             }
             catch { }
             _switch = null; _switchInteractable = null; _switchLatched = false;
             _switchScrubDone = false; _scrubManual = false; _activeMovers = null; _scrubAnimators = null;
             _leverT = null; _leverParent = null; _leverCon = null;
-            _switchRef = null; _switchMovers = null; _switchAnimator = null; _switchKey = null; _switchProgress = 0f;
+            _switchRef = null; _switchMovers = null; _switchAnimator = null; _switchKey = null; _scrubKey = null; _switchProgress = 0f;
             // Keep the learn arrays alive ONLY while a tail capture is pending; otherwise drop everything.
             if (!_learnTail)
             {
@@ -974,8 +1073,12 @@ namespace IronNestVR
         private void DumpStickCandidates(Transform grabbed, Vector3 grabPoint)
         {
             if (grabbed == null) return;
-            string key = SafeName(grabbed);
-            if (key == null || _stickDumped.Contains(key)) return;
+            // Key the once-per-control gate by INSTANCE, not bare name — many controls share 'Universal Button', and a
+            // name-only gate meant only the FIRST instance ever dumped its geometry (the punchcard/raise-console levers,
+            // grabbed after a floor hatch, were silently skipped). Per-instance → each physical control dumps once.
+            int gid = 0; try { gid = grabbed.GetInstanceID(); } catch { }
+            string key = SafeName(grabbed) + "#" + gid;
+            if (_stickDumped.Contains(key)) return;
             _stickDumped.Add(key);
             try
             {
@@ -1082,27 +1185,115 @@ namespace IronNestVR
         // the held stick, so we never pick from them. Seeded from the grab point; null => no synthetic swing this grab.
         private void SelectHeldStick(Transform grabbed, Vector3 grabPoint)
         {
-            _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f; _leverArmed = false;
+            _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f; _leverArmed = false; _leverBuried = false; _capSlideFollow = false; _leverStickArchetype = false;
+            _riderT = null; _riderParent = null; _riderCon = null; _riderTravel = 0f; _leverFollowFrac = 0f;
             if (!HeldStickFollow) return;   // structure-dump build: don't drive any node until the real stick is identified
             if (grabbed == null) return;
 
-            // The rig hinges every lever on a '<Name> Parent' empty (War Horn Parent / Power Lever Parent /
-            // .Hatch Lever Barbet Parent.001). Find the one nearest the grab — ancestors up to the assembly, then the
-            // grabbed node's siblings — and rotate THAT so its child stick swings about the correct hinge.
-            Transform pivot = FindPivotNode(grabbed, grabPoint);
-            // GRABBED-NODE FALLBACK: some controls have no carrying '*Parent' hinge — their visible handle IS the grabbed
-            // button itself, a long node whose OWN origin is the hinge and whose cap sits well out at the tip (the game's
-            // own animator swings the whole button — its cap travels 0.6-1.2 m). Covers reload cylinder, charge rammer,
-            // dispensers, punchcard submit. Driving a separate internal mechanism ('.RotateLever', gears, number drums)
-            // moved parts the player never sees; driving the grabbed node about its origin swings the handle they hold.
+            // Resolve the node to drive, best first. The choice is PURELY GEOMETRIC (no learn-capture dependency) so
+            // the SAME node is driven on grab #1 and every grab after — the earlier "tracks once, then stops" bug came
+            // from grab #2+ switching to a captured mover that the scrub loop then fought.
+            //  1) a named '<Name> Parent' hinge on an ancestor/sibling (hatch, power lever, war horn, arming) — TOGGLE;
+            //  2) a named '*Parent' hinge nested in the assembly (reload '.RotateLeverParent', shell '.ShellRamLeverParent',
+            //     Calculate '.Calculate Lever Parent', coffee) — buried;
+            //  3) a named '*Lever' DESCENDANT the game animates when there's no '*Parent' (dispenser '.ChargeLever',
+            //     charge rammer '.PowderRamLever') — drives ONLY the lever, not the lights/drums/gears under the button;
+            //  3b) the grabbed control's own small per-control PARENT when it isn't named '*Parent' (review-console toggle
+            //     '.Check Switch') — TOGGLE; the orb-cap/knob head rides it since they're under the pivot;
+            //  4) a captured lever/cap outside the grabbed subtree (charge rammer) — last resort, needs a capture.
+            // 2 & 3 are BURIED mechanism levers: ONE-DIRECTIONAL (rest→press), not the ±70° bidirectional toggle.
+            Transform pivot = FindPivotNode(grabbed, grabPoint);     // tier 1: ancestor/sibling '<Name> Parent' (toggle)
+            if (pivot != null) pivot = RefinePivotToLeverChild(pivot, grabPoint);
             if (pivot == null)
             {
-                float gExt = NodeExtent(grabbed);
-                float gArm = 0f; try { gArm = Vector3.Distance(grabPoint, grabbed.position); } catch { }
-                if (gExt >= 0.15f && gArm >= 0.10f)
+                pivot = FindAssemblyParentHinge(grabbed, grabPoint); // tier 2: '*Parent' nested in the assembly
+                if (pivot != null && HingeGovernsForeignSwitch(pivot, grabbed)) pivot = null;
+                if (pivot != null) { pivot = RefinePivotToLeverChild(pivot, grabPoint); _leverBuried = true; }
+            }
+            if (pivot == null)
+            {
+                pivot = FindLeverDescendant(grabbed, grabPoint);     // tier 3: a '*Lever' the game animates (no '*Parent')
+                if (pivot != null) _leverBuried = true;
+            }
+            if (pivot == null)
+            {
+                // tier 3a-pre: a CAPTURED rotation lever the game itself animates (charge rammer '.PowderRamLever') — the
+                // TRUE stick. PREFERRED over the name match below, which grabs the nearest lever-NAMED node by origin: for
+                // the charge rammer that's 'BigLever.001' whose only child is a Bézier WIRING curve, not the rod (the user
+                // saw "wiring move, not the stick"). The captured lever is the node the game's own clip swings, tip orb
+                // rides it. Needs a capture → engages from the 2nd grab; the 1st (learn) grab falls through to the match.
+                Transform capHinge = FindCapturedLeverHinge(grabbed, grabPoint);
+                if (capHinge != null)
                 {
-                    pivot = grabbed;
-                    Log.LogInfo($"[manip] held-stick follow: driving grabbed node '{SafeName(grabbed)}' as its own lever (ext={gExt:0.00}m, arm={gArm:0.00}m).");
+                    pivot = capHinge; _leverBuried = true;
+                    Vector3 rAxisW0; float rTravel0;
+                    Transform rider0 = FindCapturedCapMover(grabbed, out rAxisW0, out rTravel0);
+                    if (rider0 != null && rider0 != pivot && !IsDescendantOf(rider0, pivot))
+                        SetRider(rider0, rAxisW0, rTravel0);
+                }
+            }
+            if (pivot == null)
+            {
+                pivot = FindAssemblyLever(grabbed, grabPoint);       // tier 3a: a lever-named handle in a SIBLING subtree
+                // Only drive a lever that actually RENDERS. The punchcard's 'Locking Lever' is a logical/hidden node (its
+                // subtree renders nothing — nothing turned red); driving it moved an invisible transform. Reject it so the
+                // orb-cap SLIDE path (tier 4) takes over — the user says the punchcard handle slides along its base.
+                if (pivot != null && !HasVisibleEnabledMesh(pivot))
+                {
+                    Log.LogInfo($"[manip] held-stick follow: assembly lever '{SafeName(pivot)}' renders nothing (hidden mechanism) — skip; use the orb-cap slide.");
+                    pivot = null;
+                }
+                if (pivot != null)
+                {
+                    _leverBuried = true; _leverStickArchetype = true;
+                    // The user actually GRABS the orb-cap ('Cylinder.001'), a constraint-driven mesh child of the button
+                    // that sits at the lever tip — NOT under the lever's subtree, so swinging the lever alone leaves the
+                    // held orb dead in the air ("nothing tracks"). Glue it to the swing as a rigid rider. Found geometrically
+                    // (no capture needed → works on the 1st grab). The Barbet/hatch levers don't need this — their orb rides
+                    // the lever via the game's own constraint because we drive the very lever it's pinned to.
+                    Transform orb = FindOrbCapGeometric(grabbed, pivot, grabPoint);
+                    if (orb != null) SetRider(orb, Vector3.zero, 0f);
+                }
+            }
+            if (pivot == null)
+            {
+                pivot = FindParentHinge(grabbed, grabPoint);         // tier 3b: a small per-control parent not named '*Parent' (toggle)
+            }
+            bool capSlideFollow = false;
+            Vector3 capSlideAxisW = Vector3.zero; float capSlideTravel = 0f;
+            if (pivot == null)
+            {
+                // tier 4: no '*Parent' hinge and no lever-named child IN the grabbed subtree. Use the captured motion:
+                //  4a) a captured LEVER-named ROTATION mover whose arm reaches the grab — the STICK to swing (charge rammer
+                //      '.PowderRamLever', a SIBLING whose hinge is ~1.2 m off but whose arm reaches your hand; the tip
+                //      orb-light rides it). Rotate-follow it like reload — swings the whole stick, not just the tip light.
+                //  4b) else the captured mesh that TRAVELS the most (a tip with no lever hinge) — slide-follow it 1:1.
+                // Needs the capture, so it engages from the 2nd grab; the 1st learn grab can't follow (logged).
+                Transform hinge = FindCapturedLeverHinge(grabbed, grabPoint);
+                if (hinge != null)
+                {
+                    pivot = hinge; _leverBuried = true;
+                    // The tip orb-light is a captured mover under the grabbed BUTTON (not under the stick), so swinging the
+                    // stick won't move it. Set it up as a RIDER: capture its world pose now and RIGIDLY co-move it with the
+                    // stick's exact transform delta each frame (DriveRider) so it stays glued to the swinging tip.
+                    Vector3 rAxisW; float rTravel;
+                    Transform rider = FindCapturedCapMover(grabbed, out rAxisW, out rTravel);
+                    if (rider != null && rider != pivot && !IsDescendantOf(rider, pivot))
+                        SetRider(rider, rAxisW, rTravel);
+                }
+                else
+                {
+                    Transform cap = FindCapturedCapMover(grabbed, out capSlideAxisW, out capSlideTravel);
+                    if (cap == null)
+                    {
+                        // No capture yet (or the handle isn't a captured mover): the orb-cap IS the visible handle (punchcard
+                        // slides it along its base). Find it geometrically so it follows on the FIRST grab — slide axis then
+                        // auto-infers from the hand's pull (snapped to the cap's local cardinal).
+                        cap = FindOrbCapGeometric(grabbed, null, grabPoint);
+                        if (cap != null) Log.LogInfo($"[manip] held-stick follow: orb-cap '{SafeName(cap)}' slide-follow (geometric, no capture).");
+                    }
+                    if (cap != null) { pivot = cap; _leverBuried = true; capSlideFollow = true; }
+                    else Log.LogInfo($"[manip] held-stick follow: '{SafeName(grabbed)}' has no hinge/lever and no capture yet (learn grab) — grab again to follow.");
                 }
             }
             if (pivot == null)
@@ -1121,27 +1312,67 @@ namespace IronNestVR
             Vector3 armW = grabPoint - pivot.position;
             _leverArmParentDir = _leverParent != null ? _leverParent.InverseTransformDirection(armW) : armW;
             try { _leverGrabLocal = pivot.InverseTransformPoint(grabPoint); } catch { _leverGrabLocal = Vector3.zero; }
-            _leverMaxAngle = 70f;
             _leverTip0W = grabPoint; _leverTipTravel = 0f;
-            // SLIDE if the control is set to (menu) or its name hints a pulley/horn/chain; otherwise ROTATE about the hinge.
-            _leverSlide = _switchMotion.Translate || NameSlideHint(pivot) || NameSlideHint(grabbed);
             _leverHasSlideAxis = false; _leverSlideAxisW = Vector3.zero;
             _leverHasRotAxis = false; _leverRotAxisW = Vector3.zero;
             _leverArmed = false;
+            _capSlideFollow = capSlideFollow;   // remember for DriveSwitch (syncs the scrub movers to the cap's travel)
 
-            // MANUAL AXIS OVERRIDE (VR menu): if the player has dialled in an axis for this control, lock it NOW from the
-            // hinge's rest frame instead of inferring it from the first hand shove. The menu cycles SwitchMotion.Axis
-            // through the hinge's ±X/±Y/±Z; left unset, the auto-inference at drive time still runs.
+            // SLIDE: a captured-cap follow (tier 4) slides; else the menu Translate flag or a name hint.
+            _leverSlide = capSlideFollow || _switchMotion.Translate || NameSlideHint(pivot) || NameSlideHint(grabbed);
+
+            // THROW LIMIT: both toggle and buried levers swing up to 70°, but a buried mechanism lever is ONE-DIRECTIONAL
+            // (rest→press; enforced by swingLo in DriveHeldStick) while a named toggle hinge swings ±70°. Slide distance is
+            // the captured travel for a cap-follow, the menu Range for a translate control, else a default.
+            _leverMaxAngle = 70f;
+            // Cap-slide throw = the captured travel; but a GEOMETRIC orb-cap (no capture, capSlideTravel==0) needs a sane
+            // default (~0.3 m) so the punchcard handle can slide its full track instead of clamping to 5 cm.
+            _leverSlideMax = capSlideFollow ? Mathf.Clamp(capSlideTravel > 0.01f ? capSlideTravel : 0.30f, 0.05f, 1.5f)
+                           : (_switchMotion.Translate ? Mathf.Clamp(_switchMotion.Range, 0.03f, 0.4f) : 0.18f);
+
+            // AXIS priority: (1) manual menu override; (2) the captured cap's real travel direction; (3) a buried
+            // rotate-lever's FIXED axis from the game's captured motion (always the same way, not whichever way the
+            // controller first moved); (4) auto-infer.
+            Vector3 lockAxisLocal = Vector3.zero; Quaternion axisFrame = Quaternion.identity; bool haveLock = false;
             if (_switchMotion.ManualAxis)
             {
-                Quaternion frame = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
-                Vector3 axW = frame * _switchMotion.Axis;
-                if (_switchMotion.Flip) axW = -axW;
+                lockAxisLocal = _switchMotion.Axis; if (_switchMotion.Flip) lockAxisLocal = -lockAxisLocal;
+                axisFrame = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
+                haveLock = true;
+            }
+            if (haveLock)
+            {
+                Vector3 axW = (axisFrame * lockAxisLocal).normalized;
                 if (axW.sqrMagnitude > 1e-8f)
                 {
-                    axW = axW.normalized;
                     if (_leverSlide) { _leverSlideAxisW = axW; _leverHasSlideAxis = true; }
                     else { _leverRotAxisW = axW; _leverHasRotAxis = true; }
+                }
+            }
+            else if (capSlideFollow && capSlideAxisW.sqrMagnitude > 1e-8f)
+            {
+                _leverSlideAxisW = capSlideAxisW.normalized; _leverHasSlideAxis = true;
+            }
+            else if (_leverBuried && !_leverSlide && TryCapturedHingeAxisWorld(out Vector3 capAxW))
+            {
+                // FIXED direction from the game's own rest→press of the lever child (reload '.RotateLever' etc.). Pulling
+                // the wrong way then reads as negative swing → clamped to 0 (DriveHeldStick), so the lever simply won't
+                // move the wrong way. Needs a capture (present from the 2nd grab on); the 1st learn grab auto-infers.
+                _leverRotAxisW = capAxW; _leverHasRotAxis = true;
+                Log.LogInfo($"[manip] held-stick follow: fixed hinge axis from capture ({capAxW.x:0.00},{capAxW.y:0.00},{capAxW.z:0.00}).");
+            }
+
+            // ORB-STICK with no captured/manual axis (punchcard, charge rammer): lock a STABLE axis PERPENDICULAR to the rod
+            // so the stick sweeps toward the hand instead of the cross-product inference snapping to the rod's LONG axis and
+            // just twisting it (which moved only the offset orb). Bidirectional swing (see _leverStickArchetype in DriveHeldStick)
+            // means the sign doesn't matter — pull either way and the visible stick follows.
+            if (_leverStickArchetype && !_leverHasRotAxis && !_leverHasSlideAxis && !_leverSlide)
+            {
+                Vector3 ax = StableHingeAxisW(pivot, grabPoint);
+                if (ax.sqrMagnitude > 1e-8f)
+                {
+                    _leverRotAxisW = ax; _leverHasRotAxis = true;
+                    Log.LogInfo($"[manip] held-stick follow: stable perpendicular hinge axis ({ax.x:0.00},{ax.y:0.00},{ax.z:0.00}) for orb-stick '{SafeName(pivot)}'.");
                 }
             }
 
@@ -1165,6 +1396,24 @@ namespace IronNestVR
             }
             catch { }
             Log.LogInfo($"[manip] held-stick follow: {(_leverSlide ? "sliding" : "swinging")} hinge '{SafeName(pivot)}' (arm={arm:0.000}m, con={_leverCon != null}).{kidNames}");
+
+            // DIAG TINT: paint the node we DRIVE bright red (and the orb-rider green) so the user can SEE which mesh we
+            // think is the stick. Our writes provably move these transforms with no animator override, yet the user reports
+            // "no change" — so either the tinted mesh IS the stick and moves (perception), or it ISN'T (wrong node). Restored
+            // on release. Reading/setting Renderer.material.color is IL2CPP-safe (URP Lit maps .color → _BaseColor).
+            if (TintHeldStick)
+            {
+                TintNode(_leverT, new Color(1f, 0.1f, 0.1f, 1f));
+                if (_riderT != null) TintNode(_riderT, new Color(0.1f, 1f, 0.1f, 1f));
+            }
+        }
+
+        // A control name shared by many unrelated controls (so its per-name SwitchMotion must be disambiguated by parent,
+        // or one control's slide/axis tuning leaks onto all the others). The whole turret reuses these two generic prefabs.
+        private static bool IsGenericControlName(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            return s == "Universal Button" || s == "Universal Switch Button";
         }
 
         // Name hint that a control TRANSLATES rather than rotates (pulley/horn/chain). The menu Translate flag overrides.
@@ -1173,6 +1422,71 @@ namespace IronNestVR
             string s = SafeName(t); if (string.IsNullOrEmpty(s)) return false;
             s = s.ToLowerInvariant();
             return s.Contains("horn") || s.Contains("pulley") || s.Contains("chain") || s.Contains("rope") || s.Contains("cord");
+        }
+
+        // If the chosen hinge carries BOTH a lever-named child AND other large meshes, drive only the LEVER child (about
+        // that same hinge) so the siblings stay put. The trigger floor-hatch hinge '.Hatch Trigger Parent.001' carries the
+        // hatch DOORS ('.Hatch 1.002', '.Hatch 2.001') alongside the lever '.Hatch lever.002'; rotating the hinge swung the
+        // doors with the hand ("moves the hatch instead of the stick"). Only refines when there's a FOREIGN visible-mesh
+        // child to protect — a hinge whose only mesh IS the lever (Barbet hatch, power, arming) is returned unchanged, so
+        // those keep their exact current behavior. The lever child rotates about its own origin (the real lever hinge).
+        private Transform RefinePivotToLeverChild(Transform pivot, Vector3 grabPoint)
+        {
+            if (pivot == null) return pivot;
+            int cc = 0; try { cc = pivot.childCount; } catch { return pivot; }
+            // FOREIGN-MESH gate stays on DIRECT children only: a hinge that holds nothing but its lever (Barbet hatch,
+            // power, arming) has no foreign direct child, so this never fires for them — zero regression. The trigger
+            // floor-hatch hinge '.Hatch Trigger Parent.001' has the two DOOR meshes as direct children → foreign.
+            bool hasForeignMesh = false;
+            for (int i = 0; i < cc; i++)
+            {
+                Transform k = null; try { k = pivot.GetChild(i); } catch { }
+                if (k == null || !HasVisibleMesh(k)) continue;
+                if (!LeverHandleName(k)) { hasForeignMesh = true; break; }   // a door/panel that would swing if we rotated the hinge
+            }
+            if (!hasForeignMesh) return pivot;
+            // LEVER search spans DESCENDANTS, not just direct children: the trigger hatch's real lever '.Hatch lever.002'
+            // is mounted UNDER a door (a grandchild), so a direct-children-only search missed it and we kept swinging the
+            // doors. Pick the nearest-to-grab lever-named visible mesh anywhere in the subtree.
+            Transform bestLever = null; float bestNear = float.MaxValue;
+            Transform[] desc = null; try { desc = pivot.GetComponentsInChildren<Transform>(true); } catch { }
+            if (desc != null)
+                for (int i = 0; i < desc.Length; i++)
+                {
+                    Transform k = desc[i]; if (k == null || k == pivot) continue;
+                    if (!LeverHandleName(k) || !HasVisibleMesh(k)) continue;
+                    float nr = NearestApproach(k, grabPoint);
+                    if (nr < bestNear) { bestNear = nr; bestLever = k; }
+                }
+            if (bestLever != null && bestNear <= 0.4f)
+            {
+                Log.LogInfo($"[manip] held-stick follow: refine hinge '{SafeName(pivot)}' → buried lever '{SafeName(bestLever)}' (swing only the lever, not the doors/siblings).");
+                return bestLever;
+            }
+            // The lever may live OUTSIDE the hinge's own subtree: the trigger lever '.Hatch lever.002' is a SEPARATE node
+            // under 'Trigger Console' (hinged at its base ~0.72 m down, but its body reaches up to ~0.19 m from the grab),
+            // NOT under '.Hatch Trigger Parent.001'. The hinge is foreign-mesh (doors), so fall back to the nearest
+            // lever-named visible mesh anywhere in the local assembly whose BODY reaches the grab (strict ≤0.3 m so we never
+            // latch a neighbouring control's lever). Drive it about its own base = the real lever swing; doors stay put.
+            Transform root = BoundedAssemblyRoot(pivot);
+            if (root != null)
+            {
+                Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { }
+                if (all != null)
+                    for (int i = 0; i < all.Length; i++)
+                    {
+                        Transform k = all[i]; if (k == null || k == pivot) continue;
+                        if (!LeverHandleName(k) || !HasVisibleMesh(k) || IsDescendantOf(k, pivot)) continue;
+                        float nr = NearestApproach(k, grabPoint);
+                        if (nr < bestNear) { bestNear = nr; bestLever = k; }
+                    }
+                if (bestLever != null && bestNear <= 0.3f)
+                {
+                    Log.LogInfo($"[manip] held-stick follow: refine hinge '{SafeName(pivot)}' → assembly lever '{SafeName(bestLever)}' (body {bestNear:0.000}m from grab; doors stay).");
+                    return bestLever;
+                }
+            }
+            return pivot;
         }
 
         // The lever's hinge: the nearest node named '*Parent' to the grab point — ancestors first (up to the assembly),
@@ -1198,14 +1512,18 @@ namespace IronNestVR
                 {
                     Transform c = null; try { c = par.GetChild(i); } catch { }
                     if (c == null || c == grabbed || !NameHasParent(c)) continue;
+                    // A sibling '*Parent' is only a real lever hinge if it carries visible geometry. The requisition
+                    // console's submit/raise '*Parent' sits beside the map's 'RTS cam Parent' (a camera rig, no mesh);
+                    // without this guard the nearest-'*Parent' search latched onto the camera and swung it on grab.
+                    if (!HasVisibleMesh(c))
+                    {
+                        Log.LogInfo($"[manip] held-stick follow: skip sibling hinge '{SafeName(c)}' (no visible mesh — not a lever).");
+                        continue;
+                    }
                     float n = NearestApproach(c, grabPoint);
                     if (n < bestNear) { bestNear = n; best = c; }
                 }
             }
-            // Some controls hinge on a '<Name> Parent' nested under a SIBLING (a nephew), not an ancestor or direct
-            // sibling — e.g. Calculate's '.Calculate Lever Parent'. Only when the close search finds nothing, fall back
-            // to a bounded assembly scan for the nearest local hinge.
-            if (best == null) best = FindAssemblyParentHinge(grabbed, grabPoint);
             // Reject a hinge that governs OTHER controls (a shared assembly/console parent). The Review Console switches
             // sit under '.Review Console Parent', which also carries every other switch — swinging it moved the WHOLE
             // console. A real per-control hinge carries only this control's own button.
@@ -1267,22 +1585,357 @@ namespace IronNestVR
             return best;
         }
 
-        // Max distance from a node's own origin to any descendant body point — how far the node's mesh reaches. A long
-        // value means the grabbed node is itself a lever (handle out at the tip, hinge at the origin).
+        // A looser handle-name test than LeverMoverName: accepts 'lever'/'handle'/'crank'/'pull' but — unlike LeverMoverName
+        // — does NOT reject on 'lock', because the punchcard submit's real handle is literally named 'Locking Lever'. Still
+        // rejects the lock PIN ('LeverLock'/'lever lock'), which is hardware, not the handle.
+        private static bool LeverHandleName(Transform t)
+        {
+            string s = SafeName(t); if (string.IsNullOrEmpty(s)) return false;
+            s = s.ToLowerInvariant();
+            if (s.Contains("leverlock") || s.Contains("lever lock")) return false;   // the lock pin, not a handle
+            return s.Contains("lever") || s.Contains("handle") || s.Contains("crank") || s.Contains("pull");
+        }
+
+        // True if a 'lever'-named node's ONLY visible mesh is a Bézier/cable/wire/spline curve — i.e. it's cosmetic WIRING
+        // running along a stick, not the stick itself. The charge rammer's 'BigLever.001' has a single child 'BézierCurve.010';
+        // we drove it and the user saw "the wiring move, not the lever stick." Reject so the real rod '.PowderRamLever' wins.
+        private static bool IsWiringLever(Transform t)
+        {
+            Renderer[] rs = null; try { rs = t.GetComponentsInChildren<Renderer>(true); } catch { }
+            if (rs == null || rs.Length == 0) return false;
+            bool sawEnabled = false;
+            for (int i = 0; i < rs.Length; i++)
+            {
+                var r = rs[i]; if (r == null) continue;
+                bool en = false; try { en = r.enabled && r.gameObject.activeInHierarchy; } catch { }
+                if (!en) continue;   // only meshes that actually RENDER count
+                sawEnabled = true;
+                string s = null; try { s = r.transform.name; } catch { }
+                bool wiringName = false;
+                if (!string.IsNullOrEmpty(s))
+                {
+                    s = s.ToLowerInvariant();
+                    wiringName = s.Contains("bezier") || s.Contains("bézier") || s.Contains("curve") || s.Contains("cable") || s.Contains("wire") || s.Contains("spline");
+                }
+                // 'BigLever.001's own renderer is enabled but its mesh is visually NEGLIGIBLE (a tiny stub) — so a name test
+                // alone kept it. Also treat a renderer with tiny world bounds as non-stick: a real rod is ≥~0.1 m across.
+                float size = 1f; try { size = r.bounds.size.magnitude; } catch { }
+                bool tiny = size < 0.10f;
+                if (!wiringName && !tiny) return false;   // a SUBSTANTIAL non-wiring mesh → it's a real stick, keep it
+            }
+            return sawEnabled;       // every visible mesh under it is wiring or a negligible stub
+        }
+
+        // Any renderer in t's subtree that ACTUALLY renders (enabled + active) — distinguishes a real visible stick from a
+        // logical/hidden mechanism node. The punchcard's 'Locking Lever' subtree renders NOTHING (nothing turned red), so we
+        // must not drive it; the visible handle is the orb-cap, which SLIDES.
+        private static bool HasVisibleEnabledMesh(Transform t)
+        {
+            Renderer[] rs = null; try { rs = t == null ? null : t.GetComponentsInChildren<Renderer>(true); } catch { }
+            if (rs == null) return false;
+            for (int i = 0; i < rs.Length; i++)
+            {
+                var r = rs[i]; if (r == null) continue;
+                try { if (r.enabled && r.gameObject.activeInHierarchy) return true; } catch { }
+            }
+            return false;
+        }
+
+        // A LEVER-named, visible-mesh node ANYWHERE in the control's bounded assembly whose HINGE ORIGIN sits at the hand —
+        // the real handle when it lives in a SIBLING's subtree (not an ancestor, sibling, or descendant of the grabbed
+        // button, so tiers 1-3 all miss it). The punchcard submit's handle is 'Locking Lever' (→ 'Lever'/'Big Lever', with
+        // an FMOD 'Lever Rotation' provider), a child of a sibling of the grabbed 'Universal Button', origin 0.29 m from the
+        // grab. This is exactly what the [stick] dump surfaces as the smallest 'origin-near' lever. Rotating it about its own
+        // origin swings the handle to the hand. Buried (one-directional, rest→press) like the other mechanism levers.
+        private Transform FindAssemblyLever(Transform grabbed, Vector3 grabPoint)
+        {
+            Transform root = BoundedAssemblyRoot(grabbed);
+            Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { }
+            if (all == null) return null;
+            Transform best = null; float bestOrigin = float.MaxValue; int bestDepth = int.MaxValue;
+            Transform bestBody = null; float bestBodyNear = float.MaxValue;   // far-hinge fallback (charge rammer '.PowderRamLever')
+            for (int i = 0; i < all.Length; i++)
+            {
+                var n = all[i]; if (n == null || n == grabbed) continue;
+                if (!LeverHandleName(n) || !HasVisibleMesh(n)) continue;
+                if (IsDescendantOf(grabbed, n)) continue;            // never an ancestor of the grab (that's the console)
+                if (IsWiringLever(n)) continue;                      // skip a 'lever' whose only mesh is a Bézier/cable (charge rammer 'BigLever.001')
+                float o; try { o = Vector3.Distance(n.position, grabPoint); } catch { continue; }
+                float nr = NearestApproach(n, grabPoint);
+                if (o <= 0.4f)                                       // PRIMARY: a lever hinged AT the hand (punchcard 'Locking Lever')
+                {
+                    int d = Depth(n, root);
+                    // nearest origin wins; on a near-tie prefer the SHALLOWER node (the lever assembly, not a leaf mesh under it)
+                    if (o < bestOrigin - 0.02f || (Mathf.Abs(o - bestOrigin) <= 0.02f && d < bestDepth))
+                    { bestOrigin = o; best = n; bestDepth = d; }
+                }
+                else if (o <= 2.0f && nr <= 0.3f && nr < bestBodyNear)
+                {
+                    // FALLBACK: a LONG lever hinged far away (origin ≤2 m) but whose BODY reaches the grab — the charge
+                    // rammer's '.PowderRamLever' hinges ~1.25 m down at the breech, the rod+orb you hold is its tip.
+                    bestBodyNear = nr; bestBody = n;
+                }
+            }
+            if (best == null && bestBody != null)
+            {
+                Log.LogInfo($"[manip] held-stick follow: assembly lever '{SafeName(bestBody)}' (long lever, body {bestBodyNear:0.000}m from grab; hinge far).");
+                return bestBody;
+            }
+            if (best == null) return null;
+            Log.LogInfo($"[manip] held-stick follow: assembly lever '{SafeName(best)}' (origin {bestOrigin:0.000}m from grab).");
+            return best;
+        }
+
+        // The grabbed control's own ancestor used as the hinge WITHOUT the '<Name> Parent' naming convention. Some switches
+        // hinge on a small per-control assembly node that simply isn't named '*Parent' — the review-console toggle
+        // ('Universal Switch Button') sits under '.Check Switch', an 18 cm node carrying ONLY this one switch; rotating it
+        // swings the toggle head (orb-cap + knob) about its base. FindPivotNode/FindAssemblyParentHinge miss it because they
+        // require the literal 'Parent' name. Accept the nearest ancestor (up to 3) that carries visible mesh, is SMALL
+        // (per-control, ext ≤ 0.6 m — never the whole '.Review Console Parent'/console), reaches the grab, and governs no
+        // OTHER switch. Bidirectional toggle (not buried). Only reached after the named-'*Parent' tiers fail.
+        private Transform FindParentHinge(Transform grabbed, Vector3 grabPoint)
+        {
+            Transform t = grabbed.parent; int up = 0;
+            while (t != null && up < 3)
+            {
+                if (HasVisibleMesh(t) && !HingeGovernsForeignSwitch(t, grabbed))
+                {
+                    float ext = NodeExtent(t);
+                    float near = NearestApproach(t, grabPoint);
+                    if (ext <= 0.6f && near <= 0.2f)
+                    {
+                        Log.LogInfo($"[manip] held-stick follow: parent hinge '{SafeName(t)}' (ext {ext:0.00}m, body {near:0.000}m from grab).");
+                        return t;
+                    }
+                }
+                t = t.parent; up++;
+            }
+            return null;
+        }
+
+        // Geometric extent: how far the farthest descendant transform sits from this node's own origin. Distinguishes a
+        // per-control assembly (small) from a shared console/turret root (huge). Same measure the [stick] dump prints as 'ext'.
         private static float NodeExtent(Transform t)
         {
-            if (t == null) return 0f;
+            float extent = 0f;
             Vector3 o; try { o = t.position; } catch { return 0f; }
-            float ext = 0f;
             Transform[] kids = null; try { kids = t.GetComponentsInChildren<Transform>(true); } catch { }
             if (kids != null)
                 for (int i = 0; i < kids.Length; i++)
                 {
                     var k = kids[i]; if (k == null) continue;
-                    float d; try { d = Vector3.Distance(k.position, o); } catch { continue; }
-                    if (d > ext) ext = d;
+                    Vector3 kp; try { kp = k.position; } catch { continue; }
+                    float e = Vector3.Distance(kp, o); if (e > extent) extent = e;
                 }
-            return ext;
+            return extent;
+        }
+
+        // A named '*Lever'/handle DESCENDANT of the grabbed control whose body reaches the grab — the visible handle when
+        // there's no '<Name> Parent' hinge to find (dispenser '.ChargeLever', charge rammer '.PowderRamLever'). Driving it
+        // moves ONLY the lever, leaving the lights/drums/gears that share the grabbed button alone (those failed when we
+        // rotated the whole grabbed node). Excludes gears/drums/lights/locks via LeverMoverName; picks the lever whose body
+        // comes closest to the grab. Purely geometric — works on the very first grab, no learn capture needed.
+        private Transform FindLeverDescendant(Transform grabbed, Vector3 grabPoint)
+        {
+            Transform[] all = null; try { all = grabbed.GetComponentsInChildren<Transform>(true); } catch { }
+            if (all == null) return null;
+            Transform best = null; float bestNear = float.MaxValue;
+            for (int i = 0; i < all.Length; i++)
+            {
+                var n = all[i]; if (n == null || n == grabbed) continue;
+                if (!LeverMoverName(n)) continue;
+                if (RendererKind(n) == "rNONE") continue;             // must have its own visible geometry
+                float nr = NearestApproach(n, grabPoint);
+                if (nr < bestNear) { bestNear = nr; best = n; }
+            }
+            if (best == null || bestNear > 0.35f) return null;        // no lever whose body reaches the grab → fall through
+            Log.LogInfo($"[manip] held-stick follow: lever descendant '{SafeName(best)}' (body {bestNear:0.000}m from grab).");
+            return best;
+        }
+
+        // A captured LEVER-named ROTATION mover whose body reaches the grab — the STICK to swing when there's no '*Parent'
+        // hinge and the lever lives OUTSIDE the grabbed subtree (charge rammer '.PowderRamLever', a sibling whose hinge is
+        // ~1.2 m from the grab but whose arm passes through your hand; the tip orb-light rides it via a constraint). Scans
+        // the learn cache; requires rotation-dominant motion (a hinge, not a slider) and the arm to actually reach the
+        // grab. Rotate-follow then uses TryCapturedHingeAxisWorld for the fixed axis/direction.
+        private Transform FindCapturedLeverHinge(Transform grabbed, Vector3 grabPoint)
+        {
+            if (_scrubKey == null) return null;
+            if (!_scrubCache.TryGetValue(_scrubKey, out var nodes) || nodes == null) return null;
+            Transform best = null; float bestNear = float.MaxValue;
+            for (int k = 0; k < nodes.Length; k++)
+            {
+                var T = nodes[k].T; if (T == null) continue;
+                if (!LeverMoverName(T)) continue;
+                float rotDeg = Quaternion.Angle(nodes[k].RestRot, nodes[k].PressRot);
+                float trans = Vector3.Distance(nodes[k].RestPos, nodes[k].PressPos);
+                if (rotDeg < 5f || rotDeg < trans * 60f) continue;   // rotation-dominant only (a hinge, not a slider)
+                float nr = NearestApproach(T, grabPoint);
+                if (nr < bestNear) { bestNear = nr; best = T; }
+            }
+            if (best == null || bestNear > 0.6f) return null;        // its body must actually reach the hand
+            // NOTE: the hinge ORIGIN is allowed to be far (charge rammer '.PowderRamLever' hinges ~1.26 m away at the
+            // breech and the orb-tip is what you hold) — it's a LONG lever, not a remote mechanism. The orb rides it via
+            // co-rotation in DriveRider, so the whole stick+orb swings about the far hinge as the hand moves.
+            Log.LogInfo($"[manip] held-stick follow: captured lever hinge '{SafeName(best)}' (body {bestNear:0.000}m from grab).");
+            return best;
+        }
+
+        // The in-hand mesh that the game moves by a long captured TRANSLATION (the charge rammer cap 'Cylinder.001' rides
+        // the ram lever ~1.2 m). Among the learned movers that sit UNDER the grabbed control, pick the one with the
+        // largest captured WORLD travel and return it + that travel direction (world) + distance — so the follow can slide
+        // the actual in-hand cap along its real arc instead of rotating a button that has no stick. The remaining movers
+        // (the lever, gears) are siblings, so they keep scrub-replaying in step. Null until there's a capture (2nd grab).
+        private Transform FindCapturedCapMover(Transform grabbed, out Vector3 slideAxisW, out float travelMax)
+        {
+            slideAxisW = Vector3.zero; travelMax = 0f;
+            if (grabbed == null || _scrubKey == null) return null;
+            // Scan the LEARN CACHE, not _activeMovers: the cap 'Cylinder.001' carries a ParentConstraint, so the scrub
+            // resolve drops it from _activeMovers (it skips constraint-pinned followers) — but the cache keeps it. We
+            // disable that constraint when we drive it (see _leverCon below), so our slide writes hold.
+            if (!_scrubCache.TryGetValue(_scrubKey, out var nodes) || nodes == null) return null;
+            Transform best = null; float bestTravel = 0f; Vector3 bestDirW = Vector3.zero;
+            for (int k = 0; k < nodes.Length; k++)
+            {
+                var T = nodes[k].T;
+                if (T == null) continue;
+                if (T != grabbed && !IsDescendantOf(T, grabbed)) continue;   // only meshes under the grabbed control
+                Transform par = T.parent; if (par == null) continue;
+                Vector3 dW; try { dW = par.TransformVector(nodes[k].PressPos - nodes[k].RestPos); } catch { continue; }   // local Δ → world
+                float tr = dW.magnitude;
+                if (tr <= bestTravel) continue;
+                bestTravel = tr; best = T; bestDirW = dW;
+            }
+            if (best == null || bestTravel < 0.10f) return null;   // need a real ≥10 cm travel to be the riding tip-cap
+            slideAxisW = bestDirW.normalized; travelMax = bestTravel;
+            Log.LogInfo($"[manip] held-stick follow: captured cap '{SafeName(best)}' slide-follow (travel {bestTravel:0.00}m).");
+            return best;
+        }
+
+        // Set a mesh up as a RIDER: capture its world pose now and RIGIDLY co-move it with the swung stick's exact
+        // transform delta each frame (DriveRider), so a held orb-cap that lives OUTSIDE the lever's subtree stays glued to
+        // the swinging tip instead of hanging dead in the air. Its ParentConstraint is disabled so our writes hold;
+        // RestoreScrubDrivers re-enables it on release. Pose is captured WHILE the constraint is still active (orb at its
+        // correct spot), so frame 1 (identity swing) leaves it exactly where it was — no snap.
+        private void SetRider(Transform rider, Vector3 slideAxisW, float travel)
+        {
+            if (rider == null) return;
+            _riderT = rider; _riderParent = rider.parent; _riderRestLocal = rider.localPosition;
+            _riderSlideAxisW = slideAxisW; _riderTravel = travel;
+            try { _riderRestPosW = rider.position; _riderRestRotW = rider.rotation; } catch { }
+            try { _riderCon = rider.GetComponent<UnityEngine.Animations.ParentConstraint>(); } catch { _riderCon = null; }
+            if (_riderCon != null) { try { _riderConWasActive = _riderCon.constraintActive; _riderCon.constraintActive = false; } catch { } }
+            Log.LogInfo($"[manip] held-stick follow: + rider '{SafeName(rider)}' co-moves with the stick (glued to the tip).");
+        }
+
+        // The in-hand orb-cap ('Cylinder.001') the user actually holds: a mesh DESCENDANT of the grabbed button carrying a
+        // ParentConstraint (the game glues it to a lever tip) that sits right at the grab point. Found GEOMETRICALLY (no
+        // learn capture required, so it works on the very first grab) for the rider co-move when we swing a lever that the
+        // orb is NOT under. Excludes the pivot and anything beneath it — those already ride the swing for free.
+        private Transform FindOrbCapGeometric(Transform grabbed, Transform pivot, Vector3 grabPoint)
+        {
+            if (grabbed == null) return null;
+            Transform[] kids = null; try { kids = grabbed.GetComponentsInChildren<Transform>(true); } catch { }
+            if (kids == null) return null;
+            Transform best = null; float bestNear = float.MaxValue;
+            for (int i = 0; i < kids.Length; i++)
+            {
+                Transform t = kids[i]; if (t == null || t == grabbed) continue;
+                if (pivot != null && (t == pivot || IsDescendantOf(t, pivot))) continue;   // under the stick → rides for free
+                bool hasCon = false; try { hasCon = t.GetComponent<UnityEngine.Animations.ParentConstraint>() != null; } catch { }
+                if (!hasCon || !HasVisibleMesh(t)) continue;                               // the orb-cap is a constraint-driven mesh
+                float nr; try { nr = Vector3.Distance(t.position, grabPoint); } catch { continue; }
+                if (nr < bestNear) { bestNear = nr; best = t; }
+            }
+            if (best == null || bestNear > 0.35f) return null;                             // must be the in-hand cap, at the grab
+            return best;
+        }
+
+        // DIAG: tint every renderer under t to colour c, saving the originals to restore on release. material (not
+        // sharedMaterial) gives a per-renderer instance so we never corrupt the shared asset; .color maps to URP Lit's
+        // [MainColor] _BaseColor. Wrapped in try/catch per renderer so an exotic material can't break the grab.
+        private void TintNode(Transform t, Color c)
+        {
+            if (t == null) return;
+            if (_tints == null) _tints = new System.Collections.Generic.List<TintEntry>();
+            Renderer[] rs = null; try { rs = t.GetComponentsInChildren<Renderer>(true); } catch { }
+            if (rs == null) return;
+            for (int i = 0; i < rs.Length; i++)
+            {
+                var r = rs[i]; if (r == null) continue;
+                try { var m = r.material; if (m == null) continue; _tints.Add(new TintEntry { R = r, C = m.color }); m.color = c; }
+                catch { }
+            }
+        }
+
+        private void RestoreTints()
+        {
+            if (_tints == null) return;
+            for (int i = 0; i < _tints.Count; i++)
+                try { var e = _tints[i]; if (e.R != null) { var m = e.R.material; if (m != null) m.color = e.C; } } catch { }
+            _tints.Clear();
+        }
+
+        // A clean, STABLE hinge axis for an orb-stick lever that has no captured clip motion: the lever's local cardinal
+        // (right/up/forward) MOST PERPENDICULAR to the grab arm. A real lever hinges ACROSS its length, so this is the
+        // physical swing axis — and unlike the per-frame cross-product it never collapses onto the rod's long axis (which
+        // merely twisted the stick in place, moving only the offset orb). Independent of hand jitter → same axis every grab.
+        private Vector3 StableHingeAxisW(Transform pivot, Vector3 grabPoint)
+        {
+            if (pivot == null) return Vector3.zero;
+            Vector3 armW; try { armW = grabPoint - pivot.position; } catch { return Vector3.zero; }
+            if (armW.sqrMagnitude < 1e-8f) return Vector3.zero;
+            Vector3 armDir = armW.normalized;
+            Vector3[] axes; try { axes = new[] { pivot.right, pivot.up, pivot.forward }; } catch { return Vector3.zero; }
+            Vector3 best = Vector3.zero; float bestPerp = -1f;
+            for (int i = 0; i < axes.Length; i++)
+            {
+                if (axes[i].sqrMagnitude < 1e-8f) continue;
+                float perp = 1f - Mathf.Abs(Vector3.Dot(axes[i].normalized, armDir));   // 1 = perpendicular to the rod
+                if (perp > bestPerp) { bestPerp = perp; best = axes[i].normalized; }
+            }
+            return best;
+        }
+
+        // The hinge's FIXED axis + direction, taken from the game's own captured motion: among the learned movers (ready
+        // from the 2nd grab), the one that is _leverT or rigidly under it (the lever mesh) rotates rest→press about the
+        // true hinge axis. We return that axis in WORLD space, signed so a POSITIVE swing = rest→press (the activation
+        // direction). DriveHeldStick then clamps swing to [0,max], so a wrong-way pull reads negative → clamps to 0 → the
+        // lever can only move the correct way (fixes "locks onto whichever direction the controller first moved"). False
+        // when there's no capture yet (the very first learn grab) → caller auto-infers from the first swing instead.
+        private bool TryCapturedHingeAxisWorld(out Vector3 axisW)
+        {
+            axisW = Vector3.zero;
+            if (_activeMovers == null || _leverT == null) return false;
+            float bestAngle = 0f; Quaternion bestDq = Quaternion.identity; Transform bestParent = null;
+            for (int k = 0; k < _activeMovers.Count; k++)
+            {
+                var m = _activeMovers[k];
+                if (m.T == null) continue;
+                if (m.T != _leverT && !IsDescendantOf(m.T, _leverT)) continue;   // only the lever itself / its rigid children
+                float ang = Quaternion.Angle(m.RestRot, m.PressRot);
+                if (ang <= bestAngle) continue;
+                bestAngle = ang; bestDq = m.PressRot * Quaternion.Inverse(m.RestRot); bestParent = m.T.parent;
+            }
+            if (bestAngle < 3f || bestParent == null) return false;             // no meaningful captured rotation
+            float a; Vector3 axLocal; bestDq.ToAngleAxis(out a, out axLocal);   // +a about axLocal does rest→press
+            if (axLocal.sqrMagnitude < 1e-8f) return false;
+            Vector3 w = bestParent.rotation * axLocal.normalized;               // mover-parent frame → world
+            if (_switchMotion.Flip) w = -w;
+            if (w.sqrMagnitude < 1e-8f) return false;
+            axisW = w.normalized; return true;
+        }
+
+        // Name reads like a movable handle, and NOT a counter/indicator/cog that merely spins or displays.
+        private static bool LeverMoverName(Transform t)
+        {
+            string s = SafeName(t); if (string.IsNullOrEmpty(s)) return false;
+            s = s.ToLowerInvariant();
+            bool handle = s.Contains("lever") || s.Contains("ram") || s.Contains("rotate") || s.Contains("handle")
+                       || s.Contains("crank") || s.Contains("pull") || s.Contains("swing");
+            bool notHandle = s.Contains("gear") || s.Contains("drum") || s.Contains("number") || s.Contains("wheel")
+                          || s.Contains("cog") || s.Contains("light") || s.Contains("lamp") || s.Contains("lock");
+            return handle && !notHandle;
         }
 
         // Highest ancestor of `from` whose whole subtree is still bounded (≤1200 nodes) — the control's local assembly,
@@ -1374,6 +2027,7 @@ namespace IronNestVR
         {
             if (_leverT == null) return;
             Vector3 pivotW = _leverParent != null ? _leverParent.TransformPoint(_leverPivotLocal) : _leverT.position;
+            _leverPivotW = pivotW; _leverSwingDqW = Quaternion.identity; _leverSlideDeltaW = Vector3.zero;   // rider co-move delta (set below)
 
             if (_leverSlide)
             {
@@ -1386,13 +2040,13 @@ namespace IronNestVR
                 if (!_leverHasSlideAxis && travelW.magnitude >= 0.03f) { _leverSlideAxisW = SnapToPivotAxis(travelW.normalized); _leverHasSlideAxis = true; }
                 if (_leverHasSlideAxis)
                 {
-                    // Range is METRES only when the control is explicitly translate-typed; otherwise it's rotate-degrees,
-                    // so for an auto-detected slide use a fixed reach instead of misreading 25° as 25 m.
-                    float maxSlide = _switchMotion.Translate ? Mathf.Clamp(_switchMotion.Range, 0.03f, 0.4f) : 0.18f;
-                    float off = Mathf.Clamp(Vector3.Dot(travelW, _leverSlideAxisW), 0f, maxSlide);
+                    // Bounded to the captured throw (captured slider) or the menu/auto reach, resolved at grab time.
+                    float off = Mathf.Clamp(Vector3.Dot(travelW, _leverSlideAxisW), 0f, _leverSlideMax);
                     Vector3 localDelta = _leverParent != null ? _leverParent.InverseTransformVector(_leverSlideAxisW * off) : _leverSlideAxisW * off;
                     _leverT.localPosition = _leverPivotLocal + localDelta;
+                    _leverSlideDeltaW = _leverSlideAxisW * off;          // rider slides by the same world delta
                     if (off > _leverTipTravel) _leverTipTravel = off;   // DIAG: actual slide distance (parent-ride excluded)
+                    _leverFollowFrac = _leverSlideMax > 1e-3f ? Mathf.Clamp01(off / _leverSlideMax) : 0f;
                 }
             }
             else
@@ -1415,13 +2069,20 @@ namespace IronNestVR
                         Vector3 hp = Vector3.ProjectOnPlane(toHand, _leverRotAxisW);
                         if (ap.sqrMagnitude > 1e-8f && hp.sqrMagnitude > 1e-8f)
                         {
-                            float swing = Mathf.Clamp(Vector3.SignedAngle(ap, hp, _leverRotAxisW), -_leverMaxAngle, _leverMaxAngle);
+                            // Buried mechanism levers are one-directional (rest→press only); named toggle hinges swing both ways.
+                            // Buried mechanism levers are one-directional, EXCEPT the orb-stick archetype (punchcard, charge
+                            // rammer): its axis is a stable perpendicular guess with no fixed sign, so allow both ways.
+                            float swingLo = (_leverBuried && !_leverStickArchetype) ? 0f : -_leverMaxAngle;
+                            float swing = Mathf.Clamp(Vector3.SignedAngle(ap, hp, _leverRotAxisW), swingLo, _leverMaxAngle);
                             Quaternion restW = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
-                            _leverT.rotation = Quaternion.AngleAxis(swing, _leverRotAxisW) * restW;
+                            _leverSwingDqW = Quaternion.AngleAxis(swing, _leverRotAxisW);   // rider co-rotates by this about pivotW
+                            _leverT.rotation = _leverSwingDqW * restW;
+                            _leverFollowFrac = _leverMaxAngle > 0.01f ? Mathf.Clamp01(Mathf.Abs(swing) / _leverMaxAngle) : 0f;
                         }
                     }
                 }
             }
+            DriveRider();   // a tip mesh outside the stick's subtree (charge rammer orb-light) rides the swing, synced
             // DIAG (rotate only): world travel of the grabbed point. For slide we report the clamped slide distance above
             // instead — the TransformPoint readout is inflated by any parent ride, which is what made the horn read 10 m.
             if (!_leverSlide)
@@ -1432,6 +2093,28 @@ namespace IronNestVR
                     if (td > _leverTipTravel) _leverTipTravel = td;
                 }
                 catch { }
+        }
+
+        // Drive the RIDER (charge rammer orb-light) by RIGIDLY co-moving it with the stick's exact transform delta this
+        // frame — rotate it about the same hinge by the same angle (or translate it by the same slide) as the stick — so it
+        // stays glued to the swinging tip instead of decoupling. Captured world pose at grab; constraint/animator disabled
+        // so the write holds; on release they restore and it returns to the game's control.
+        private void DriveRider()
+        {
+            if (_riderT == null) return;
+            try
+            {
+                if (_leverSlide)
+                {
+                    _riderT.position = _riderRestPosW + _leverSlideDeltaW;
+                }
+                else
+                {
+                    _riderT.position = _leverPivotW + _leverSwingDqW * (_riderRestPosW - _leverPivotW);
+                    _riderT.rotation = _leverSwingDqW * _riderRestRotW;
+                }
+            }
+            catch { }
         }
 
         private void SampleLearnFrame()
@@ -1598,6 +2281,21 @@ namespace IronNestVR
 
         // PROBE: what kind of renderer drives this node's pixels — a MeshRenderer follows the node's own transform (so a
         // hand-written rotation shows), a SkinnedMeshRenderer follows BONES (so writing this transform shows nothing).
+        // True if t's subtree contains any visible mesh (mesh or skinned). A real lever hinge always carries visible
+        // geometry; a logic/camera rig (the map's 'RTS cam Parent', child 'RTS Camera Controler') carries none — that's
+        // how we reject it as a held-stick hinge so grabbing the requisition-console lever stops swinging the map camera.
+        private static bool HasVisibleMesh(Transform t)
+        {
+            try
+            {
+                if (t == null) return false;
+                if (t.GetComponentInChildren<MeshRenderer>(true) != null) return true;
+                if (t.GetComponentInChildren<SkinnedMeshRenderer>(true) != null) return true;
+            }
+            catch { }
+            return false;
+        }
+
         private static string RendererKind(Transform t)
         {
             try
@@ -1684,6 +2382,10 @@ namespace IronNestVR
                 }
             // Re-enable the held stick's own constraint (if we disabled one to swing it).
             try { if (_leverCon != null) { _leverCon.constraintActive = _leverConWasActive; } } catch { }
+            // Re-enable the rider's constraint (charge rammer orb-light) so it returns to the game's control.
+            try { if (_riderCon != null) { _riderCon.constraintActive = _riderConWasActive; } } catch { }
+            // DIAG: undo the held-stick tint.
+            try { RestoreTints(); } catch { }
         }
 
         // Resolve a learned node on a later grab: among descendants named leaf (already enumerated in `all`), pick the
@@ -1968,6 +2670,36 @@ namespace IronNestVR
                     Log.LogInfo($"[gripmiss]   {hits[i].distance:0.00}m '{SafeName(ht)}'{(trig ? " (trigger)" : "")} -> {tag}");
                     shown++;
                 }
+                // PROXIMITY PROBE: the grabbable may sit just OFF the thin aim ray (you point/reach slightly off, so the
+                // ray hits only the desk/wall behind it). Sweep a FAT sphere ALONG the ray (catches a control near the ray
+                // line at any distance) AND a sphere at the controller (close reach). For each control found, flag whether a
+                // PickUpZoomTarget sits above it — that's the reason the lever-follow currently skips it.
+                var found = new System.Collections.Generic.List<Transform>();
+                RaycastHit[] sc = null; try { sc = Physics.SphereCastAll(ao, 0.20f, dir, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Collide); } catch { }
+                for (int i = 0; sc != null && i < sc.Length; i++) { var c = sc[i].collider; if (c != null && c.transform != null) found.Add(c.transform); }
+                Collider[] near = null; try { near = Physics.OverlapSphere(ao, 0.6f, ~0, QueryTriggerInteraction.Collide); } catch { }
+                for (int i = 0; near != null && i < near.Length; i++) { var c = near[i]; if (c != null && c.transform != null) found.Add(c.transform); }
+                int pshown = 0;
+                var seen = new System.Collections.Generic.HashSet<int>();
+                for (int i = 0; i < found.Count && pshown < 14; i++)
+                {
+                    var ht = found[i]; if (ht == null) continue;
+                    var lat = FindUp<LookAtTarget>(ht); var dial = FindUp<DialInteractable>(ht);
+                    var slide = FindUp<LinearSliderInteractable>(ht); var pick = FindUp<PickUpZoomTarget>(ht);
+                    if (lat == null && dial == null && slide == null && pick == null) continue;
+                    Transform key = lat != null ? lat.transform : dial != null ? dial.transform : slide != null ? slide.transform : pick.transform;
+                    int id; try { id = key.GetInstanceID(); } catch { id = i; }
+                    if (!seen.Add(id)) continue;
+                    string what = lat != null ? $"LAT '{SafeName(lat.transform)}'"
+                                : dial != null ? $"dial '{SafeName(dial.transform)}'"
+                                : slide != null ? $"slider '{SafeName(slide.transform)}'"
+                                : $"pickup '{SafeName(pick.transform)}'";
+                    string pz = (pick != null && (lat != null || slide != null || dial != null)) ? "  [+PickUpZoomTarget → follow SKIPS it]" : "";
+                    float d = 0f; try { d = Vector3.Distance(ht.position, ao); } catch { }
+                    Log.LogInfo($"[gripmiss]   NEAR {d:0.00}m '{SafeName(ht)}' -> {what}{pz}");
+                    pshown++;
+                }
+                if (pshown == 0) Log.LogInfo("[gripmiss]   NEAR: no LAT/slider/dial/pickup near the ray or the controller.");
             }
             catch (Exception e) { Log.LogWarning("[gripmiss] " + e.Message); }
         }

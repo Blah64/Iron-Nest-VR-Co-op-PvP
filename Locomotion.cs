@@ -19,7 +19,13 @@ namespace IronNestVR
         private CharacterController _cc;
         private float _nextFind;
         private bool _loggedFound;
-        private bool _loggedPop;         // one-shot warning when the anti-pop guard first fires
+        private int _popCount;           // times the anti-pop guard has fired (throttled logging)
+        private float _nextPopLog;
+        private float _floatTimer;       // how long we've continuously looked "floating"
+        private float _nextFloatCheck;   // throttle the ground raycast
+        private float _lastFloatCheck;   // unscaled time of the previous check (for timer accumulation)
+        private float _nextFloatLog;
+        private int _floatRecoveries;
         private bool _snapArmed = true; // snap turn fires once per stick flick
 
         public void Tick(VrInput input, CameraRig rig, float dt)
@@ -54,11 +60,14 @@ namespace IronNestVR
             if (!Config.LocomotionEnabled) return;
             try
             {
+                EnsureController();
+                // Floating watchdog runs EVERY gameplay frame (not just while the stick is pushed) — the player
+                // can be left stranded in the air with the stick centred. Cheap (a throttled downward raycast).
+                if (Config.FloatWatchdogEnabled) FloatWatchdogTick();
+
                 float x = input.MoveX, y = input.MoveY;
                 float mag = Mathf.Sqrt(x * x + y * y);
-                if (mag < Config.MoveDeadzone) return; // nothing to do; don't even bother finding the FPC
-
-                EnsureController();
+                if (mag < Config.MoveDeadzone) return; // nothing more to do; below stick deadzone
                 if (_cc == null) return;
 
                 if (!rig.TryGetHeadBasis(out var fwd, out var right)) return;
@@ -88,11 +97,12 @@ namespace IronNestVR
                     if (rise > horiz + 0.003f)
                     {
                         _cc.Move(Vector3.down * (rise - horiz));
-                        if (!_loggedPop)
+                        _popCount++;
+                        if (Time.unscaledTime >= _nextPopLog)
                         {
-                            _loggedPop = true;
-                            Log.LogWarning($"[locomotion] cancelled an abnormal upward pop (rise={rise:0.000}m, " +
-                                           $"horiz={horiz:0.000}m) — the stuck-floating glitch. Disable with Config.LocomotionAntiPop.");
+                            _nextPopLog = Time.unscaledTime + 1f;
+                            Log.LogWarning($"[locomotion] anti-pop cancelled upward rise={rise:0.000}m " +
+                                           $"(horiz={horiz:0.000}m), count={_popCount}.");
                         }
                     }
                 }
@@ -102,6 +112,79 @@ namespace IronNestVR
                 Log.LogWarning("[locomotion] " + e.Message);
                 _fpc = null; _cc = null;
             }
+        }
+
+        // Symptom-level safety net for the "stuck floating" bug, independent of what lifted the player (our
+        // Move's slow-climb leak that slips under the anti-pop slope allowance, OR a game-side shove): each
+        // check we find the REAL floor under the capsule and, if it has hung above it for FloatStuckSeconds
+        // without falling, drop it back down and clear the FPC's stuck grounded/zero-velocity state so the
+        // game's own gravity resumes. A genuine jump/fall is exempt — it resolves before the dwell time or
+        // shows a clear downward verticalVelocity. Throttled to ~10 Hz (one raycast) to stay allocation-light.
+        private void FloatWatchdogTick()
+        {
+            if (_cc == null) return;
+            if (Time.unscaledTime < _nextFloatCheck) return;
+            float since = Time.unscaledTime - _lastFloatCheck;
+            if (since <= 0f || since > 1f) since = 0.1f; // first run / after a gap: use the nominal interval
+            _lastFloatCheck = Time.unscaledTime;
+            _nextFloatCheck = Time.unscaledTime + 0.1f;
+
+            if (!GroundBelow(out float groundY)) { _floatTimer = 0f; return; }
+
+            Vector3 pos = _cc.transform.position;
+            float feet = pos.y + _cc.center.y - _cc.height * 0.5f;
+            float gap = feet - groundY;
+            float vy = 0f; bool fpcGrounded = false;
+            try { vy = _fpc.verticalVelocity; fpcGrounded = _fpc.isGrounded; } catch { }
+            bool falling = vy < -Config.FloatFallSpeed;
+
+            if (gap > Config.FloatGapThreshold && !falling)
+            {
+                _floatTimer += since;
+                if (Time.unscaledTime >= _nextFloatLog)
+                {
+                    _nextFloatLog = Time.unscaledTime + 0.5f;
+                    Log.LogWarning($"[locomotion] suspected float: gap={gap:0.00}m vy={vy:0.00} " +
+                                   $"grounded(cc={_cc.isGrounded},fpc={fpcGrounded}) held={_floatTimer:0.00}s");
+                }
+                if (_floatTimer >= Config.FloatStuckSeconds)
+                {
+                    _cc.Move(Vector3.down * (gap + 0.05f)); // reseat on the floor — Move stops at it
+                    try { _fpc.isGrounded = false; _fpc.verticalVelocity = -2f; } catch { } // let FPC gravity re-settle
+                    _floatRecoveries++;
+                    Log.LogWarning($"[locomotion] RECOVERED stuck-float #{_floatRecoveries}: dropped {gap:0.00}m " +
+                                   $"to ground (vy was {vy:0.00}).");
+                    _floatTimer = 0f;
+                }
+            }
+            else _floatTimer = 0f;
+        }
+
+        // Nearest solid floor directly below the player, skipping the player's own colliders. RaycastAll (the
+        // proven interop path here) from just above the capsule, straight down.
+        private bool GroundBelow(out float groundY)
+        {
+            groundY = 0f;
+            Vector3 origin = _cc.transform.position + Vector3.up * 0.2f;
+            var hits = Physics.RaycastAll(origin, Vector3.down, 200f, ~0, QueryTriggerInteraction.Ignore);
+            if (hits == null) return false;
+            Transform self = _fpc != null ? _fpc.transform : _cc.transform;
+            float best = float.MaxValue; bool found = false;
+            for (int i = 0; i < hits.Length; i++)
+            {
+                var h = hits[i];
+                var col = h.collider;
+                if (col == null) continue;
+                if (IsSelf(col.transform, self)) continue; // don't treat our own capsule as the floor
+                if (h.distance < best) { best = h.distance; groundY = h.point.y; found = true; }
+            }
+            return found;
+        }
+
+        private static bool IsSelf(Transform t, Transform self)
+        {
+            for (Transform p = t; p != null; p = p.parent) if (p == self) return true;
+            return false;
         }
 
         private void EnsureController()
@@ -123,6 +206,6 @@ namespace IronNestVR
             }
         }
 
-        public void Reset() { _fpc = null; _cc = null; _loggedFound = false; }
+        public void Reset() { _fpc = null; _cc = null; _loggedFound = false; _floatTimer = 0f; }
     }
 }

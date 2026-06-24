@@ -105,6 +105,12 @@ namespace IronNestVR
             {
                 try { _grab.LateApply(_rig, _xr.Input); } catch { }
             }
+            // Re-assert the held cockpit LEVER pose here too — the game re-poses the lever meshes it animates AFTER our
+            // Update, overwriting the swing before render (a confirmed-correct lever moved in our log yet looked static).
+            if (_xrReady && _frameActive && _handManip != null)
+            {
+                try { _handManip.LateApply(); } catch { }
+            }
 
             // Same-machine test: the game pauses its SCALED-time sim/animations on an UNFOCUSED window
             // (Time.timeScale → 0) even though the player loop keeps running (runInBackground). Our net layer

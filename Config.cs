@@ -396,6 +396,14 @@ namespace IronNestVR
         // launches the player into the air where the FPC can read "grounded" so gravity never reels them back).
         // When on, cancel any per-frame rise beyond a natural slope so a thumbstick walk can't bump you upward.
         public static bool LocomotionAntiPop = true;
+        // Floating watchdog (SYMPTOM-level safety net, independent of what caused the pop). Each frame we cast
+        // down to the real floor; if the capsule hangs above it by more than FloatGapThreshold for longer than
+        // FloatStuckSeconds while NOT falling, we drop the player back to the ground. Catches the slow-climb
+        // leak the anti-pop guard misses AND any game-side shove, since it watches the result not the input.
+        public static bool FloatWatchdogEnabled = true;
+        public static float FloatGapThreshold = 0.6f;   // metres above the floor before we call it "floating"
+        public static float FloatStuckSeconds = 0.75f;  // must persist this long (so a real jump/fall is exempt)
+        public static float FloatFallSpeed = 1.0f;       // if verticalVelocity < -this, they're falling — don't intervene
 
         // --- View turn (right thumbstick) ---
         public static bool TurnEnabled = true;
