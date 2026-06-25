@@ -35,7 +35,6 @@ namespace IronNestVR
         private Material _vigMat;          // its colour alpha is the live darkness
         private float _vigCurrent;         // smoothed 0..1 darkness actually applied
         private Fovf _lastFov;             // most recent eye FOV, for sizing the head-locked overlay
-        private float _vigDiagNext;        // throttle for the visibility diagnostic
         private bool _ready;
         private int _eyeMask = -1; // captured scene cull mask (for the eye-cull diagnostic)
         private bool _useEnabledFallback;
@@ -313,21 +312,6 @@ namespace IronNestVR
                 try { _vigMat.color = c; } catch { }
                 try { if (_vigMat.HasProperty("_Color")) _vigMat.SetColor("_Color", c); } catch { }
             }
-
-            // Decisive diagnostic while the vignette SHOULD be showing: is it culled, or drawing-but-invisible?
-            if (_vigMr != null && _vigCurrent > 0.05f && Time.unscaledTime >= _vigDiagNext)
-            {
-                _vigDiagNext = Time.unscaledTime + 1f;
-                Vector3 wp = _vig != null ? _vig.transform.position : Vector3.zero;
-                Vector3 ls = _vig != null ? _vig.transform.lossyScale : Vector3.zero;
-                Vector3 ep = _cam[0] != null ? _cam[0].transform.position : Vector3.zero;
-                float ba = -1f, sb = -1f, db = -1f;
-                try { if (_vigMat.HasProperty("_BaseColor")) ba = _vigMat.GetColor("_BaseColor").a; } catch { }
-                try { sb = _vigMat.GetFloat("_SrcBlend"); db = _vigMat.GetFloat("_DstBlend"); } catch { }
-                Log.LogInfo($"[vignette] state cur={_vigCurrent:0.00} en={_vigMr.enabled} vis={_vigMr.isVisible} " +
-                            $"act={(_vig != null && _vig.activeInHierarchy)} pos={wp} eye0={ep} scale={ls} " +
-                            $"baseA={ba:0.00} blend={sb}/{db} q={_vigMat.renderQueue} kw={_vigMat.shaderKeywords?.Length ?? -1}");
-            }
         }
 
         // Reserve ONE layer for the overlay. The main camera renders "Everything", so we can't find an unused bit;
@@ -405,10 +389,7 @@ namespace IronNestVR
             _vig = go;
             _vigMr = mr;
             PlaceVignette(); // position it now so it isn't drawn at the origin for a frame
-            int m0 = _cam[0] != null ? _cam[0].cullingMask : 0;
-            bool has = (m0 & (1 << _vigLayer)) != 0;
-            Log.LogInfo($"[vignette] overlay built (layer {_vigLayer}; eye mask=0x{(uint)m0:X8} hasLayer={has}; " +
-                        $"shader='{(_vigMat != null && _vigMat.shader != null ? _vigMat.shader.name : "null")}').");
+            Log.LogInfo($"[vignette] overlay built (layer {_vigLayer}).");
         }
 
         // Head-lock the overlay: centre it in front of the eye-midpoint, facing the head, sized to cover the FOV

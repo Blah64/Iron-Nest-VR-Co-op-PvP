@@ -366,9 +366,6 @@ namespace IronNestVR
                       () => Config.VignetteEnabled = !Config.VignetteEnabled);
             AddFloat("Vignette Strength", () => Mathf.RoundToInt(Config.VignetteStrength * 100f) + "%",
                      d => Config.VignetteStrength = Clamp(Config.VignetteStrength + d * 0.1f, 0.1f, 1f));
-            // Diagnostic: force the vignette fully on (no motion needed) to confirm it renders.
-            AddToggle("Vignette Test", () => Config.VignetteAlwaysOn ? "ALWAYS ON" : "off",
-                      () => Config.VignetteAlwaysOn = !Config.VignetteAlwaysOn);
 
             AddAction("Recenter View", () => { _rig?.Recenter(); });
             AddAction("Close Menu", Close);

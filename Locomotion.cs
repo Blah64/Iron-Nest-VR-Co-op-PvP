@@ -43,7 +43,6 @@ namespace IronNestVR
         private GameObject _teleArcGo;   // projectile-arc line (Unity-XR-style teleport curve)
         private LineRenderer _teleArc;
         private readonly List<Vector3> _arcPts = new List<Vector3>(72);
-        private float _teleLogNext;
 
         public void Tick(VrInput input, CameraRig rig, float dt)
         {
@@ -148,9 +147,6 @@ namespace IronNestVR
         {
             if (rig == null) return;
 
-            // TEST override: hold the vignette fully on so you can confirm it renders without moving.
-            if (Config.VignetteAlwaysOn) { rig.SetVignette(Mathf.Clamp01(Config.VignetteStrength), dt); return; }
-
             float moveMag = Mathf.Sqrt(input.MoveX * input.MoveX + input.MoveY * input.MoveY);
             float moveT = Mathf.Clamp01((moveMag - Config.MoveDeadzone) / (1f - Config.MoveDeadzone));
             float turnT = (Config.TurnEnabled && !Config.SnapTurn)
@@ -191,18 +187,11 @@ namespace IronNestVR
                     Vector3 d = (origin.rotation * lr) * Vector3.forward;
                     _teleValid = TraceArc(o, d, out _teleTarget);
                     ShowTeleAim(_teleValid);
-
-                    if (Time.unscaledTime >= _teleLogNext)
-                    {
-                        _teleLogNext = Time.unscaledTime + 0.75f;
-                        Log.LogInfo($"[teleport] aiming valid={_teleValid} target={_teleTarget} aimValidL={input.AimValidL} pts={_arcPts.Count}");
-                    }
                 }
             }
             else if (_teleAiming) // released to centre
             {
                 if (_teleValid) DoTeleport(_teleTarget, input);
-                else Log.LogInfo("[teleport] released with no valid target — point lower so the arc lands on a floor.");
                 _teleAiming = false; _teleValid = false;
                 HideTele();
             }
