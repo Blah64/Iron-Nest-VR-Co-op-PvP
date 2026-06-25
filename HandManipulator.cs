@@ -72,6 +72,7 @@ namespace IronNestVR
         private Quaternion _gripCalOppRot0, _gripCalHandRot0;
         private Vector3 _gripCalCurPos;      // the LATEST dragged hand pose — captured on release (DriveSwitch resets
         private Quaternion _gripCalCurRot;   // _handPos/_handRot before the release frame's capture runs, so we can't read those)
+        private bool _gripStateOff;          // this grab uses the OFF/down grip set (two-state handle, latched at grab from GetActive)
 
         // The switch mesh we physically move + its captured rest pose, the per-switch motion model, the control's
         // own Animator (disabled while we drive so it can't overwrite us; restored on release), and the latest
@@ -206,11 +207,8 @@ namespace IronNestVR
         // ROTATE: lock the swing PLANE from the first real movement so the lever swings about one fixed hinge axis,
         // instead of a free point-at-hand that tilts about the wrong axis when the hand drifts sideways.
         private Vector3 _leverRotAxisW; private bool _leverHasRotAxis;
-        // Per-key LEARNED rotation axis, stored in the lever's rest-local frame (turret-stable). Seeded from the FIRST grab's
-        // live auto-infer — which followed the user's actual correct pull, so the sign is right by construction — and reused on
-        // every later grab so a buried lever swings the SAME correct direction each time. Replaces the captured-hinge axis
-        // derivation whose sign (from the lever-child's own frame) flipped grab-to-grab. Session-lifetime, all controls.
-        private static readonly System.Collections.Generic.Dictionary<string, Vector3> LeverAxisRestLocal = new System.Collections.Generic.Dictionary<string, Vector3>();
+        // (The old per-key auto-LEARNED axis cache was removed: the hinge axis now comes solely from the calibrated
+        // per-lever SwitchMotion.Axis, never inferred from hand motion — see SelectHeldStick.)
         // FIRE-MID-PULL: a hand-followed lever fires its EFFECT the moment you pull it to the bottom of its throw (so the
         // action happens while it's in your hand), then we SILENCE the canned animation for the rest of the hold so the
         // game's playback can't rip the lever out of your grip — DriveHeldStick keeps owning the visible lever. On release
@@ -741,6 +739,9 @@ namespace IronNestVR
             // identical every time. Levers: keep the laser-hit anchor for the swing (the swing is driven by _handPos);
             // LateApply glues the VISIBLE hand to the swinging handle. Non-levers (no _leverT): anchor the hand at the
             // calibrated spot too (it then rides the controller's push travel, throw projection unchanged).
+            // Two-state handle (e.g. power lever): pick the OFF/down grip set if the control is currently off. Latched
+            // for the whole grab so the hand doesn't pop to the other set mid-toggle.
+            _gripStateOff = _switchMotion.GripTwoState && !SwitchIsOn();
             bool rightHand = hand == 2;
             GetGrip(rightHand, out _, out _, out bool hasGrip);
             if (hasGrip)
@@ -1578,51 +1579,27 @@ namespace IronNestVR
             _leverSlideMax = capSlideFollow ? Mathf.Clamp(capSlideTravel > 0.01f ? capSlideTravel : 0.30f, 0.05f, 1.5f)
                            : (_switchMotion.Translate ? Mathf.Clamp(_switchMotion.Range, 0.03f, 0.4f) : 0.18f);
 
-            // AXIS priority: (1) manual menu override; (2) the captured cap's real travel direction; (3) a buried
-            // rotate-lever's FIXED axis from the game's captured motion (always the same way, not whichever way the
-            // controller first moved); (4) auto-infer.
-            Vector3 lockAxisLocal = Vector3.zero; Quaternion axisFrame = Quaternion.identity; bool haveLock = false;
-            if (_switchMotion.ManualAxis)
+            // AXIS comes from the CALIBRATED per-lever Axis — never auto-inferred from the hand's motion (too error-prone:
+            // it changed direction whenever the first nudge differed). The saved Axis (in the lever's rest-local frame) with
+            // the Direction flip is authoritative for every non-archetype lever, every grab, deterministically. Sources, in
+            // order: (1) a captured cap-slide keeps its real measured travel direction (charge rammer cap); (2) the calibrated
+            // Axis for all other levers. Orb-stick archetypes (charge rammer / punchcard) have no meaningful saved axis, so
+            // they fall through to the stable perpendicular axis below. A wrong calibrated direction is fixed in the menu
+            // (Axis / Direction) — and now that nothing auto-infers, that fix sticks on every later grab.
+            if (capSlideFollow && capSlideAxisW.sqrMagnitude > 1e-8f)
             {
-                lockAxisLocal = _switchMotion.Axis; if (_switchMotion.Flip) lockAxisLocal = -lockAxisLocal;
-                axisFrame = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
-                haveLock = true;
+                _leverSlideAxisW = capSlideAxisW.normalized; _leverHasSlideAxis = true;
             }
-            if (haveLock)
+            else if (!_leverStickArchetype)
             {
+                Vector3 lockAxisLocal = _switchMotion.Axis; if (_switchMotion.Flip) lockAxisLocal = -lockAxisLocal;
+                Quaternion axisFrame = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
                 Vector3 axW = (axisFrame * lockAxisLocal).normalized;
                 if (axW.sqrMagnitude > 1e-8f)
                 {
                     if (_leverSlide) { _leverSlideAxisW = axW; _leverHasSlideAxis = true; }
                     else { _leverRotAxisW = axW; _leverHasRotAxis = true; }
                 }
-            }
-            else if (capSlideFollow && capSlideAxisW.sqrMagnitude > 1e-8f)
-            {
-                _leverSlideAxisW = capSlideAxisW.normalized; _leverHasSlideAxis = true;
-            }
-            else if (_leverBuried && !_leverStickArchetype && _switchKey != null
-                     && LeverAxisRestLocal.TryGetValue(_switchKey, out Vector3 axRL) && axRL.sqrMagnitude > 1e-8f)
-            {
-                // REUSE the axis LEARNED on this lever's first grab (from the user's actual correct pull) — turret-stable
-                // because it's stored in the rest-local frame. This is the RELIABLE source of the correct one-directional sign;
-                // it replaces the captured-hinge derivation below, whose sign came from the lever-CHILD's frame and flipped.
-                // The menu "Direction" toggle (SwitchMotion.Flip) negates it, so a lever learned the WRONG way on a bad first
-                // pull can be corrected by the player (and SwitchFlipDir promotes it to a persistent ManualAxis so it sticks).
-                Quaternion fr = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
-                _leverRotAxisW = (fr * axRL).normalized;
-                if (_switchMotion.Flip) _leverRotAxisW = -_leverRotAxisW;
-                _leverHasRotAxis = true;
-                Log.LogInfo($"[manip] held-stick follow: reused learned hinge axis ({_leverRotAxisW.x:0.00},{_leverRotAxisW.y:0.00},{_leverRotAxisW.z:0.00}) flip={_switchMotion.Flip} for '{_switchKey}'.");
-            }
-            else if (_leverBuried && !_leverSlide && TryCapturedHingeAxisWorld(out Vector3 capAxW))
-            {
-                // FALLBACK (only if nothing learned yet): FIXED direction from the game's own rest→press of the lever child
-                // (reload '.RotateLever' etc.). Pulling the wrong way reads as negative swing → clamped to 0, so the lever
-                // won't move the wrong way. NOTE its sign can be unreliable (lever-child frame ≠ arm swing) — that's why the
-                // learned-axis tier above is preferred once the first grab has run.
-                _leverRotAxisW = capAxW; _leverHasRotAxis = true;
-                Log.LogInfo($"[manip] held-stick follow: fixed hinge axis from capture ({capAxW.x:0.00},{capAxW.y:0.00},{capAxW.z:0.00}).");
             }
 
             // ORB-STICK with no captured/manual axis (punchcard, charge rammer): lock a STABLE axis PERPENDICULAR to the rod
@@ -2631,20 +2608,9 @@ namespace IronNestVR
                 Vector3 toHand = _handPos - pivotW;
                 if (armW.sqrMagnitude > 1e-8f && toHand.sqrMagnitude > 1e-8f)
                 {
-                    if (!_leverHasRotAxis)
-                    {
-                        Vector3 a = Vector3.Cross(armW.normalized, toHand.normalized);
-                        if (a.sqrMagnitude >= 2e-3f)
-                        {
-                            _leverRotAxisW = SnapToPivotAxis(a.normalized); _leverHasRotAxis = true;
-                            // PERSIST this freshly-inferred axis per-key in the lever's turret-stable rest-local frame. The first
-                            // grab infers it from the user's ACTUAL correct pull (right sign by construction — SignedAngle about
-                            // Cross(arm,hand) is positive for that pull); every later grab then reuses it (SelectHeldStick) so a
-                            // buried lever swings the SAME correct direction every time instead of re-deriving a sign-flipped axis.
-                            if (_switchKey != null && _leverBuried && !_leverStickArchetype && _leverParent != null)
-                                try { Quaternion fr = _leverParent.rotation * _leverRestLocalR; LeverAxisRestLocal[_switchKey] = (Quaternion.Inverse(fr) * _leverRotAxisW).normalized; } catch { }
-                        }
-                    }
+                    // The hinge axis is the CALIBRATED one, already locked in SelectHeldStick — we never infer it from the
+                    // hand's motion here. If no axis was set (shouldn't happen for a calibrated lever), the lever simply
+                    // doesn't swing rather than guessing a (likely wrong) one.
                     if (_leverHasRotAxis)
                     {
                         Vector3 ap = Vector3.ProjectOnPlane(armW, _leverRotAxisW);
@@ -2653,11 +2619,9 @@ namespace IronNestVR
                         {
                             // Buried mechanism levers are ONE-DIRECTIONAL (rest→press only): the player wants each pull to move
                             // ONLY in the correct canned direction and refuse the wrong way — never a both-ways wiggle. The
-                            // correct SIGN is guaranteed by the per-key LEARNED axis (LeverAxisRestLocal: captured from the first
-                            // grab's live auto-infer, which followed the user's actual correct pull, and reused on every later
-                            // grab) instead of the sign-flipped captured-hinge derivation that made the cylinder reverse/stall.
-                            // The orb-stick archetype (charge rammer / punchcard) stays bidirectional — its axis is a sign-less
-                            // perpendicular guess, and the user confirmed it works that way.
+                            // correct SIGN comes from the CALIBRATED axis + Direction flip (SelectHeldStick) — a wrong-way pull
+                            // reads as negative swing and clamps to 0. The orb-stick archetype (charge rammer / punchcard) stays
+                            // bidirectional — its axis is a sign-less perpendicular guess, and the user confirmed it works that way.
                             float swingLo = (_leverBuried && !_leverStickArchetype) ? 0f : -_leverMaxAngle;
                             float swing = Mathf.Clamp(Vector3.SignedAngle(ap, hp, _leverRotAxisW), swingLo, _leverMaxAngle);
                             Quaternion restW = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
@@ -3402,15 +3366,7 @@ namespace IronNestVR
             if (!HasSwitchSelection) return;
             var m = SwitchMotions.Get(_selSwitchKey);
             m.Flip = !m.Flip;
-            // PROMOTE an auto-LEARNED axis to a DEFINITIVE manual one the moment the player sets the direction. The learned
-            // axis (LeverAxisRestLocal) is otherwise re-derived from the FIRST pull each session — so a fat-fingered wrong
-            // first pull would "ruin the lever" until restart. Baking the learned rest-local axis into the persisted
-            // SwitchMotion (ManualAxis=true) makes this direction stick across sessions and stops it ever re-learning a bad
-            // one. From here the ManualAxis tier owns it and Flip negates it, so the player has definitive per-lever control.
-            if (!m.ManualAxis && LeverAxisRestLocal.TryGetValue(_selSwitchKey, out var axRL) && axRL.sqrMagnitude > 1e-8f)
-            {
-                m.Axis = axRL.normalized; m.ManualAxis = true;
-            }
+            m.ManualAxis = true;   // mark the direction as deliberately set (the follow uses the saved Axis + this flip)
             SwitchMotions.Set(_selSwitchKey, m);
         }
 
@@ -3436,11 +3392,23 @@ namespace IronNestVR
         private Transform GripRef => _leverT != null ? _leverT : _switchRef;
 
         // This handle's calibrated grip pose for one hand (right vs left — the left model is mirrored, so each is
-        // stored separately). Reads the live grab's _switchMotion.
+        // stored separately). Reads the live grab's _switchMotion. For a two-state handle currently in its OFF/down
+        // state (latched in _gripStateOff at grab), returns the OFF grip when calibrated, else falls back to the main one.
         private void GetGrip(bool right, out Vector3 pos, out Vector3 eul, out bool has)
         {
+            if (_gripStateOff)
+            {
+                if (right && _switchMotion.HasGripROff) { pos = _switchMotion.GripPosROff; eul = _switchMotion.GripEulROff; has = true; return; }
+                if (!right && _switchMotion.HasGripLOff) { pos = _switchMotion.GripPosLOff; eul = _switchMotion.GripEulLOff; has = true; return; }
+            }
             if (right) { pos = _switchMotion.GripPosR; eul = _switchMotion.GripEulR; has = _switchMotion.HasGripR; }
             else { pos = _switchMotion.GripPosL; eul = _switchMotion.GripEulL; has = _switchMotion.HasGripL; }
+        }
+
+        // The control's logical on/off state (power lever: on=up, off=down). Defaults to ON if it can't be read.
+        private bool SwitchIsOn()
+        {
+            try { return _switch == null || _switch.GetActive(); } catch { return true; }
         }
 
         // World hand position from a hand's grip pose, in the given reference frame.
@@ -3477,13 +3445,18 @@ namespace IronNestVR
             return new Quaternion(t.x * inv, t.y * inv, t.z * inv, t.w * inv);
         }
 
-        // Menu hint: prompt to grab a lever, then (once holding one) which hand to use the OTHER grip on.
+        // Menu hint: prompt to grab a lever, then (once holding one) which hand to use the OTHER grip on. For a
+        // two-state handle it also shows which position you're calibrating (up/down), so you know to do both.
         public string GripCalText
         {
             get
             {
                 if (!_gripCalArmed) return "tap";
-                if (_kind == Kind.Switch && _switch != null) return _hand == 2 ? "R held: L grip" : "L held: R grip";
+                if (_kind == Kind.Switch && _switch != null)
+                {
+                    string h = _hand == 2 ? "R: L grip" : "L: R grip";
+                    return _switchMotion.GripTwoState ? h + (_gripStateOff ? " (down)" : " (up)") : h;
+                }
                 return "grab a lever";
             }
         }
@@ -3498,15 +3471,28 @@ namespace IronNestVR
                 : "off."));
         }
 
-        // Forget the selected handle's calibrated grip pose (BOTH hands) → it falls back to the laser-hit point.
+        // Forget the selected handle's calibrated grip pose (BOTH hands, BOTH states) → it falls back to the laser-hit point.
         public void GripResetSelected()
         {
             if (!HasSwitchSelection) return;
             var m = SwitchMotions.Get(_selSwitchKey);
             m.HasGripR = false; m.GripPosR = Vector3.zero; m.GripEulR = Vector3.zero;
             m.HasGripL = false; m.GripPosL = Vector3.zero; m.GripEulL = Vector3.zero;
+            m.HasGripROff = false; m.GripPosROff = Vector3.zero; m.GripEulROff = Vector3.zero;
+            m.HasGripLOff = false; m.GripPosLOff = Vector3.zero; m.GripEulLOff = Vector3.zero;
             SwitchMotions.Set(_selSwitchKey, m);
             if (_selSwitchKey == _switchKey) _switchMotion = m;   // mirror onto the live grab so it takes effect now
+        }
+
+        // Two-position grip: a handle with distinct up/down rests (power lever) keeps a separate grip per state.
+        public string GripTwoStateText => !HasSwitchSelection ? "—" : (SwitchMotions.Get(_selSwitchKey).GripTwoState ? "On" : "Off");
+        public void ToggleGripTwoState()
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            m.GripTwoState = !m.GripTwoState;
+            SwitchMotions.Set(_selSwitchKey, m);
+            if (_selSwitchKey == _switchKey) { _switchMotion = m; _gripStateOff = m.GripTwoState && !SwitchIsOn(); }
         }
 
         // Free-twist control: Off → X → Y → Z → Off, for the selected handle (the axis is in the grip-reference frame).
@@ -3567,8 +3553,17 @@ namespace IronNestVR
                 // old code "saved the old position." Re-express the dragged hand in the grip-reference frame.
                 Vector3 lpos = gripRef.InverseTransformPoint(_gripCalCurPos);
                 Vector3 leul = (Quaternion.Inverse(gripRef.rotation) * _gripCalCurRot).eulerAngles;
-                if (right) { _switchMotion.GripPosR = lpos; _switchMotion.GripEulR = leul; _switchMotion.HasGripR = true; }
-                else { _switchMotion.GripPosL = lpos; _switchMotion.GripEulL = leul; _switchMotion.HasGripL = true; }
+                // Store into this grab's state slot: the OFF/down set for a two-state handle currently off, else the main set.
+                if (_gripStateOff)
+                {
+                    if (right) { _switchMotion.GripPosROff = lpos; _switchMotion.GripEulROff = leul; _switchMotion.HasGripROff = true; }
+                    else { _switchMotion.GripPosLOff = lpos; _switchMotion.GripEulLOff = leul; _switchMotion.HasGripLOff = true; }
+                }
+                else
+                {
+                    if (right) { _switchMotion.GripPosR = lpos; _switchMotion.GripEulR = leul; _switchMotion.HasGripR = true; }
+                    else { _switchMotion.GripPosL = lpos; _switchMotion.GripEulL = leul; _switchMotion.HasGripL = true; }
+                }
                 SwitchMotions.Set(_switchKey, _switchMotion);
                 try { Config.Save(); } catch { }
                 // Re-base so the hand stays where you placed it: reset the free-twist reference to now (twist resumes
@@ -3582,7 +3577,7 @@ namespace IronNestVR
                     _switchHandAnchor = ComputeGripPosW(_switchRef, right);
                 }
                 input.Haptic(Config.DetentHapticAmplitude, 0.03f);   // tick: grip captured
-                Log.LogInfo($"[manip] grip calibrated '{_switchKey}' ({(right ? "right" : "left")} hand): pos={lpos}, eul={leul}.");
+                Log.LogInfo($"[manip] grip calibrated '{_switchKey}' ({(right ? "right" : "left")} hand, {(_gripStateOff ? "OFF/down" : "on")} state): pos={lpos}, eul={leul}.");
             }
 
             if (_gripCalAdjust)

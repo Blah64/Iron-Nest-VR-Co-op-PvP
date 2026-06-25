@@ -412,6 +412,9 @@ namespace IronNestVR
             // one (the laser grabs at any distance) — and hold your OTHER hand's grip to move the hand into a good
             // placement on the handle; release to set. Saved per handle and re-applied on every later grab.
             AddToggle("Calibrate Grip", () => Manip != null ? Manip.GripCalText : "—", () => Manip?.ToggleGripCalibrate());
+            // Two-position grip: handles with a distinct up/down rest (power lever) keep a separate grip per state.
+            // Turn On, then calibrate the grip once with the lever up and once with it down.
+            AddToggle("Two-Pos Grip", () => Manip != null ? Manip.GripTwoStateText : "—", () => Manip?.ToggleGripTwoState());
             // Free-twist: let the hand roll about one handle axis (like a fist on a cylinder) — Off / X / Y / Z.
             AddToggle("Grip Twist", () => Manip != null ? Manip.GripTwistText : "—", () => Manip?.GripCycleTwist());
             // Finger curl when gripping a handle (global) — loosen so the fingers leave room for the handle.
