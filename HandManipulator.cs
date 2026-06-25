@@ -53,8 +53,25 @@ namespace IronNestVR
         private LookAtTarget _switch;
         private Interactable _switchInteractable;
         private Vector3 _switchGrabGripPos;
+        private Quaternion _switchGrabGripRot;   // holding controller rotation at grab — the free-twist reference
+        private Quaternion _curGripRot;          // holding controller rotation this frame (for the free-twist follow)
         private Vector3 _switchHandAnchor;
         private bool _switchLatched;
+
+        // PER-HANDLE GRIP CALIBRATION (menu-armed, two-hand gesture — the same "grab with the OTHER hand and move it"
+        // feel as the clipboard/hand-model Calibrate). You grab a lever with one hand (the gravity-glove laser grabs
+        // it at ANY distance, so far-out-of-reach handles are fine), then press the OTHER controller's grip and
+        // drag/rotate the hand model into a good grip on the handle; release to set. The placed pose is stored per
+        // handle on its SwitchMotion (GripPos/GripEul, local to _switchRef so it's stable as the turret turns) and
+        // re-applied on every later grab — so each lever gets a consistent, deliberate hand placement instead of the
+        // hand snapping to wherever the laser happened to hit. Stays armed across grabs until toggled off in the menu.
+        private bool _gripCalArmed;          // menu toggle: the grip-calibration gesture is armed
+        private bool _gripCalAdjust;         // the opposite hand's grip is currently dragging the hand
+        private bool _prevGripCalGrip;       // edge-detect the opposite grip
+        private Vector3 _gripCalOppPos0, _gripCalHandPos0;     // opposite-controller + hand world poses at drag start
+        private Quaternion _gripCalOppRot0, _gripCalHandRot0;
+        private Vector3 _gripCalCurPos;      // the LATEST dragged hand pose — captured on release (DriveSwitch resets
+        private Quaternion _gripCalCurRot;   // _handPos/_handRot before the release frame's capture runs, so we can't read those)
 
         // The switch mesh we physically move + its captured rest pose, the per-switch motion model, the control's
         // own Animator (disabled while we drive so it can't overwrite us; restored on release), and the latest
@@ -288,6 +305,10 @@ namespace IronNestVR
         // reads this to hide that hand's pointing laser while it's operating something.
         public int HeldHand => _kind != Kind.None ? _hand : 0;
 
+        // Which hand is gripping a lever/handle (Switch or native-Lever kind — not a Dial knob), 0 none / 1 left /
+        // 2 right. HandVisuals reads this to curl that hand to the looser handle grip (room for the handle).
+        public int HandleGripHand => (_kind == Kind.Switch || _kind == Kind.Lever) ? _hand : 0;
+
         // The LEVER currently held by the LEFT hand (else null). CockpitInteractor pins this control's own
         // raycast camera to the LEFT pointer cam each frame so its native drag follows the left controller
         // (the periodic repoint otherwise pins every control to the right cam). Switches don't need it (their
@@ -361,12 +382,22 @@ namespace IronNestVR
         // showed "no change": the game re-poses the very nodes it animates (the lever meshes) after our Update. The working
         // '*Parent'-hinge controls don't need it (the game doesn't touch the parent), but re-applying their identical pose
         // here is harmless. Runs only while actively holding a click-switch lever; _handPos is this frame's cached grab.
-        public void LateApply()
+        public void LateApply(HandVisuals hands)
         {
             try
             {
                 if (_kind != Kind.Switch || _switch == null || _leverT == null) return;
+                if (_gripCalAdjust) return;   // freeze the lever while you're placing the hand on it (grip calibration)
                 DriveHeldStick();
+                // GLUE the visible hand to the swung handle: a calibrated lever rides _leverT (which we just swung),
+                // so the hand stays gripping the handle through the whole pull instead of drifting with the controller.
+                // Pose the hand TRANSFORM directly here (not SetGrab — that target is consumed back in Update and would
+                // be overwritten by the next DriveSwitch). The swing is still driven by _handPos (the controller), so
+                // this re-pose doesn't feed back into it.
+                bool right = _hand == 2;
+                GetGrip(right, out _, out _, out bool hasGrip);
+                if (hasGrip && hands != null)
+                    hands.PoseGrabbedLate(right, ComputeGripPosW(_leverT, right), ComputeGripRotW(_leverT, right));
             }
             catch (Exception e) { Log.LogWarning("[manip] LateApply " + e.Message); }
         }
@@ -700,11 +731,30 @@ namespace IronNestVR
 
             GetWorld(origin, HandGripPose(hand, input), out Vector3 gp, out Quaternion gr);
             _switchGrabGripPos = gp;     // controller anchor — throw is measured from here
+            _switchGrabGripRot = gr; _curGripRot = gr;   // free-twist reference (twist = 0 at grab)
             _switchHandAnchor = hitPoint; // seed the hand on the switch; it rides the controller travel
             _switchLatched = false;
             _handPos = hitPoint;
             _handRot = gr;
-            hands.SetGrab(hand == 2, _handPos, _handRot);
+            // PER-HANDLE GRIP: if THIS hand has a calibrated grip pose for this handle, place the hand at that exact
+            // spot/orientation on the handle instead of the raw laser-hit point, so the grab looks deliberate and
+            // identical every time. Levers: keep the laser-hit anchor for the swing (the swing is driven by _handPos);
+            // LateApply glues the VISIBLE hand to the swinging handle. Non-levers (no _leverT): anchor the hand at the
+            // calibrated spot too (it then rides the controller's push travel, throw projection unchanged).
+            bool rightHand = hand == 2;
+            GetGrip(rightHand, out _, out _, out bool hasGrip);
+            if (hasGrip)
+            {
+                _handRot = ComputeGripRotW(GripRef, rightHand);
+                if (_leverT == null && _switchRef != null)
+                {
+                    _switchHandAnchor = ComputeGripPosW(_switchRef, rightHand);
+                    _handPos = _switchHandAnchor;
+                }
+            }
+            _gripCalAdjust = false; _prevGripCalGrip = true;   // a held opposite grip carried in from before is swallowed
+            Vector3 visPos0 = (hasGrip && GripRef != null) ? ComputeGripPosW(GripRef, rightHand) : _handPos;
+            hands.SetGrab(hand == 2, visPos0, _handRot);
             input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
             Log.LogInfo($"[manip] grabbed switch '{sw.name}' ({(hand == 2 ? "right" : "left")}; {(_scrubManual ? $"scrub {_activeMovers.Count} drivers" : "learn")}).");
         }
@@ -793,10 +843,22 @@ namespace IronNestVR
             if (_switch == null || _switchRef == null) { Release(input, hands, "control gone"); return; }
 
             GetWorld(origin, HandGripPose(_hand, input), out Vector3 gp, out Quaternion gr);
+            _curGripRot = gr;
             Vector3 worldTravel = gp - _switchGrabGripPos;
             _handPos = _switchHandAnchor + worldTravel; // hand follows the controller so it looks operated
-            _handRot = gr;
-            hands.SetGrab(_hand == 2, _handPos, _handRot);
+            // A calibrated handle keeps its deliberate grip orientation (riding the handle, optionally free to twist
+            // about one axis); else the hand tracks the controller grip. Levers re-pose the visible hand in LateApply.
+            bool rightHand = _hand == 2;
+            GetGrip(rightHand, out _, out _, out bool hasGrip);
+            _handRot = hasGrip ? ComputeGripRotW(GripRef, rightHand) : gr;
+            // _handPos stays the controller-derived swing driver (feeds DriveHeldStick); the VISIBLE hand is glued to
+            // the handle when calibrated (LateApply locks it post-swing; this also targets the fly-in toward the handle).
+            Vector3 visPos = hasGrip ? ComputeGripPosW(GripRef, rightHand) : _handPos;
+            hands.SetGrab(_hand == 2, visPos, _handRot);
+
+            // PER-HANDLE GRIP CALIBRATION gesture (menu-armed): the OTHER hand's grip drags the hand on the handle.
+            // While actively dragging we suppress the throw (you're placing the hand, not pulling the lever).
+            if (_gripCalArmed) { GripCalibrateDrive(input, origin, hands); if (_gripCalAdjust) return; }
 
             // Hand travel in the reference PARENT-local frame — the frame the motion axis / push direction live in —
             // so the motion is defined relative to the switch wherever you stand.
@@ -1145,6 +1207,7 @@ namespace IronNestVR
         {
             try
             {
+                _gripCalAdjust = false; _prevGripCalGrip = true;   // end any in-progress grip-calibration drag with the grab
                 // PROBE: per-mover scrub result — local move, root-local (visible) move, stale-rest gap, write drift.
                 if (_scrubManual && _activeMovers != null && _switchKey != null)
                 {
@@ -3362,6 +3425,175 @@ namespace IronNestVR
         public void SwitchResetSelected()
         {
             if (HasSwitchSelection) SwitchMotions.Remove(_selSwitchKey);
+        }
+
+        // ---------------- per-handle grip calibration (menu) ----------------
+
+        public bool GripCalibrating => _gripCalArmed;
+
+        // The grip-reference transform a handle's calibrated pose lives in: the swinging hinge _leverT when there is
+        // one (so the hand rides the handle as it swings), else the stable control root _switchRef.
+        private Transform GripRef => _leverT != null ? _leverT : _switchRef;
+
+        // This handle's calibrated grip pose for one hand (right vs left — the left model is mirrored, so each is
+        // stored separately). Reads the live grab's _switchMotion.
+        private void GetGrip(bool right, out Vector3 pos, out Vector3 eul, out bool has)
+        {
+            if (right) { pos = _switchMotion.GripPosR; eul = _switchMotion.GripEulR; has = _switchMotion.HasGripR; }
+            else { pos = _switchMotion.GripPosL; eul = _switchMotion.GripEulL; has = _switchMotion.HasGripL; }
+        }
+
+        // World hand position from a hand's grip pose, in the given reference frame.
+        private Vector3 ComputeGripPosW(Transform gripRef, bool right)
+        {
+            GetGrip(right, out Vector3 pos, out _, out _);
+            return gripRef != null ? gripRef.TransformPoint(pos) : _handPos;
+        }
+
+        // World hand rotation from a hand's calibrated orientation, plus the optional free-twist about one handle
+        // axis: the hand rolls round that axis tracking the controller's twist since grab (like a fist on a cylinder).
+        private Quaternion ComputeGripRotW(Transform gripRef, bool right)
+        {
+            GetGrip(right, out _, out Vector3 eul, out _);
+            if (gripRef == null) return _curGripRot;
+            Quaternion baseR = gripRef.rotation * Quaternion.Euler(eul);
+            if (_switchMotion.GripTwistFree && _switchMotion.GripTwistAxis.sqrMagnitude > 1e-6f)
+            {
+                Vector3 axisW = (gripRef.rotation * _switchMotion.GripTwistAxis).normalized;
+                Quaternion dq = _curGripRot * Quaternion.Inverse(_switchGrabGripRot);   // controller roll since grab
+                baseR = TwistAbout(dq, axisW) * baseR;
+            }
+            return baseR;
+        }
+
+        // Swing-twist decomposition: the component of rotation q about unit axis a (the "twist").
+        private static Quaternion TwistAbout(Quaternion q, Vector3 a)
+        {
+            float d = q.x * a.x + q.y * a.y + q.z * a.z;
+            var t = new Quaternion(a.x * d, a.y * d, a.z * d, q.w);
+            float n = t.x * t.x + t.y * t.y + t.z * t.z + t.w * t.w;
+            if (n < 1e-8f) return Quaternion.identity;
+            float inv = 1f / Mathf.Sqrt(n);
+            return new Quaternion(t.x * inv, t.y * inv, t.z * inv, t.w * inv);
+        }
+
+        // Menu hint: prompt to grab a lever, then (once holding one) which hand to use the OTHER grip on.
+        public string GripCalText
+        {
+            get
+            {
+                if (!_gripCalArmed) return "tap";
+                if (_kind == Kind.Switch && _switch != null) return _hand == 2 ? "R held: L grip" : "L held: R grip";
+                return "grab a lever";
+            }
+        }
+
+        public void ToggleGripCalibrate()
+        {
+            _gripCalArmed = !_gripCalArmed;
+            _gripCalAdjust = false; _prevGripCalGrip = true;   // swallow an opposite grip that's already held as we enter
+            if (!_gripCalArmed) { try { Config.Save(); } catch { } }   // persist on finish
+            Log.LogInfo("[manip] grip calibrate " + (_gripCalArmed
+                ? "ARMED — grab a lever, then hold your OTHER hand's grip and move it to place the hand; release to set."
+                : "off."));
+        }
+
+        // Forget the selected handle's calibrated grip pose (BOTH hands) → it falls back to the laser-hit point.
+        public void GripResetSelected()
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            m.HasGripR = false; m.GripPosR = Vector3.zero; m.GripEulR = Vector3.zero;
+            m.HasGripL = false; m.GripPosL = Vector3.zero; m.GripEulL = Vector3.zero;
+            SwitchMotions.Set(_selSwitchKey, m);
+            if (_selSwitchKey == _switchKey) _switchMotion = m;   // mirror onto the live grab so it takes effect now
+        }
+
+        // Free-twist control: Off → X → Y → Z → Off, for the selected handle (the axis is in the grip-reference frame).
+        public string GripTwistText
+        {
+            get
+            {
+                if (!HasSwitchSelection) return "—";
+                var m = SwitchMotions.Get(_selSwitchKey);
+                return m.GripTwistFree ? AxisName(m.GripTwistAxis) : "Off";
+            }
+        }
+
+        public void GripCycleTwist()
+        {
+            if (!HasSwitchSelection) return;
+            var m = SwitchMotions.Get(_selSwitchKey);
+            if (!m.GripTwistFree) { m.GripTwistFree = true; m.GripTwistAxis = Vector3.right; }
+            else
+            {
+                string cur = AxisName(m.GripTwistAxis);
+                if (cur == "X") m.GripTwistAxis = Vector3.up;
+                else if (cur == "Y") m.GripTwistAxis = Vector3.forward;
+                else { m.GripTwistFree = false; m.GripTwistAxis = Vector3.zero; }   // Z → Off
+            }
+            SwitchMotions.Set(_selSwitchKey, m);
+            if (_selSwitchKey == _switchKey) _switchMotion = m;
+        }
+
+        // The two-hand grip-calibration drive. While the lever is held by _hand, the OPPOSITE controller's grip
+        // rigidly carries the hand model across the handle; on release we re-express the hand's world pose in the
+        // grip-reference frame and store it on this handle's SwitchMotion FOR THE HOLDING HAND (HasGripR/L). Mirrors
+        // GrabManager.HeldPoseAdjust / HandVisuals.CalibrateTick (same grab-with-the-other-hand-and-move gesture).
+        private void GripCalibrateDrive(VrInput input, Transform origin, HandVisuals hands)
+        {
+            if (_switch == null) return;
+            Transform gripRef = GripRef;
+            if (gripRef == null) return;
+            int opp = _hand == 2 ? 1 : 2;
+            bool oppValid = HandGripValid(opp, input);
+            bool oppGrip = HandGrab(opp, input);
+            if (!oppValid) { _prevGripCalGrip = oppGrip; return; }
+            GetWorld(origin, HandGripPose(opp, input), out Vector3 oPos, out Quaternion oRot);
+
+            if (oppGrip && !_prevGripCalGrip)
+            {
+                _gripCalOppPos0 = oPos; _gripCalOppRot0 = oRot;
+                _gripCalHandPos0 = _handPos; _gripCalHandRot0 = _handRot;
+                _gripCalAdjust = true;
+                input.Haptic(Config.HapticAmplitude, Config.HapticSeconds);
+            }
+            else if (!oppGrip && _prevGripCalGrip && _gripCalAdjust)
+            {
+                _gripCalAdjust = false;
+                bool right = _hand == 2;
+                // Capture the LATEST DRAGGED pose (_gripCalCurPos/Rot), NOT _handPos/_handRot — DriveSwitch already
+                // reset those to the anchor pose THIS frame before this release branch ran, which is exactly why the
+                // old code "saved the old position." Re-express the dragged hand in the grip-reference frame.
+                Vector3 lpos = gripRef.InverseTransformPoint(_gripCalCurPos);
+                Vector3 leul = (Quaternion.Inverse(gripRef.rotation) * _gripCalCurRot).eulerAngles;
+                if (right) { _switchMotion.GripPosR = lpos; _switchMotion.GripEulR = leul; _switchMotion.HasGripR = true; }
+                else { _switchMotion.GripPosL = lpos; _switchMotion.GripEulL = leul; _switchMotion.HasGripL = true; }
+                SwitchMotions.Set(_switchKey, _switchMotion);
+                try { Config.Save(); } catch { }
+                // Re-base so the hand stays where you placed it: reset the free-twist reference to now (twist resumes
+                // from neutral), and for a NON-lever also anchor the live position on the new spot (levers re-glue in
+                // LateApply, so they don't pop back). Levers leave _switchHandAnchor alone (it drives the swing).
+                GetWorld(origin, HandGripPose(_hand, input), out Vector3 hgp, out Quaternion hgr);
+                _switchGrabGripRot = hgr;
+                if (_leverT == null && _switchRef != null)
+                {
+                    _switchGrabGripPos = hgp;
+                    _switchHandAnchor = ComputeGripPosW(_switchRef, right);
+                }
+                input.Haptic(Config.DetentHapticAmplitude, 0.03f);   // tick: grip captured
+                Log.LogInfo($"[manip] grip calibrated '{_switchKey}' ({(right ? "right" : "left")} hand): pos={lpos}, eul={leul}.");
+            }
+
+            if (_gripCalAdjust)
+            {
+                Quaternion dq = oRot * Quaternion.Inverse(_gripCalOppRot0);
+                _handPos = oPos + dq * (_gripCalHandPos0 - _gripCalOppPos0);
+                _handRot = dq * _gripCalHandRot0;
+                _gripCalCurPos = _handPos; _gripCalCurRot = _handRot;   // remember it for the release-frame capture
+                hands.SetGrab(_hand == 2, _handPos, _handRot);
+            }
+            _prevGripCalGrip = oppGrip;
         }
 
         // Name the dominant principal axis of a (near-principal) local vector.

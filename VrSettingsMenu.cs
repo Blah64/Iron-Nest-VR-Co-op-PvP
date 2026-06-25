@@ -408,6 +408,17 @@ namespace IronNestVR
             AddAction("Recapture Push", () => Manip?.SwitchRecapturePush());
             AddAction("Reset This Switch", () => Manip?.SwitchResetSelected());
 
+            // Per-handle hand-grip calibration: tap to arm (stays armed across grabs), then grab a lever — even a far
+            // one (the laser grabs at any distance) — and hold your OTHER hand's grip to move the hand into a good
+            // placement on the handle; release to set. Saved per handle and re-applied on every later grab.
+            AddToggle("Calibrate Grip", () => Manip != null ? Manip.GripCalText : "—", () => Manip?.ToggleGripCalibrate());
+            // Free-twist: let the hand roll about one handle axis (like a fist on a cylinder) — Off / X / Y / Z.
+            AddToggle("Grip Twist", () => Manip != null ? Manip.GripTwistText : "—", () => Manip?.GripCycleTwist());
+            // Finger curl when gripping a handle (global) — loosen so the fingers leave room for the handle.
+            AddFloat("Grip Curl", () => Mathf.RoundToInt(Config.HandleGripCurl * 100f) + " %",
+                     d => Config.HandleGripCurl = Clamp(Config.HandleGripCurl + d * 0.05f, 0f, 1f));
+            AddAction("Reset Grip", () => Manip?.GripResetSelected());
+
             AddAction("Close Menu", Close);
         }
 

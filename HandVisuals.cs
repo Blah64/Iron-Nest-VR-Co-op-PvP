@@ -81,6 +81,12 @@ namespace IronNestVR
         private int _clipHoldHand;
         public void SetClipboardHold(int hand) { _clipHoldHand = hand; }
 
+        // Which hand is gripping a cockpit lever/handle (0 none, 1 left, 2 right). That hand curls to a looser
+        // grip (Config.HandleGripCurl) leaving room for the handle, instead of clenching a full fist through it.
+        // Set each frame by VrManager from HandManipulator.HandleGripHand, before Tick.
+        private int _handleGripHand;
+        public void SetHandleGrip(int hand) { _handleGripHand = hand; }
+
         // Current smoothed finger-curl amounts (0..1), streamed to the peer so the remote avatar's hands curl
         // too (index follows the trigger, "other" follows the grip). See CoopP2P / RemoteAvatar.
         public float RightCurlIndex => _right.CurlIndex;
@@ -186,6 +192,12 @@ namespace IronNestVR
             {
                 idx = Config.ClipHoldCurl;
                 oth = Config.ClipHoldCurl;
+            }
+            // Gripping a lever/handle: a looser, configurable curl so the fingers leave space for the handle.
+            else if (_handleGripHand != 0 && _handleGripHand == (h == _right ? 2 : 1))
+            {
+                idx = Config.HandleGripCurl;
+                oth = Config.HandleGripCurl;
             }
             // Ease the on/off grip so the fist doesn't pop (trigger is already analog).
             float k = Config.FingerCurlSmooth > 0f ? 1f - Mathf.Exp(-Config.FingerCurlSmooth * dt) : 1f;
@@ -295,6 +307,20 @@ namespace IronNestVR
         public void ClearGrab(bool right)
         {
             (right ? _right : _left).HasOverride = false;
+        }
+
+        // Re-pose a grabbed hand DIRECTLY in LateUpdate (after the game + our lever swing have run), bypassing the
+        // Update-phase PoseHand whose result is already stale by render time. SetGrab only sets the override TARGET,
+        // which PoseHand consumes in Update — so a LateUpdate SetGrab never reaches the transform this frame. This
+        // moves h.T itself so the end-of-frame eye render sees the hand glued to the handle. Only once the grab has
+        // fully blended in (Blend≈1); during the fly-in PoseHand still does the lerp toward the override. The model
+        // child keeps its calibrated offset/scale/curl (set on the child in Update), so we only move the root here.
+        public void PoseGrabbedLate(bool right, Vector3 pos, Quaternion rot)
+        {
+            var h = right ? _right : _left;
+            if (h == null || h.T == null) return;
+            h.OverridePos = pos; h.OverrideRot = rot;   // keep next Update's PoseHand consistent (no 1-frame flicker)
+            if (h.HasOverride && h.Blend > 0.999f) h.T.SetPositionAndRotation(pos, rot);
         }
 
         private void Hide()

@@ -464,6 +464,10 @@ namespace IronNestVR
         public static Vector3 ClipHeldEulerL = new Vector3(62.616592f, 190.85422f, 198.97607f);
         public static float ClipHoldCurl = 0.28f;
 
+        // Finger curl (0 = open .. 1 = fist) when a hand is gripping a cockpit lever/handle. Looser than a full
+        // fist so the fingers leave space for the handle rather than clenching through it. Menu-tunable (Switch tab).
+        public static float HandleGripCurl = 0.7f;
+
         // World "operating manual" props get their OWN held pose — their pivots differ from the clipboard's,
         // so the clipboard's offset would float them too far out. These are the FALLBACK defaults used until a
         // given manual is individually calibrated. Per-hand (grip frames mirror). (Holding-hand finger curl
@@ -726,6 +730,7 @@ namespace IronNestVR
                 WV(sb, "ClipHeldOffsetL", ClipHeldOffsetL);
                 WV(sb, "ClipHeldEulerL", ClipHeldEulerL);
                 WF(sb, "ClipHoldCurl", ClipHoldCurl);
+                WF(sb, "HandleGripCurl", HandleGripCurl);
                 WV(sb, "ManualHeldOffsetR", ManualHeldOffsetR);
                 WV(sb, "ManualHeldEulerR", ManualHeldEulerR);
                 WV(sb, "ManualHeldOffsetL", ManualHeldOffsetL);
@@ -873,6 +878,7 @@ namespace IronNestVR
                 case "ClipHeldOffsetL": ClipHeldOffsetL = PV(v, ClipHeldOffsetL); break;
                 case "ClipHeldEulerL": ClipHeldEulerL = PV(v, ClipHeldEulerL); break;
                 case "ClipHoldCurl": ClipHoldCurl = PF(v, ClipHoldCurl); break;
+                case "HandleGripCurl": HandleGripCurl = PF(v, HandleGripCurl); break;
                 case "ManualHeldOffsetR": ManualHeldOffsetR = PV(v, ManualHeldOffsetR); break;
                 case "ManualHeldEulerR": ManualHeldEulerR = PV(v, ManualHeldEulerR); break;
                 case "ManualHeldOffsetL": ManualHeldOffsetL = PV(v, ManualHeldOffsetL); break;

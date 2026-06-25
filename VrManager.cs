@@ -109,7 +109,7 @@ namespace IronNestVR
             // Update, overwriting the swing before render (a confirmed-correct lever moved in our log yet looked static).
             if (_xrReady && _frameActive && _handManip != null)
             {
-                try { _handManip.LateApply(); } catch { }
+                try { _handManip.LateApply(_hands); } catch { }
             }
 
             // Same-machine test: the game pauses its SCALED-time sim/animations on an UNFOCUSED window
@@ -497,6 +497,7 @@ namespace IronNestVR
                     }
                     _grab.ReconcileScale(); // live clipboard size, even with the menu open
                     _hands.SetClipboardHold(_grab.ClipboardHoldHand); // pose the holding hand as cradling the board
+                    _hands.SetHandleGrip(_handManip.HandleGripHand);  // looser finger curl while gripping a lever/handle
                     _hands.Tick(_xr.Input, _rig, active); // pose hand models (after manip sets overrides)
 
                     // Co-op: stream our head + hand world poses (and finger curl) to the peer (mirrored as
