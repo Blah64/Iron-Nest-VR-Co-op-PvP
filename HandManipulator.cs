@@ -167,6 +167,15 @@ namespace IronNestVR
         // the rod in place (only the offset orb appeared to move). For these we lock a STABLE axis perpendicular to the rod
         // and allow the swing BOTH ways (bidirectional), so the visible stick actually sweeps toward the hand.
         private bool _leverStickArchetype;
+        // CAP-TRACK (requisition console's pull-handle): the pivot 'Locking Lever' is GPU-instanced/undriveable, but the cap
+        // the user grabs ('Cylinder.001') is animated by the GAME during the requisition. For THIS control the user wants the
+        // CAP to drive the hand (not the hand to drive the cap): we DON'T touch the cap at all (game owns + animates it
+        // normally — _leverT stays null, so it's a plain activate-only click), and each frame we read the cap's LIVE pose and
+        // glue the hand to it via the rigid grab offset. So the hand rides the game-animated cap. DriveSwitch + LateApply
+        // pose the hand from _phantomTrackT; the offset is captured in the cap's local frame at grab.
+        private Transform _phantomTrackT;
+        private Vector3 _phantomTrackLocalPos;
+        private Quaternion _phantomTrackLocalRot = Quaternion.identity;
         // DIAG: paint the driven node red / rider green on grab so the user can confirm WHICH mesh we move. Flip off to ship.
         private const bool TintHeldStick = false;
         private struct TintEntry { public Renderer R; public Color C; }
@@ -390,15 +399,24 @@ namespace IronNestVR
         {
             try
             {
-                if (_kind != Kind.Switch || _switch == null || _leverT == null) return;
+                if (_kind != Kind.Switch || _switch == null) return;
                 if (_gripCalAdjust) return;   // freeze the lever while you're placing the hand on it (grip calibration)
+                bool right = _hand == 2;
+                // CAP-TRACK handle (requisition cap): _leverT is null (the game owns + animates the cap). Read the cap's LIVE
+                // pose now (AFTER the game posed it this frame) and glue the hand to it, so the cap drives the hand.
+                if (_phantomTrackT != null)
+                {
+                    if (hands != null && TryCapTrackHandPose(out Vector3 ctPos, out Quaternion ctRot))
+                        hands.PoseGrabbedLate(right, ctPos, ctRot);
+                    return;
+                }
+                if (_leverT == null) return;
                 DriveHeldStick();
                 // GLUE the visible hand to the swung handle: a calibrated lever rides _leverT (which we just swung),
                 // so the hand stays gripping the handle through the whole pull instead of drifting with the controller.
                 // Pose the hand TRANSFORM directly here (not SetGrab — that target is consumed back in Update and would
                 // be overwritten by the next DriveSwitch). The swing is still driven by _handPos (the controller), so
                 // this re-pose doesn't feed back into it.
-                bool right = _hand == 2;
                 GetGrip(right, out _, out _, out bool hasGrip);
                 if (hasGrip && hands != null)
                     hands.PoseGrabbedLate(right, ComputeGripPosW(_leverT, right), ComputeGripRotW(_leverT, right));
@@ -745,6 +763,10 @@ namespace IronNestVR
             _switchGrabGripRot = gr; _curGripRot = gr;   // free-twist reference (twist = 0 at grab)
             _switchHandAnchor = hitPoint; // seed the hand on the switch; it rides the controller travel
             _switchLatched = false;
+            // CAP-TRACK: capture the hand's grab ORIENTATION in the cap's local frame (the position offset _phantomTrackLocalPos
+            // was set in SelectHeldStick). Each frame the hand rides the game-animated cap rigidly via these two offsets.
+            if (_phantomTrackT != null)
+                try { _phantomTrackLocalRot = Quaternion.Inverse(_phantomTrackT.rotation) * gr; } catch { _phantomTrackLocalRot = Quaternion.identity; }
             _handPos = hitPoint;
             _handRot = gr;
             // PER-HANDLE GRIP: if THIS hand has a calibrated grip pose for this handle, place the hand at that exact
@@ -915,6 +937,11 @@ namespace IronNestVR
 
             // The held stick follows the hand on EVERY grab (learn or scrub) — independent of the mechanism replay below.
             DriveHeldStick();
+
+            // CAP-TRACK handle (requisition cap): the game owns + animates the cap; glue the hand to its live pose so the cap
+            // drives the hand. Provisional here; LateApply re-asserts it after the game animates the cap this frame.
+            if (_phantomTrackT != null && TryCapTrackHandPose(out Vector3 ctPos, out Quaternion ctRot))
+                hands.SetGrab(_hand == 2, ctPos, ctRot);
 
             // A FOLLOWED lever also activates by how far the LEVER ITSELF actually swung/slid (its tip travel / deflection),
             // not only by hand travel projected onto the captured push direction. That auto-seeded PushLocal can land along
@@ -1313,6 +1340,7 @@ namespace IronNestVR
             catch { }
             _switch = null; _switchInteractable = null; _switchLatched = false;
             _switchScrubDone = false; _scrubManual = false; _activeMovers = null; _scrubAnimators = null;
+            _phantomTrackT = null;   // stop riding the requisition cap
             _leverT = null; _leverParent = null; _leverCon = null;
             _leverPinT = null; _leverPinP = null; _leverPinR = null;   // stop pinning → the lever returns to the animation's pose
             _leverDecorT = null; _leverDecorSnapP = null; _leverDecorSnapR = null;   // stop riding the end-decor → it returns to anim
@@ -1449,7 +1477,7 @@ namespace IronNestVR
         // the held stick, so we never pick from them. Seeded from the grab point; null => no synthetic swing this grab.
         private void SelectHeldStick(Transform grabbed, Vector3 grabPoint)
         {
-            _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f; _leverArmed = false; _leverBuried = false; _capSlideFollow = false; _leverStickArchetype = false;
+            _leverT = null; _leverParent = null; _leverCon = null; _leverTipTravel = 0f; _leverArmed = false; _leverBuried = false; _capSlideFollow = false; _leverStickArchetype = false; _phantomTrackT = null;
             _riderT = null; _riderParent = null; _riderCon = null; _riderTravel = 0f; _leverFollowFrac = 0f;
             if (_riders != null) _riders.Clear();   // their constraints were already re-enabled by RestoreScrubDrivers on the prior release
             if (_forcedRends != null) _forcedRends.Clear();   // renderer-enable already restored by RestoreScrubDrivers on the prior release
@@ -1504,21 +1532,45 @@ namespace IronNestVR
                         SetRider(rider0, rAxisW0, rTravel0);
                 }
             }
+            // Cap-slide state (a constraint-driven cap mesh, e.g. 'Cylinder.001', driven 1:1 along its travel; set in tier 4).
+            bool capSlideFollow = false;
+            Vector3 capSlideAxisW = Vector3.zero; float capSlideTravel = 0f;
             if (pivot == null)
             {
                 pivot = FindAssemblyLever(grabbed, grabPoint);       // tier 3a: a lever-named handle in a SIBLING subtree
-                // PUNCHCARD: the visible handle ('Locking Lever') is GPU-instanced and only renders while the game's OWN
-                // submit animation actively plays — it cannot be hand-followed (proven over passes 26-34: it ignores
-                // transform writes AND a held/disabled animator; an enabled animator gets reverted to idle by the game every
-                // frame). Per the user, leave this lever as a plain THRESHOLD TRIGGER with no custom visual movement: don't
-                // drive a held stick (leave _leverT null) so DriveSwitch fires the click when the hand pulls a set distance
-                // in the slide/push direction, exactly like the base control.
+                // GPU-INSTANCED handle ('Locking Lever'): the visible mesh only renders while the game's OWN submit animation
+                // actively plays — it CANNOT be hand-followed (proven over passes 26-34: it ignores transform writes AND a
+                // held/disabled animator; an enabled animator gets reverted to idle every frame). So we never drive THAT mesh.
                 if (pivot != null && !HasVisibleEnabledMesh(pivot))
                 {
-                    Log.LogInfo($"[manip] held-stick follow: '{SafeName(grabbed)}' handle '{SafeName(pivot)}' is GPU-instanced (renders only during the game's own animation) — activate-only threshold trigger, no visual follow.");
-                    return;
+                    // REQUISITION lever ('Locking Lever'): the Locking Lever mesh is undriveable, BUT the cap the user grabs
+                    // ('Cylinder.001') is a normal mesh the GAME animates during the requisition. For this control the user
+                    // wants the CAP to drive the HAND (not the hand to drive the cap), with the cap keeping its own game
+                    // animation. So we DON'T drive/disable anything — leave _leverT null (plain activate-only click + the game
+                    // owns + animates the cap) and just CAP-TRACK: record the cap + the rigid grab offset, then glue the hand
+                    // to the cap's live pose each frame (DriveSwitch + LateApply). Any OTHER GPU-instanced handle stays a plain
+                    // activate-only trigger with no follow.
+                    if (IsPhantomFollowHandle(pivot))
+                    {
+                        Transform cap = FindCapturedCapMover(grabbed, out _, out _);
+                        if (cap == null) cap = FindOrbCapGeometric(grabbed, null, grabPoint);
+                        if (cap != null)
+                        {
+                            _phantomTrackT = cap;
+                            try { _phantomTrackLocalPos = cap.InverseTransformPoint(grabPoint); } catch { _phantomTrackLocalPos = Vector3.zero; }
+                            Log.LogInfo($"[manip] held-stick follow: '{SafeName(grabbed)}' → cap-TRACK '{SafeName(cap)}' ('Locking Lever' GPU-instanced; the game animates the cap, the hand rides it — cap drives the hand).");
+                        }
+                        else
+                            Log.LogInfo($"[manip] held-stick follow: '{SafeName(grabbed)}' GPU-instanced, no cap mesh to track yet — activate-only (pull again to capture the cap).");
+                        return;   // _leverT stays null → plain click + game-owned cap; hand glued via _phantomTrackT
+                    }
+                    else
+                    {
+                        Log.LogInfo($"[manip] held-stick follow: '{SafeName(grabbed)}' handle '{SafeName(pivot)}' is GPU-instanced (renders only during the game's own animation) — activate-only threshold trigger, no visual follow.");
+                        return;
+                    }
                 }
-                if (pivot != null)
+                else if (pivot != null)
                 {
                     _leverBuried = true; _leverStickArchetype = true;
                     // The user actually GRABS the orb-cap ('Cylinder.001'), a constraint-driven mesh child of the button
@@ -1534,8 +1586,6 @@ namespace IronNestVR
             {
                 pivot = FindParentHinge(grabbed, grabPoint);         // tier 3b: a small per-control parent not named '*Parent' (toggle)
             }
-            bool capSlideFollow = false;
-            Vector3 capSlideAxisW = Vector3.zero; float capSlideTravel = 0f;
             if (pivot == null)
             {
                 // tier 4: no '*Parent' hinge and no lever-named child IN the grabbed subtree. Use the captured motion:
@@ -1707,6 +1757,15 @@ namespace IronNestVR
                 try { t = t.parent; } catch { t = null; }
             }
             return false;
+        }
+
+        // The requisition console's pull-handle ('Locking Lever') is GPU-instanced — its mesh can't be hand-driven, so it
+        // was an activate-only trigger. The user wants the HAND to ride its pull arc anyway: this opts that ONE handle into
+        // PHANTOM follow by name, so any other GPU-instanced handle (future controls) keeps the plain activate-only trigger.
+        private static bool IsPhantomFollowHandle(Transform pivot)
+        {
+            string n = SafeName(pivot);
+            return !string.IsNullOrEmpty(n) && n.ToLowerInvariant().Contains("locking lever");
         }
 
         // Look up tuning saved under an OLDER key scheme so it can migrate to the new per-control key: builds keyed by
@@ -2711,6 +2770,18 @@ namespace IronNestVR
                     if (td > _leverTipTravel) _leverTipTravel = td;
                 }
                 catch { }
+        }
+
+        // CAP-TRACK (requisition console): the game animates the cap (_phantomTrackT) on its own; we ONLY read its live world
+        // pose and return the hand pose glued to it via the rigid grab offset captured at grab — so the cap drives the hand.
+        // Read AFTER the game has posed the cap this frame (call from LateApply). Returns false if the cap is gone.
+        private bool TryCapTrackHandPose(out Vector3 posW, out Quaternion rotW)
+        {
+            posW = _handPos; rotW = _curGripRot;
+            if (_phantomTrackT == null) return false;
+            try { posW = _phantomTrackT.TransformPoint(_phantomTrackLocalPos); rotW = _phantomTrackT.rotation * _phantomTrackLocalRot; }
+            catch { return false; }
+            return true;
         }
 
         // Drive the RIDER (charge rammer orb-light) by RIGIDLY co-moving it with the stick's exact transform delta this
