@@ -1577,7 +1577,11 @@ namespace IronNestVR
                 return;
             }
             float arm = 0f; try { arm = Vector3.Distance(grabPoint, pivot.position); } catch { }
-            if (arm < 0.03f)
+            // A near-zero arm makes the aim-at-hand swing math meaningless, so normally we bail. But a ROTATE-ACTIVATE
+            // toggle (Review Console) doesn't aim at the hand — it swings the pivot by the controller-twist PROGRESS about
+            // the calibrated axis — so it works even when you grab dead-centre on the pivot (arm≈0). Without this bypass,
+            // a centre grab left _leverT null → the toggle fired but the mesh never moved (the reported symptom).
+            if (arm < 0.03f && !_switchRotateActivate)
             {
                 Log.LogInfo($"[manip] held-stick follow: hinge '{SafeName(pivot)}' arm<3cm ({arm:0.000}) — no swing.");
                 return;
