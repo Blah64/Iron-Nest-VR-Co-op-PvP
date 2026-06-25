@@ -35,6 +35,7 @@ namespace IronNestVR
         private Material _vigMat;          // its colour alpha is the live darkness
         private float _vigCurrent;         // smoothed 0..1 darkness actually applied
         private Fovf _lastFov;             // most recent eye FOV, for sizing the head-locked overlay
+        private float _vigDiagNext;        // throttle for the visibility diagnostic
         private bool _ready;
         private int _eyeMask = -1; // captured scene cull mask (for the eye-cull diagnostic)
         private bool _useEnabledFallback;
@@ -312,6 +313,21 @@ namespace IronNestVR
                 try { _vigMat.color = c; } catch { }
                 try { if (_vigMat.HasProperty("_Color")) _vigMat.SetColor("_Color", c); } catch { }
             }
+
+            // Decisive diagnostic while the vignette SHOULD be showing: is it culled, or drawing-but-invisible?
+            if (_vigMr != null && _vigCurrent > 0.05f && Time.unscaledTime >= _vigDiagNext)
+            {
+                _vigDiagNext = Time.unscaledTime + 1f;
+                Vector3 wp = _vig != null ? _vig.transform.position : Vector3.zero;
+                Vector3 ls = _vig != null ? _vig.transform.lossyScale : Vector3.zero;
+                Vector3 ep = _cam[0] != null ? _cam[0].transform.position : Vector3.zero;
+                float ba = -1f, sb = -1f, db = -1f;
+                try { if (_vigMat.HasProperty("_BaseColor")) ba = _vigMat.GetColor("_BaseColor").a; } catch { }
+                try { sb = _vigMat.GetFloat("_SrcBlend"); db = _vigMat.GetFloat("_DstBlend"); } catch { }
+                Log.LogInfo($"[vignette] state cur={_vigCurrent:0.00} en={_vigMr.enabled} vis={_vigMr.isVisible} " +
+                            $"act={(_vig != null && _vig.activeInHierarchy)} pos={wp} eye0={ep} scale={ls} " +
+                            $"baseA={ba:0.00} blend={sb}/{db} q={_vigMat.renderQueue} kw={_vigMat.shaderKeywords?.Length ?? -1}");
+            }
         }
 
         // Reserve ONE layer for the overlay. The main camera renders "Everything", so we can't find an unused bit;
@@ -410,7 +426,9 @@ namespace IronNestVR
             float tanY = Mathf.Max(Mathf.Tan(_lastFov.AngleUp), Mathf.Abs(Mathf.Tan(_lastFov.AngleDown)));
             if (tanX < 0.1f || float.IsNaN(tanX)) tanX = 1f; // FOV not read yet — generous (~45°)
             if (tanY < 0.1f || float.IsNaN(tanY)) tanY = 1f;
-            _vig.transform.localScale = new Vector3(2f * (d * tanX * m + 0.06f), 2f * (d * tanY * m + 0.06f), 1f);
+            // Size STRICTLY proportional to the FOV (no fixed slack — a fixed term swamps a small FOV and pushes
+            // the whole dark ring outside the view). Margin is the only overscan, so the ratio holds at any FOV.
+            _vig.transform.localScale = new Vector3(2f * d * tanX * m, 2f * d * tanY * m, 1f);
         }
 
         // Black RGB, radial alpha ramp: clear inside ApertureInner, fully opaque by ApertureOuter (of the

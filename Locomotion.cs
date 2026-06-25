@@ -74,9 +74,8 @@ namespace IronNestVR
                 }
             }
 
-            // Comfort tunnelling vignette: darken the periphery during smooth artificial motion. Driven every
-            // frame (even with locomotion disabled — smooth turn still counts) and BEFORE the early-outs below.
-            UpdateVignette(input, rig, dt);
+            // NOTE: the comfort vignette is driven by DriveVignette(), called every active frame from VrManager
+            // (so it also works while the menu/popup is open — Locomotion.Tick is skipped then). Don't drive it here.
 
             if (!Config.LocomotionEnabled) { HideTele(); return; }
             try
@@ -144,8 +143,8 @@ namespace IronNestVR
         // Compute how strongly to darken the periphery this frame and hand it to the rig (which smooths +
         // renders it). Smooth translation contributes only in smooth-locomotion mode (teleport blinks instead);
         // smooth turn always contributes. A just-fired teleport adds a brief full-strength blink regardless of
-        // the movement-vignette toggle.
-        private void UpdateVignette(VrInput input, CameraRig rig, float dt)
+        // the movement-vignette toggle. Called EVERY active frame by VrManager (works with the menu open too).
+        public void DriveVignette(VrInput input, CameraRig rig, float dt)
         {
             if (rig == null) return;
 

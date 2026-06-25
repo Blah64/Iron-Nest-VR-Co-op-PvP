@@ -461,6 +461,10 @@ namespace IronNestVR
                     // _locomotion.Tick below, which may add this frame's view-turn yaw.)
                     _rig.UpdateOrigin();
 
+                    // Comfort vignette: drive it EVERY active frame (even with the menu/popup open, where
+                    // Locomotion.Tick is skipped) so the on-screen toggle gives immediate feedback.
+                    _locomotion.DriveVignette(_xr.Input, _rig, dt);
+
                     // Click BOTH thumbsticks at once to open/close the VR settings menu.
                     bool chord = _xr.Input.StickClickL && _xr.Input.StickClickR;
                     if (chord && !_prevChord) _menu.Toggle(_rig);

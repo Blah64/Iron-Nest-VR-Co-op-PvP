@@ -451,11 +451,13 @@ namespace IronNestVR
         // Head-locked overlay distance in front of the eyes (m). Far enough for comfortable convergence, near
         // enough that cockpit geometry (esp. the close peripheral walls) sits behind it instead of occluding it.
         public static float VignetteDistance = 0.2f;
-        // Oversize vs the eye frustum so the dark edge always reaches past the visible FOV (no hard cutoff).
-        public static float VignetteCoverMargin = 1.2f;
-        // Radial alpha ramp (fraction of half-extent): clear inside Inner, fully dark by Outer.
-        public static float VignetteApertureInner = 0.40f;
-        public static float VignetteApertureOuter = 0.95f;
+        // Slight proportional overscan so the dark edge reaches just past the visible FOV (no hard cutoff). Keep
+        // this near 1 — it must NOT be a fixed additive term, which would swamp a small FOV (see PlaceVignette).
+        public static float VignetteCoverMargin = 1.1f;
+        // Radial alpha ramp (fraction of half-extent): clear inside Inner, fully dark by Outer. AGGRESSIVE by
+        // default right now (tiny clear centre) to confirm coverage on a small FOV — soften once verified.
+        public static float VignetteApertureInner = 0.06f;
+        public static float VignetteApertureOuter = 0.40f;
         // Fade time-constant (s) as the vignette opens/closes — keep snappy so it tracks motion without lag.
         public static float VignetteFadeTime = 0.10f;
 
