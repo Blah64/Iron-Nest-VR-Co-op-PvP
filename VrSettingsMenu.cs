@@ -413,8 +413,11 @@ namespace IronNestVR
             // placement on the handle; release to set. Saved per handle and re-applied on every later grab.
             AddToggle("Calibrate Grip", () => Manip != null ? Manip.GripCalText : "—", () => Manip?.ToggleGripCalibrate());
             // Two-position grip: handles with a distinct up/down rest (power lever) keep a separate grip per state.
-            // Turn On, then calibrate the grip once with the lever up and once with it down.
+            // Turn On, then calibrate Up (place hand), flip "Calibrate Pos" to Down, calibrate again.
             AddToggle("Two-Pos Grip", () => Manip != null ? Manip.GripTwoStateText : "—", () => Manip?.ToggleGripTwoState());
+            // Which position the grip calibration targets (Up/Down) — explicit, so the save lands in the slot you pick
+            // rather than depending on the game reporting the lever's state. Flip it between the two calibrations.
+            AddToggle("Calibrate Pos", () => Manip != null ? Manip.GripCalPosText : "—", () => Manip?.ToggleGripCalPos());
             // Free-twist: let the hand roll about one handle axis (like a fist on a cylinder) — Off / X / Y / Z.
             AddToggle("Grip Twist", () => Manip != null ? Manip.GripTwistText : "—", () => Manip?.GripCycleTwist());
             // Finger curl when gripping a handle (global) — loosen so the fingers leave room for the handle.

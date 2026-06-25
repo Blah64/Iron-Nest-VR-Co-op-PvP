@@ -72,7 +72,11 @@ namespace IronNestVR
         private Quaternion _gripCalOppRot0, _gripCalHandRot0;
         private Vector3 _gripCalCurPos;      // the LATEST dragged hand pose — captured on release (DriveSwitch resets
         private Quaternion _gripCalCurRot;   // _handPos/_handRot before the release frame's capture runs, so we can't read those)
-        private bool _gripStateOff;          // this grab uses the OFF/down grip set (two-state handle, latched at grab from GetActive)
+        private bool _gripStateOff;          // this grab uses the OFF/down grip set (two-state handle, latched at grab)
+        private bool _calStateOff;           // CALIBRATION target slot for a two-state handle (menu "Calibrate Pos": false=up/on, true=down/off).
+                                             // While calibrating we use THIS explicit choice, not GetActive — so saving a grip never depends on
+                                             // the game reporting up/down correctly. Normal play picks the slot by where the hand grabbed (below).
+        private Vector3 _gripClassifyHit;    // last grab's hit point (hinge-local nearest-grip state classify; GetActive() is unreliable here)
 
         // The switch mesh we physically move + its captured rest pose, the per-switch motion model, the control's
         // own Animator (disabled while we drive so it can't overwrite us; restored on release), and the latest
@@ -739,10 +743,14 @@ namespace IronNestVR
             // identical every time. Levers: keep the laser-hit anchor for the swing (the swing is driven by _handPos);
             // LateApply glues the VISIBLE hand to the swinging handle. Non-levers (no _leverT): anchor the hand at the
             // calibrated spot too (it then rides the controller's push travel, throw projection unchanged).
-            // Two-state handle (e.g. power lever): pick the OFF/down grip set if the control is currently off. Latched
-            // for the whole grab so the hand doesn't pop to the other set mid-toggle.
-            _gripStateOff = _switchMotion.GripTwoState && !SwitchIsOn();
+            // Two-state handle (e.g. power lever): pick the OFF/down grip set. While calibrating, that's the explicit
+            // menu "Calibrate Pos"; in normal play it's classified by where the hand grabbed (GetActive is unreliable
+            // here). Latched for the whole grab so the hand doesn't pop to the other set mid-toggle.
+            _gripClassifyHit = hitPoint;
             bool rightHand = hand == 2;
+            _gripStateOff = ComputeGripStateOff(rightHand);
+            if (_switchMotion.GripTwoState)
+                Log.LogInfo($"[manip] two-state grip '{_switchKey}': stateOff={_gripStateOff} (calArmed={_gripCalArmed}, calPos={(_calStateOff ? "down" : "up")}, live-active={SwitchIsOn()}).");
             GetGrip(rightHand, out _, out _, out bool hasGrip);
             if (hasGrip)
             {
@@ -3411,6 +3419,37 @@ namespace IronNestVR
             try { return _switch == null || _switch.GetActive(); } catch { return true; }
         }
 
+        // Which grip slot this grab uses for a two-state handle. While the grip-calibration tool is armed we use the
+        // EXPLICIT menu choice (_calStateOff) so a save lands in the slot the user picked. Outside calibration we pick
+        // the slot by WHERE the hand grabbed — NOT GetActive() (verified unreliable: it returns a constant for the
+        // power lever, so the runtime always read the same slot = "only one grip position").
+        private bool ComputeGripStateOff(bool right)
+        {
+            if (!_switchMotion.GripTwoState) return false;
+            return _gripCalArmed ? _calStateOff : ClassifyStateOffByGrab(right, _gripClassifyHit);
+        }
+
+        // Runtime up/down classification WITHOUT GetActive(): the on/off grips sit far apart in the hinge's local frame
+        // (the handle is at a different spot in each state), so transform the actual grab point into that frame and pick
+        // whichever stored grip it's nearer to. Falls back to whichever single grip exists, else the game's on/off state.
+        private bool ClassifyStateOffByGrab(bool right, Vector3 hitPoint)
+        {
+            if (!_switchMotion.GripTwoState) return false;
+            bool hasOn  = right ? _switchMotion.HasGripR    : _switchMotion.HasGripL;
+            bool hasOff = right ? _switchMotion.HasGripROff : _switchMotion.HasGripLOff;
+            Transform gr = GripRef;
+            if (gr != null && hasOn && hasOff)
+            {
+                Vector3 local = gr.InverseTransformPoint(hitPoint);
+                Vector3 onP  = right ? _switchMotion.GripPosR    : _switchMotion.GripPosL;
+                Vector3 offP = right ? _switchMotion.GripPosROff : _switchMotion.GripPosLOff;
+                return (local - offP).sqrMagnitude < (local - onP).sqrMagnitude;
+            }
+            if (hasOff && !hasOn) return true;    // only the off/down grip calibrated
+            if (hasOn && !hasOff) return false;   // only the on/up grip calibrated
+            return !SwitchIsOn();                 // neither calibrated yet → fall back to the game state
+        }
+
         // World hand position from a hand's grip pose, in the given reference frame.
         private Vector3 ComputeGripPosW(Transform gripRef, bool right)
         {
@@ -3492,7 +3531,26 @@ namespace IronNestVR
             var m = SwitchMotions.Get(_selSwitchKey);
             m.GripTwoState = !m.GripTwoState;
             SwitchMotions.Set(_selSwitchKey, m);
-            if (_selSwitchKey == _switchKey) { _switchMotion = m; _gripStateOff = m.GripTwoState && !SwitchIsOn(); }
+            _calStateOff = false;   // start calibrating from the Up/On position
+            if (_selSwitchKey == _switchKey) { _switchMotion = m; _gripStateOff = ComputeGripStateOff(_hand == 2); }
+        }
+
+        // Which position the grip calibration targets on a two-state handle. EXPLICIT (not auto-detected) so a save
+        // always lands in the slot you picked — calibrate Up, place the hand, switch to Down, place it again. Flipping
+        // it while holding the selected lever re-poses the hand to that slot's grip immediately.
+        public string GripCalPosText
+        {
+            get
+            {
+                if (!HasSwitchSelection) return "—";
+                if (!SwitchMotions.Get(_selSwitchKey).GripTwoState) return "n/a";
+                return _calStateOff ? "Down" : "Up";
+            }
+        }
+        public void ToggleGripCalPos()
+        {
+            _calStateOff = !_calStateOff;
+            if (_selSwitchKey == _switchKey && _switch != null) _gripStateOff = ComputeGripStateOff(_hand == 2);
         }
 
         // Free-twist control: Off → X → Y → Z → Off, for the selected handle (the axis is in the grip-reference frame).
