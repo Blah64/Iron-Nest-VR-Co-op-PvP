@@ -57,6 +57,8 @@ namespace IronNestVR
         private Quaternion _curGripRot;          // holding controller rotation this frame (for the free-twist follow)
         private Vector3 _switchHandAnchor;
         private bool _switchLatched;
+        private bool _switchRotateActivate;      // Review-Console toggles: grabbed right at their pivot, so a wrist FLIP barely
+                                                 // translates — drive progress (and fire) from controller ROTATION since grab, not travel.
 
         // PER-HANDLE GRIP CALIBRATION (menu-armed, two-hand gesture — the same "grab with the OTHER hand and move it"
         // feel as the clipboard/hand-model Calibrate). You grab a lever with one hand (the gravity-glove laser grabs
@@ -563,6 +565,13 @@ namespace IronNestVR
             // Reference frame the throw travel + push direction are measured in (animator root, else the LAT node).
             _switchRef = _switchAnimator != null ? _switchAnimator.transform : sw.transform;
 
+            // Review-Console toggles sit right on their pivot, so a natural wrist flip translates the grab point almost not
+            // at all and the push-projection throw never builds (you have to drag the hand sideways to fire them). Detect
+            // them by ancestor name and switch to ROTATION-driven activation in DriveSwitch instead.
+            _switchRotateActivate = UnderReviewConsole(sw.transform);
+            if (_switchRotateActivate)
+                Log.LogInfo($"[manip] rotate-activate switch '{_switchKey}': flip by controller rotation (~{Config.SwitchRotateActivateDegrees:0}° fires), not travel.");
+
             // PROBE (one-time per control): dump the local hierarchy around the grabbed node so we can identify which node
             // is the visible STICK the player holds (the grabbed LookAtTarget is usually a logical button carrying lights).
             DumpStickCandidates(sw.transform, hitPoint);
@@ -874,8 +883,9 @@ namespace IronNestVR
             Transform pspace = _switchRef.parent;
             Vector3 localTravel = pspace != null ? pspace.InverseTransformVector(worldTravel) : worldTravel;
 
-            // Auto-seed the activation push direction from the first real shove, then persist it.
-            if (!_switchMotion.HasPush && localTravel.magnitude >= Config.SwitchThrowDistance * 0.5f)
+            // Auto-seed the activation push direction from the first real shove, then persist it. (Rotate-activate
+            // toggles never use the push projection, so don't let stray hand drift seed a bogus direction for them.)
+            if (!_switchRotateActivate && !_switchMotion.HasPush && localTravel.magnitude >= Config.SwitchThrowDistance * 0.5f)
             {
                 _switchMotion.PushLocal = localTravel.normalized;
                 _switchMotion.HasPush = true;
@@ -888,6 +898,18 @@ namespace IronNestVR
             // first-ever direction, so without abs the return pull reads as negative progress and never arms.
             if (_leverT != null && !_leverBuried) along = Mathf.Abs(along);   // buried mechanism levers are one-way, not toggles
             float progress = Mathf.Clamp(along / Mathf.Max(0.01f, Config.SwitchThrowDistance), 0f, 1f);
+
+            // ROTATE-TO-ACTIVATE (Review-Console toggles): the grab sits on the pivot, so a wrist flip barely translates
+            // and the push projection above never builds. Drive progress from how far the controller has ROTATED in place
+            // since grab instead — axis-agnostic (total angle), so any flick direction counts; rotating back toward the
+            // grab orientation re-arms it (flick-and-return toggles on, then off). Computed BEFORE DriveHeldStick so the
+            // held toggle MESH swings WITH the rotation too: DriveHeldStick reads _switchProgress for these instead of
+            // aiming the stick at the near-stationary hand. This OWNS the progress for these switches.
+            if (_switchRotateActivate)
+            {
+                float twistDeg = Quaternion.Angle(_switchGrabGripRot, _curGripRot);
+                progress = Mathf.Clamp01(twistDeg / Mathf.Max(1f, Config.SwitchRotateActivateDegrees));
+            }
             _switchProgress = progress;
             if (progress > _scrubProgMax) _scrubProgMax = progress;
 
@@ -901,7 +923,9 @@ namespace IronNestVR
             // reached threshold). Tip travel reflects the real deflection, so a deliberate pull fires regardless of a bad
             // push capture. Big levers deflect far (this path fires them); tiny toggles barely deflect (so it stays dormant
             // for them and they keep using the push projection above). Computed AFTER DriveHeldStick so it sees this frame.
-            if (_leverT != null)
+            // SKIPPED for rotate-activate switches: their progress IS the controller twist, and the swing it produces would
+            // otherwise feed its own deflection back into progress.
+            if (_leverT != null && !_switchRotateActivate)
             {
                 float leverThrow = Mathf.Max(0.04f, Config.SwitchThrowDistance * 2f);
                 float byDeflect = Mathf.Clamp01(_leverTipTravel / leverThrow);
@@ -1666,6 +1690,19 @@ namespace IronNestVR
                 try { t = t.parent; } catch { t = null; }
             }
             return sb.ToString();
+        }
+
+        // True if the control hangs under the Review Console ('.Review Console Parent' carries every review switch).
+        // Those toggles are gripped at their pivot → DriveSwitch activates them by controller rotation, not travel.
+        private static bool UnderReviewConsole(Transform t)
+        {
+            for (int i = 0; i < 8 && t != null; i++)
+            {
+                string s = SafeName(t);
+                if (!string.IsNullOrEmpty(s) && s.ToLowerInvariant().Contains("review console")) return true;
+                try { t = t.parent; } catch { t = null; }
+            }
+            return false;
         }
 
         // Look up tuning saved under an OLDER key scheme so it can migrate to the new per-control key: builds keyed by
@@ -2612,6 +2649,23 @@ namespace IronNestVR
                 // ROTATE: PIN position to rest, then swing about a FIXED hinge axis. The axis is the rig's local axis nearest
                 // the user's first swing (snapped) — a clean hinge axis, not the skewed free cross-product that tilted.
                 try { _leverT.localPosition = _leverPivotLocal; } catch { }
+
+                // ROTATE-TO-ACTIVATE toggle (Review Console): swing the mesh by the flick PROGRESS (controller rotation),
+                // not by aiming the stick at the hand — the grab is on the pivot so the hand barely translates (and the
+                // aim-at-hand path below is even gated behind a non-trivial toHand, which a pivot-grab fails). _switchProgress
+                // was already set from the controller twist this frame. Forward (rest→press) along the calibrated hinge axis.
+                if (_switchRotateActivate && _leverHasRotAxis)
+                {
+                    float swing = Mathf.Clamp01(_switchProgress) * _leverMaxAngle;
+                    Quaternion restWr = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
+                    _leverSwingDqW = Quaternion.AngleAxis(swing, _leverRotAxisW);   // rider co-rotates by this about pivotW
+                    try { _leverT.rotation = _leverSwingDqW * restWr; } catch { }
+                    _leverFollowFrac = _leverMaxAngle > 0.01f ? Mathf.Clamp01(swing / _leverMaxAngle) : 0f;
+                    ApplyLeverPin();
+                    DriveRider();
+                    return;
+                }
+
                 Vector3 armW = _leverParent != null ? _leverParent.TransformDirection(_leverArmParentDir) : _leverArmParentDir;
                 Vector3 toHand = _handPos - pivotW;
                 if (armW.sqrMagnitude > 1e-8f && toHand.sqrMagnitude > 1e-8f)

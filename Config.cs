@@ -687,6 +687,10 @@ namespace IronNestVR
         // Once tripped, the hand must return within this distance of the grab point to re-arm — so a
         // back-and-forth flips a toggle on then off within one grab (keep < SwitchThrowDistance).
         public static float SwitchThrowReset = 0.06f;
+        // Review-Console toggles are gripped right at their pivot, so they activate by ROTATING the controller in
+        // place rather than translating it: degrees of wrist twist from the grab orientation that fire the flip
+        // (the toggle scrubs with the rotation and fires at ~85% of this). Axis-agnostic — any flick direction counts.
+        public static float SwitchRotateActivateDegrees = 35f;
 
         // ---------------- persistence ----------------
         // The plain static fields stay the source of truth; Save/Load just mirror the user-tunable subset
@@ -721,6 +725,7 @@ namespace IronNestVR
                 WF(sb, "FingerCurlSign", FingerCurlSign);
                 WB(sb, "SwitchGrabEnabled", SwitchGrabEnabled);
                 WF(sb, "SwitchThrowDistance", SwitchThrowDistance);
+                WF(sb, "SwitchRotateActivateDegrees", SwitchRotateActivateDegrees);
                 SwitchMotions.Save(sb);   // one "SwitchMotion=" line per per-switch motion that's been tuned/seeded
                 WB(sb, "PopupVrEnabled", PopupVrEnabled);
                 WV(sb, "ClipWaistOffset", ClipWaistOffset);
@@ -871,6 +876,7 @@ namespace IronNestVR
                 case "SwitchGrabEnabled": SwitchGrabEnabled = PB(v, SwitchGrabEnabled); break;
                 case "PopupVrEnabled": PopupVrEnabled = PB(v, PopupVrEnabled); break;
                 case "SwitchThrowDistance": SwitchThrowDistance = PF(v, SwitchThrowDistance); break;
+                case "SwitchRotateActivateDegrees": SwitchRotateActivateDegrees = PF(v, SwitchRotateActivateDegrees); break;
                 case "ClipWaistOffset": ClipWaistOffset = PV(v, ClipWaistOffset); break;
                 case "ClipWaistEuler": ClipWaistEuler = PV(v, ClipWaistEuler); break;
                 case "ClipHeldOffsetR": ClipHeldOffsetR = PV(v, ClipHeldOffsetR); break;

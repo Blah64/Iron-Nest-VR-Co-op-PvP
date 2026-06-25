@@ -399,6 +399,10 @@ namespace IronNestVR
                       () => Config.SwitchGrabEnabled = !Config.SwitchGrabEnabled);
             AddFloat("Throw Distance", () => Mathf.RoundToInt(Config.SwitchThrowDistance * 100f) + " cm",
                      d => Config.SwitchThrowDistance = Clamp(Config.SwitchThrowDistance + d * 0.01f, 0.04f, 0.35f));
+            // Review-Console toggles activate by ROTATING the controller in place (they're gripped at their pivot, so a
+            // wrist flip barely translates). This is the flick angle that fires them.
+            AddFloat("Flip Angle", () => Mathf.RoundToInt(Config.SwitchRotateActivateDegrees) + " deg",
+                     d => Config.SwitchRotateActivateDegrees = Clamp(Config.SwitchRotateActivateDegrees + d * 5f, 10f, 90f));
 
             AddToggle("Selected", () => Manip != null ? Manip.SelectedSwitchName : "—", () => { });
             AddToggle("Motion", () => Manip != null ? Manip.SwitchTypeText : "—", () => Manip?.SwitchToggleType());
