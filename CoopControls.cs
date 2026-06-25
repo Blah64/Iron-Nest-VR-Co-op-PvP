@@ -111,6 +111,12 @@ namespace IronNestVR
         // first sample / after join — the JIP snapshot already carried join-time powder). Echo-suppressed via _echoUntil.
         private static readonly int PowderKeyL = Fnv("__coop_powder_L"), PowderKeyR = Fnv("__coop_powder_R");
         private static int _powderPrevL = int.MinValue, _powderPrevR = int.MinValue;
+        // Robustness: a powder change is one reliable packet; if it's lost in a link-drop blackout it never self-heals
+        // (recon no longer carries powder). So the side that AUTHORED a gun's powder re-asserts it on a low-rate
+        // heartbeat. Only the author re-asserts (adopting the peer's value clears the flag), so the two never flap.
+        private static bool _powderAuthoredL, _powderAuthoredR;
+        private static float _nextPowderBeat;
+        private const float PowderHeartbeatSec = 2f;
 
         // Join-in-progress snapshot received before the turret/guns resolved locally (scene still loading on the
         // joiner). Held here and applied once the registry is ready — see Tick / ApplySnapshot.
@@ -297,11 +303,20 @@ namespace IronNestVR
         private static void DetectPowder(float now)
         {
             if (!Config.CoopControlSync) return;
-            _powderPrevL = DetectPowderGun(_gunL, _powderPrevL, 0, PowderKeyL, now);
-            _powderPrevR = DetectPowderGun(_gunR, _powderPrevR, 1, PowderKeyR, now);
+            _powderPrevL = DetectPowderGun(_gunL, _powderPrevL, 0, PowderKeyL, now, ref _powderAuthoredL);
+            _powderPrevR = DetectPowderGun(_gunR, _powderPrevR, 1, PowderKeyR, now, ref _powderAuthoredR);
+
+            // Self-heal: re-assert the powder WE authored at a low rate so a value lost in a link-drop blackout
+            // re-converges (the peer applies it idempotently; its guard makes a matching value a no-op).
+            if (now >= _nextPowderBeat)
+            {
+                _nextPowderBeat = now + PowderHeartbeatSec;
+                if (_powderAuthoredL && _gunL != null) { try { SendPowder(0, _gunL.PowderCharges); } catch { } }
+                if (_powderAuthoredR && _gunR != null) { try { SendPowder(1, _gunR.PowderCharges); } catch { } }
+            }
         }
 
-        private static int DetectPowderGun(GunController gun, int prev, byte side, int echoKey, float now)
+        private static int DetectPowderGun(GunController gun, int prev, byte side, int echoKey, float now, ref bool authored)
         {
             if (gun == null) return prev;
             int cur;
@@ -313,6 +328,7 @@ namespace IronNestVR
             if (prev != int.MinValue && !suppressed)
             {
                 SendPowder(side, cur);
+                authored = true;   // a local change → we own re-asserting this gun's powder until we adopt the peer's
                 Log.LogInfo($"[ctrl] powder gun {side} -> peer ({cur})");
             }
             return cur;
@@ -755,8 +771,9 @@ namespace IronNestVR
                     if (gun != null)
                     {
                         try { if (gun.PowderCharges != charges) gun.SetPowderCharge(charges); } catch (Exception e) { Log.LogWarning("[ctrl] apply powder: " + e.Message); }
-                        // Adopt as our baseline + suppress the echo so DetectPowder doesn't bounce it back.
-                        if (side == 0) _powderPrevL = charges; else _powderPrevR = charges;
+                        // Adopt as our baseline + suppress the echo so DetectPowder doesn't bounce it back. Adopting the
+                        // peer's value yields authorship: the peer now re-asserts this gun's powder, not us (no flap).
+                        if (side == 0) { _powderPrevL = charges; _powderAuthoredL = false; } else { _powderPrevR = charges; _powderAuthoredR = false; }
                         _echoUntil[side == 0 ? PowderKeyL : PowderKeyR] = now + 0.3f;
                         Log.LogInfo($"[ctrl] applied remote powder gun {side} <- peer ({charges})");
                     }
@@ -783,7 +800,7 @@ namespace IronNestVR
                 default:
                     // Other co-op subsystems share the same P2P channel; forward by type.
                     if (type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL) CoopClipboard.OnPacket(type, a, len);
-                    else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN || type == CoopEntities.MSG_MOVE) CoopEntities.OnPacket(type, a, len);
+                    else if (type == CoopEntities.MSG_SPAWN || type == CoopEntities.MSG_UPDATE || type == CoopEntities.MSG_DESPAWN || type == CoopEntities.MSG_MOVE || type == CoopEntities.MSG_ENTSET) CoopEntities.OnPacket(type, a, len);
                     else if (type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY) CoopScene.OnPacket(type, origin, a, len);
                     else if (type == CoopOrders.MSG_ORDER) CoopOrders.OnPacket(type, a, len);
                     else if (type == CoopCards.MSG_CARD) CoopCards.OnPacket(type, a, len);
@@ -1185,6 +1202,7 @@ namespace IronNestVR
             _pendingGrab.Clear(); _pendingVal.Clear(); _echoUntil.Clear();
             _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
             _powderPrevL = int.MinValue; _powderPrevR = int.MinValue;   // re-seed powder baseline on next connect
+            _powderAuthoredL = false; _powderAuthoredR = false; _nextPowderBeat = 0f;
             RestoreGunDrive();   // hand gun-elevation control back to the local turret controller on link-down
         }
 

@@ -38,6 +38,13 @@ namespace IronNestVR
         private static int _lastReq = int.MinValue, _lastPow = int.MinValue;
         private static float _nextSend;
         private static int _outcomes, _opstates;
+        // Robustness: outcome/opstate are reliable, send-once, host→client with NO re-assert and NO join snapshot —
+        // a packet lost in a link-drop blackout (or a mid-session joiner) desynced the result screen permanently
+        // (the observed host outcomes=1 / client outcomes=0). Now: the host re-asserts both on a low-rate heartbeat
+        // and in the JIP snapshot; the client de-dups the outcome so a re-assert is a harmless no-op.
+        private static int _lastOutcomeKind = -1;      // host: outcome broadcast for the CURRENT mission (-1 = none yet)
+        private static int _appliedOutcomeKind = -1;   // client: outcome already applied this mission (de-dup)
+        private static bool _prevInMission;            // both sides: edge-detect a fresh mission to reset the above
 
         private static Il2CppStructArray<byte> _buf;
         private static readonly byte[] _f4 = new byte[4];
@@ -56,6 +63,7 @@ namespace IronNestVR
                 if (!EnsureBuf()) return;
                 int o = 0; _buf[o++] = MSG_OUTCOME; _buf[o++] = kind;
                 CoopP2P.Send(_buf, o, true);
+                _lastOutcomeKind = kind;   // remember it so the heartbeat / JIP snapshot can re-assert if this is lost
                 _outcomes++;
                 Log.LogInfo($"[score] mission {(kind == 0 ? "COMPLETE" : "FAILED")} -> peer");
             }
@@ -67,27 +75,42 @@ namespace IronNestVR
         public static void Tick(float dt)
         {
             if (!Config.CoopScoreSync) return;
-            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { _lastReq = int.MinValue; _lastPow = int.MinValue; return; }
+            if (!SteamNet.InLobby || !CoopP2P.HasPeer) { _lastReq = int.MinValue; _lastPow = int.MinValue; _prevInMission = false; return; }
+
+            // Both sides: a fresh mission becoming active clears the per-mission outcome state, so the NEXT outcome
+            // (even the same complete/failed kind as last time) is broadcast and applied instead of de-dup'd away.
+            bool inMission = InMission();
+            if (inMission && !_prevInMission) { _lastOutcomeKind = -1; _appliedOutcomeKind = -1; }
+            _prevInMission = inMission;
+
             if (!CoopP2P.IsHost) return;            // client only receives
-            if (InMission()) return;                // never round-trip OperationState mid-mission
+            if (inMission) return;                  // never round-trip OperationState mid-mission
             float now = Time.unscaledTime;
             if (now < _nextSend) return;
-            _nextSend = now + 0.5f;
+            _nextSend = now + 2f;                    // low-rate re-assert (was edge-gated 0.5s; now self-heals losses)
             try
             {
+                // Re-assert the last mission outcome unconditionally — if its one-shot packet was lost in a blackout,
+                // this heals it (the client de-dups, so a delivered outcome isn't re-applied).
+                if (_lastOutcomeKind >= 0 && EnsureBuf())
+                {
+                    int oo = 0; _buf[oo++] = MSG_OUTCOME; _buf[oo++] = (byte)_lastOutcomeKind;
+                    CoopP2P.Send(_buf, oo, true);
+                }
+
                 var mm = MissionManager.Instance; if (mm == null) return;
                 OperationState st = null; try { st = mm.SaveOperationState(); } catch { }
                 if (st == null) return;
                 string opId = null; try { opId = st.OperationID; } catch { }
                 if (string.IsNullOrEmpty(opId)) return;   // no active operation (e.g. main menu) — nothing to sync
                 int req, pow; try { req = st.RequisitionPoints; pow = st.PowderCharges; } catch { return; }
-                if (req == _lastReq && pow == _lastPow) return;
+                bool changed = req != _lastReq || pow != _lastPow;
                 _lastReq = req; _lastPow = pow;
                 if (!EnsureBuf()) return;
                 int o = 0; _buf[o++] = MSG_OPSTATE; o = PutInt(o, req); o = PutInt(o, pow);
-                CoopP2P.Send(_buf, o, true);
+                CoopP2P.Send(_buf, o, true);          // re-assert every cycle (idempotent on the client) so a lost opstate self-heals
                 _opstates++;
-                Log.LogInfo($"[score] requisition -> peer (points={req} powder={pow})");
+                if (changed) Log.LogInfo($"[score] requisition -> peer (points={req} powder={pow})");
             }
             catch (Exception e) { Log.LogWarning("[score] tick: " + e.Message); }
         }
@@ -104,10 +127,12 @@ namespace IronNestVR
                 {
                     if (len < 2) return;
                     byte kind = a[o++];
+                    if (kind == _appliedOutcomeKind) break;   // de-dup: a heartbeat/JIP re-assert of an already-applied outcome
                     try
                     {
                         var mm = MissionManager.Instance; if (mm == null) return;
                         if (kind == 0) mm.MarkMissionComplete(); else mm.MarkMissionFailed();
+                        _appliedOutcomeKind = kind;
                         Log.LogInfo($"[score] applied mission {(kind == 0 ? "COMPLETE" : "FAILED")} <- peer");
                     }
                     catch (Exception e) { Log.LogWarning("[score] apply outcome: " + e.Message); }
@@ -133,6 +158,39 @@ namespace IronNestVR
                     break;
                 }
             }
+        }
+
+        // ---------------- join-in-progress ----------------
+
+        // Host → joiner (and on a genuine reconnect): re-send current requisition/powder + the last mission outcome,
+        // so a mid-session joiner's result screen and progression match. Wired into CoopP2P.SendJoinSnapshot. Runs
+        // inside the JIP unicast latch so the Send reaches only the joiner.
+        public static void SendSnapshot()
+        {
+            if (!Config.CoopScoreSync || !CoopP2P.IsHost) return;
+            if (!SteamNet.InLobby || !CoopP2P.HasPeer) return;
+            try
+            {
+                var mm = MissionManager.Instance;
+                if (mm != null)
+                {
+                    OperationState st = null; try { st = mm.SaveOperationState(); } catch { }
+                    string opId = null; try { if (st != null) opId = st.OperationID; } catch { }
+                    if (st != null && !string.IsNullOrEmpty(opId) && EnsureBuf())
+                    {
+                        int req = 0, pow = 0; try { req = st.RequisitionPoints; pow = st.PowderCharges; } catch { }
+                        int o = 0; _buf[o++] = MSG_OPSTATE; o = PutInt(o, req); o = PutInt(o, pow);
+                        CoopP2P.Send(_buf, o, true);
+                    }
+                }
+                if (_lastOutcomeKind >= 0 && EnsureBuf())
+                {
+                    int o = 0; _buf[o++] = MSG_OUTCOME; _buf[o++] = (byte)_lastOutcomeKind;
+                    CoopP2P.Send(_buf, o, true);
+                }
+                Log.LogInfo($"[score] sent JIP snapshot -> peer (outcome={_lastOutcomeKind})");
+            }
+            catch (Exception e) { Log.LogWarning("[score] snapshot: " + e.Message); }
         }
 
         // ---------------- diagnostics ----------------

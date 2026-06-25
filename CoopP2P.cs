@@ -365,6 +365,7 @@ namespace IronNestVR
                 try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
                 try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
                 try { CoopPunchcards.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot punch: " + e.Message); }
+                try { CoopScore.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot score: " + e.Message); }
             }
             finally { _snapActive = false; }
         }

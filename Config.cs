@@ -103,6 +103,12 @@ namespace IronNestVR
         // discrete state/hp change counts as a keyframe too (already reliable). 0 disables periodic keyframes.
         public static float CoopEntityKeyframeSec = 3f;
 
+        // Robustness: how often (seconds) the host re-asserts the FULL entity set — re-sends every live entity as a
+        // SPAWN (heals a SPAWN lost in a link-drop blackout, where reliable packets are dropped with no retransmit and
+        // the lobby roster is unchanged so no join-snapshot re-fires) AND sends a live-key-set so the client reaps any
+        // ghost mirror whose DESPAWN was lost. Slower than the keyframe (full records are heavier). 0 disables.
+        public static float CoopEntityResyncSec = 5f;
+
         // Phase 4 co-op (4b keystone): replicate the mission/scene transition so both players are co-located.
         // The HOST broadcasts its own phase changes (→MissionActive / back out); the CLIENT follows by driving
         // its own OperationLoadRelay.StartAssignedOperation() / ReturnToMap(). Without this, the host starting a

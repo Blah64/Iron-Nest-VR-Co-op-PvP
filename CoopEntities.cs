@@ -46,6 +46,7 @@ namespace IronNestVR
         public const byte MSG_UPDATE = 17;   // [t][key i32][seq i32][pos 3f][state i32][hp i32]  RELIABLE — discrete state/hp change OR periodic position keyframe (REVIEW-fix P2)
         public const byte MSG_DESPAWN = 18;  // [t][key i32]                              reliable
         public const byte MSG_MOVE = 23;     // [t][key i32][seq i32][pos 3f]            UNRELIABLE — position stream; per-entity seq drops late/reordered moves (REVIEW-fix P2)
+        public const byte MSG_ENTSET = 40;   // [t][count i32][key i32]×count            reliable — host's authoritative LIVE key-set; client reaps mirrors not in it (heals a lost DESPAWN). Robustness re-assert.
         // REVIEW-fix (P1): movement is a SEPARATE position-only packet so a reordered/stale unreliable move can
         // never carry old state/hp and roll back a newer reliable damage/death. Discrete state/hp travels ONLY
         // on the reliable+ordered MSG_UPDATE; MSG_MOVE touches position alone (self-correcting next frame).
@@ -93,6 +94,7 @@ namespace IronNestVR
         private static float _nextTemplateTry;
 
         private static float _nextSend;
+        private static float _lastResync;   // host: last time the full entity-set re-assert (SPAWN re-send + key-set) ran
         private const float MoveEpsilonSq = 0.0001f;   // ~1cm map-units; ignore sub-pixel jitter
 
         private static Il2CppStructArray<byte> _buf;
@@ -132,6 +134,11 @@ namespace IronNestVR
             try { arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<EntityLocation>(), FindObjectsSortMode.None); } catch { return; }
             if (arr == null) return;
 
+            // Periodic FULL re-assert: re-send every live entity as a SPAWN so a SPAWN lost in a link-drop blackout
+            // self-heals (the client re-adopts/clones idempotently), and follow with the live key-set so the client
+            // reaps any ghost whose DESPAWN was lost. The fast per-frame diff below is unchanged.
+            bool resyncNow = Config.CoopEntityResyncSec > 0f && now - _lastResync >= Config.CoopEntityResyncSec;
+
             _seen.Clear();
             for (int i = 0; i < arr.Length; i++)
             {
@@ -170,6 +177,8 @@ namespace IronNestVR
                         s.State = state; s.Health = hp; s.Pos = pos; s.LastKeyframe = now;
                     }
                     else if (moved) { s.Seq++; SendMove(key, pos, s.Seq); s.Pos = pos; }
+                    // On a resync tick re-send the full SPAWN record too (heals an entity the client is missing).
+                    if (resyncNow) { SendSpawn(key, e, loc); s.LastKeyframe = now; }
                 }
             }
 
@@ -183,6 +192,21 @@ namespace IronNestVR
                 SendDespawn(k);
                 Log.LogInfo($"[ent] '{id}' despawned -> peer");
             }
+
+            if (resyncNow) { _lastResync = now; SendEntSet(); }
+        }
+
+        // Host → peer: the authoritative set of live entity keys this tick. The client destroys any mirror whose key
+        // is absent (a DESPAWN that was lost in a blackout left a ghost). Skipped if the set wouldn't fit one packet
+        // (sending a TRUNCATED set would cause false reaps) — keyframes/diff still keep those entities fresh.
+        private static void SendEntSet()
+        {
+            if (!EnsureBuf()) return;
+            int n = _seen.Count;
+            if (5 + n * 4 > 500) { Log.LogWarning($"[ent] live-set too large to re-assert in one packet ({n} keys) — skipping reap this cycle"); return; }
+            int o = 0; _buf[o++] = MSG_ENTSET; o = PutInt(o, n);
+            foreach (var k in _seen) o = PutInt(o, k);
+            CoopP2P.Send(_buf, o, true);
         }
 
         // ---------------- client: maintain template + cleanup ----------------
@@ -285,6 +309,30 @@ namespace IronNestVR
                         else { try { if (m.Go != null) UnityEngine.Object.Destroy(m.Go); } catch { } }   // adopted scene entity also dies when the host says so
                         _mirrors.Remove(key);
                         Log.LogInfo($"[ent] despawned '{m.ID}' <- peer");
+                    }
+                    break;
+                }
+                case MSG_ENTSET:
+                {
+                    if (len < 5) return;
+                    int count = GetInt(a, ref o);
+                    if (count < 0 || o + count * 4 > len) return;
+                    var live = new HashSet<int>();
+                    for (int i = 0; i < count; i++) live.Add(GetInt(a, ref o));
+                    // Reap any mirror the host no longer lists — its DESPAWN was lost (ghost enemy). Reliable+ordered
+                    // delivery means an in-flight SPAWN for a key arrives BEFORE this set (which includes that key),
+                    // so a freshly-spawned mirror is never falsely reaped.
+                    _toRemove.Clear();
+                    foreach (var kv in _mirrors) if (!live.Contains(kv.Key)) _toRemove.Add(kv.Key);
+                    for (int i = 0; i < _toRemove.Count; i++)
+                    {
+                        int k = _toRemove[i];
+                        if (_mirrors.TryGetValue(k, out var gm))
+                        {
+                            try { if (gm.Go != null) UnityEngine.Object.Destroy(gm.Go); } catch { }
+                            _mirrors.Remove(k);
+                            Log.LogInfo($"[ent] reaped ghost mirror '{gm.ID}' (not in host live-set) <- peer");
+                        }
                     }
                     break;
                 }
