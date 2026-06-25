@@ -786,9 +786,9 @@ namespace IronNestVR
             if (hasGrip)
             {
                 _handRot = ComputeGripRotW(GripRef, rightHand);
-                if (_leverT == null && _switchRef != null)
+                if (_leverT == null && GripRef != null)   // GripRef is the cap for a cap-track handle, else the switch ref
                 {
-                    _switchHandAnchor = ComputeGripPosW(_switchRef, rightHand);
+                    _switchHandAnchor = ComputeGripPosW(GripRef, rightHand);
                     _handPos = _switchHandAnchor;
                 }
             }
@@ -2779,7 +2779,16 @@ namespace IronNestVR
         {
             posW = _handPos; rotW = _curGripRot;
             if (_phantomTrackT == null) return false;
-            try { posW = _phantomTrackT.TransformPoint(_phantomTrackLocalPos); rotW = _phantomTrackT.rotation * _phantomTrackLocalRot; }
+            bool right = _hand == 2;
+            GetGrip(right, out _, out _, out bool hasGrip);
+            try
+            {
+                // CALIBRATED grip (VR-menu "Calibrate Grip") takes precedence — the hand sits at the deliberate spot on the cap,
+                // tunable + persisted, instead of wherever the laser hit. Stored in the cap's local frame (GripRef==cap here),
+                // so it rides the game-animated cap. Falls back to the at-grab offset when the handle isn't calibrated yet.
+                if (hasGrip) { posW = ComputeGripPosW(_phantomTrackT, right); rotW = ComputeGripRotW(_phantomTrackT, right); }
+                else { posW = _phantomTrackT.TransformPoint(_phantomTrackLocalPos); rotW = _phantomTrackT.rotation * _phantomTrackLocalRot; }
+            }
             catch { return false; }
             return true;
         }
@@ -3526,7 +3535,9 @@ namespace IronNestVR
 
         // The grip-reference transform a handle's calibrated pose lives in: the swinging hinge _leverT when there is
         // one (so the hand rides the handle as it swings), else the stable control root _switchRef.
-        private Transform GripRef => _leverT != null ? _leverT : _switchRef;
+        // The frame a calibrated grip pose is stored/read in. The SWINGING hinge when present, else the CAP-TRACK cap (so the
+        // requisition cap's grip rides the game-animated cap), else the static switch ref.
+        private Transform GripRef => _leverT != null ? _leverT : (_phantomTrackT != null ? _phantomTrackT : _switchRef);
 
         // This handle's calibrated grip pose for one hand (right vs left — the left model is mirrored, so each is
         // stored separately). Reads the live grab's _switchMotion. For a two-state handle currently in its OFF/down
@@ -3758,10 +3769,10 @@ namespace IronNestVR
                 // LateApply, so they don't pop back). Levers leave _switchHandAnchor alone (it drives the swing).
                 GetWorld(origin, HandGripPose(_hand, input), out Vector3 hgp, out Quaternion hgr);
                 _switchGrabGripRot = hgr;
-                if (_leverT == null && _switchRef != null)
+                if (_leverT == null && GripRef != null)   // GripRef is the cap for a cap-track handle, else the switch ref
                 {
                     _switchGrabGripPos = hgp;
-                    _switchHandAnchor = ComputeGripPosW(_switchRef, right);
+                    _switchHandAnchor = ComputeGripPosW(GripRef, right);
                 }
                 input.Haptic(Config.DetentHapticAmplitude, 0.03f);   // tick: grip captured
                 Log.LogInfo($"[manip] grip calibrated '{_switchKey}' ({(right ? "right" : "left")} hand, {(_gripStateOff ? "OFF/down" : "on")} state): pos={lpos}, eul={leul}.");
