@@ -416,6 +416,40 @@ namespace IronNestVR
         public static float SnapTurnThreshold = 0.7f; // stick past this triggers a snap
         public static float SnapTurnReArm = 0.3f;     // stick must fall below this before the next snap
 
+        // --- Comfort: teleport locomotion ---
+        // When true, the left thumbstick stops doing smooth strafing and instead aims a teleport: push the
+        // stick to raise a ground marker down the LEFT controller's aim ray, release to blink there. Smooth
+        // turn (right stick) still works. Default off — smooth locomotion is the baseline.
+        public static bool TeleportMove = false;
+        // Stick push past this (radial magnitude) starts/keeps the teleport aim; releasing below MoveDeadzone fires.
+        public static float TeleportEngage = 0.55f;
+        // Projectile-arc tuning (Unity-XR-style curve): launch speed + gravity decide how far/flat the arc throws.
+        public static float TeleportArcSpeed = 8f;
+        public static float TeleportArcGravity = 9.81f;
+        // Furthest ground hit (m) accepted as a teleport target along the arc.
+        public static float TeleportMaxDistance = 16f;
+        // A surface counts as standable only if its normal is at least this upright (1 = perfectly flat floor).
+        public static float TeleportMinNormalY = 0.6f;
+        // Brief comfort blink (periphery darkens) the instant you teleport, even if the movement vignette is off.
+        public static float TeleportBlinkTime = 0.18f;
+
+        // --- Comfort: tunnelling vignette ---
+        // Darken the peripheral FOV during smooth artificial motion (translate or smooth-turn) to reduce
+        // sim-sickness. Rendered as a per-eye overlay on the eye cameras (zero-parallax, so it sits at a
+        // comfortable infinite depth). Default off; toggled on the Comfort tab.
+        public static bool VignetteEnabled = false;
+        // Peak darkness at full motion (0 = none, 1 = fully black surround).
+        public static float VignetteStrength = 0.7f;
+        // Overlay quad distance in front of each eye (m). Close, so cockpit geometry rarely occludes it.
+        public static float VignetteDistance = 0.08f;
+        // Oversize vs the exact eye frustum so the dark edge always reaches past the visible FOV (no hard cutoff).
+        public static float VignetteCoverMargin = 1.15f;
+        // Radial alpha ramp (fraction of half-extent): clear inside Inner, fully dark by Outer.
+        public static float VignetteApertureInner = 0.40f;
+        public static float VignetteApertureOuter = 0.95f;
+        // Fade time-constant (s) as the vignette opens/closes — keep snappy so it tracks motion without lag.
+        public static float VignetteFadeTime = 0.10f;
+
         // --- HUD follow (legacy) ---
         // Superseded by GrabManager, which now anchors the clipboard to a waist holster and the watch to the
         // left wrist. HudFollower reparented the watch under its own anchor and ALWAYS followed head yaw, which
@@ -712,6 +746,9 @@ namespace IronNestVR
                 WF(sb, "TurnSpeedDegPerSec", TurnSpeedDegPerSec);
                 WF(sb, "SnapTurnAngle", SnapTurnAngle);
                 WF(sb, "MoveSpeedScale", MoveSpeedScale);
+                WB(sb, "TeleportMove", TeleportMove);
+                WB(sb, "VignetteEnabled", VignetteEnabled);
+                WF(sb, "VignetteStrength", VignetteStrength);
                 WB(sb, "LaserAlwaysOn", LaserAlwaysOn);
                 WB(sb, "HandsEnabled", HandsEnabled);
                 WF(sb, "HandScale", HandScale);
@@ -862,6 +899,9 @@ namespace IronNestVR
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;
                 case "MoveSpeedScale": MoveSpeedScale = PF(v, MoveSpeedScale); break;
+                case "TeleportMove": TeleportMove = PB(v, TeleportMove); break;
+                case "VignetteEnabled": VignetteEnabled = PB(v, VignetteEnabled); break;
+                case "VignetteStrength": VignetteStrength = PF(v, VignetteStrength); break;
                 case "LaserAlwaysOn": LaserAlwaysOn = PB(v, LaserAlwaysOn); break;
                 case "HandsEnabled": HandsEnabled = PB(v, HandsEnabled); break;
                 case "HandScale": HandScale = PF(v, HandScale); break;

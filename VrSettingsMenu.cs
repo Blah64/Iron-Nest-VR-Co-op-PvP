@@ -66,8 +66,8 @@ namespace IronNestVR
         private bool _prevTrigger;
         private int _layer;
 
-        private enum Page { Settings, Hud, Switches, Lobbies }
-        private Page _page = Page.Settings;
+        private enum Page { Comfort, Settings, Hud, Switches, Lobbies }
+        private Page _page = Page.Comfort;
         private int _scroll;                       // lobby-list scroll offset (windowed view)
         private const int LOBBY_VISIBLE = 6;       // join slots shown at once on the Lobbies tab
         private const float TAB_H = 0.05f;
@@ -87,6 +87,7 @@ namespace IronNestVR
             try
             {
                 _rig = rig;
+                _page = Page.Comfort;   // VR comfort settings are the default landing tab every time you open
                 _layer = ResolveLayer();
                 EnsureFont();
                 Build(rig);
@@ -307,6 +308,7 @@ namespace IronNestVR
             if (_page == Page.Lobbies) DefineLobbyRows();
             else if (_page == Page.Hud) DefineHudRows();
             else if (_page == Page.Switches) DefineSwitchRows();
+            else if (_page == Page.Comfort) DefineComfortRows();
             else DefineSettingsRows();
         }
 
@@ -343,6 +345,32 @@ namespace IronNestVR
             _scroll = Mathf.Clamp(_scroll + dir * LOBBY_VISIBLE, 0, maxScroll);
         }
 
+        // Comfort tab (the default landing page): locomotion + turning + sim-sickness mitigations, grouped so
+        // a motion-sensitive player can dial everything in one place. The turn-mode/speed and move-speed rows
+        // moved here from the general Settings tab.
+        private void DefineComfortRows()
+        {
+            // Smooth strafing vs point-and-blink teleport (left stick). See Locomotion.TeleportTick.
+            AddToggle("Movement", () => Config.TeleportMove ? "Teleport" : "Smooth",
+                      () => Config.TeleportMove = !Config.TeleportMove);
+            AddFloat("Move Speed", () => Config.MoveSpeedScale.ToString("0.0") + "x",
+                     d => Config.MoveSpeedScale = Clamp(Config.MoveSpeedScale + d * 0.1f, 0.2f, 3f));
+            AddToggle("Turn Mode", () => Config.SnapTurn ? "Snap" : "Smooth",
+                      () => Config.SnapTurn = !Config.SnapTurn);
+            AddFloat("Smooth Turn Speed", () => Mathf.RoundToInt(Config.TurnSpeedDegPerSec) + " deg/s",
+                     d => Config.TurnSpeedDegPerSec = Clamp(Config.TurnSpeedDegPerSec + d * 10f, 30f, 240f));
+            AddFloat("Snap Turn Angle", () => Mathf.RoundToInt(Config.SnapTurnAngle) + " deg",
+                     d => Config.SnapTurnAngle = Clamp(Config.SnapTurnAngle + d * 5f, 10f, 90f));
+            // Tunnelling vignette: darkens the periphery during smooth motion to cut sim-sickness.
+            AddToggle("Vignette", () => Config.VignetteEnabled ? "On" : "Off",
+                      () => Config.VignetteEnabled = !Config.VignetteEnabled);
+            AddFloat("Vignette Strength", () => Mathf.RoundToInt(Config.VignetteStrength * 100f) + "%",
+                     d => Config.VignetteStrength = Clamp(Config.VignetteStrength + d * 0.1f, 0.1f, 1f));
+
+            AddAction("Recenter View", () => { _rig?.Recenter(); });
+            AddAction("Close Menu", Close);
+        }
+
         private void DefineSettingsRows()
         {
             AddFloat("Clipboard Size", () => Config.ClipboardScale.ToString("0.0") + "x",
@@ -351,14 +379,6 @@ namespace IronNestVR
                      d => Config.WatchScale = Clamp(Config.WatchScale + d * 0.1f, 0.3f, 4f));
             AddFloat("Resolution Scale", () => Mathf.RoundToInt(Config.RenderScale * 100f) + "%",
                      d => Config.RenderScale = Clamp(Config.RenderScale + d * 0.05f, 0.2f, 1f));
-            AddToggle("Turn Mode", () => Config.SnapTurn ? "Snap" : "Smooth",
-                      () => Config.SnapTurn = !Config.SnapTurn);
-            AddFloat("Smooth Turn Speed", () => Mathf.RoundToInt(Config.TurnSpeedDegPerSec) + " deg/s",
-                     d => Config.TurnSpeedDegPerSec = Clamp(Config.TurnSpeedDegPerSec + d * 10f, 30f, 240f));
-            AddFloat("Snap Turn Angle", () => Mathf.RoundToInt(Config.SnapTurnAngle) + " deg",
-                     d => Config.SnapTurnAngle = Clamp(Config.SnapTurnAngle + d * 5f, 10f, 90f));
-            AddFloat("Move Speed", () => Config.MoveSpeedScale.ToString("0.0") + "x",
-                     d => Config.MoveSpeedScale = Clamp(Config.MoveSpeedScale + d * 0.1f, 0.2f, 3f));
             AddToggle("Laser Always On", () => Config.LaserAlwaysOn ? "On" : "Off",
                       () => Config.LaserAlwaysOn = !Config.LaserAlwaysOn);
 
@@ -500,7 +520,7 @@ namespace IronNestVR
         // map to the page index in _idToTab (handled in Tick alongside the row colliders).
         private void BuildTabs(float yTop, float zQuad, float zText)
         {
-            string[] names = { "Settings", "HUD", "Switch", "Lobbies" };
+            string[] names = { "Comfort", "Settings", "HUD", "Switch", "Lobbies" };
             int count = names.Length;
             float usableW = PANEL_W - 0.04f;
             float tabW = usableW / count;
