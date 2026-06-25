@@ -120,6 +120,22 @@ namespace IronNestVR
         // exactly where the hand is. The reload MECHANISM (cylinder/charges) is a SIBLING of _leverT, never in this list, so
         // it keeps animating freely to its correct end. Cleared on release → the lever then takes the animation's pose.
         private Transform[] _leverPinT; private Vector3[] _leverPinP; private Quaternion[] _leverPinR;
+        // The held lever's END DECOR that lives OUTSIDE _leverT's subtree but is part of the handle visually — e.g. the orb /
+        // indicator lights the press clip animates to travel WITH the handle. They're SIBLINGS of _leverT under the switch
+        // (_leverParent), so the subtree pin above never reaches them; left alone they follow the canned press and OVERSHOOT the
+        // hand. We snapshot each at grab (local pose, to detect which ones the press actually moves) plus its REST offset relative
+        // to _leverT (to ride it rigidly). The reload MECHANISM (cylinder, rammer arm, …) is excluded so it still animates freely.
+        // _leverDecorActive latches a node "glued" for the rest of the hold once it first moves, so it can't flicker back to the
+        // canned pose near the throw extremes. Cleared on release with the subtree pin → decor returns to the animation's pose.
+        private Transform[] _leverDecorT; private Vector3[] _leverDecorSnapP; private Quaternion[] _leverDecorSnapR;
+        private Vector3[] _leverDecorRelP; private Quaternion[] _leverDecorRelR; private bool[] _leverDecorActive;
+        // DIAGNOSTIC: when true, grabbing a lever does NOT ride any decor — instead it TRACKS every renderer near the grab and, on
+        // release, reports which one DRIFTED most off the handle during the pull (drift = movement measured in the handle's own
+        // frame; a part rigidly on the handle drifts ~0, the disconnecting orb drifts a lot). Names the orb unambiguously — no
+        // colour/blink guessing. Turn OFF (and remove DiagCaptureMovers/DiagTrackMovers/DiagReportMovers) once the orb is found.
+        private static readonly bool DiagFindOrb = false;
+        private Transform[] _diagT; private Vector3[] _diagLocal0; private float[] _diagMaxDrift; private float[] _diagStartDist; private Transform _diagRoot; private string[] _diagTag;
+        private Renderer[] _diagHidden;   // diagnostic: twin meshes we disabled this grab, re-enabled on release
         private Transform _leverParent;      // its parent — we work in parent-local so a turret rotation doesn't skew it
         private Vector3 _leverPivotLocal;    // stick localPosition at grab (its origin is the pivot we swing about)
         private Quaternion _leverRestLocalR; // stick localRotation at grab (the swing is measured off this)
@@ -1211,7 +1227,12 @@ namespace IronNestVR
             _switch = null; _switchInteractable = null; _switchLatched = false;
             _switchScrubDone = false; _scrubManual = false; _activeMovers = null; _scrubAnimators = null;
             _leverT = null; _leverParent = null; _leverCon = null;
+            if (DiagFindOrb) DiagReportMovers();   // diagnostic: log which tracked part drifted off the handle (the orb)
+            if (_diagHidden != null) { for (int i = 0; i < _diagHidden.Length; i++) { try { if (_diagHidden[i] != null) _diagHidden[i].enabled = true; } catch { } } _diagHidden = null; }
+            _diagT = null; _diagLocal0 = null; _diagMaxDrift = null; _diagStartDist = null; _diagRoot = null; _diagTag = null;
             _leverPinT = null; _leverPinP = null; _leverPinR = null;   // stop pinning → the lever returns to the animation's pose
+            _leverDecorT = null; _leverDecorSnapP = null; _leverDecorSnapR = null;   // stop riding the end-decor → it returns to anim
+            _leverDecorRelP = null; _leverDecorRelR = null; _leverDecorActive = null;
             _switchRef = null; _switchMovers = null; _switchAnimator = null; _switchKey = null; _scrubKey = null; _switchProgress = 0f;
             // Keep the learn arrays alive ONLY while a tail capture is pending; otherwise drop everything.
             if (!_learnTail)
@@ -1482,7 +1503,7 @@ namespace IronNestVR
             // Snapshot the held lever's SUBTREE (every descendant of _leverT) at its REST pose now (the press hasn't fired yet,
             // so this is the rest/idle pose). DriveHeldStick re-pins these each frame so the canned press can't move them on top
             // of the hand. Excludes _leverT itself (DriveHeldStick poses that). The mechanism cylinder is a SIBLING → not here.
-            CaptureLeverPinChildren();
+            CaptureLeverPinChildren(grabPoint);
             Vector3 armW = grabPoint - pivot.position;
             _leverArmParentDir = _leverParent != null ? _leverParent.InverseTransformDirection(armW) : armW;
             try { _leverGrabLocal = pivot.InverseTransformPoint(grabPoint); } catch { _leverGrabLocal = Vector3.zero; }
@@ -2419,22 +2440,243 @@ namespace IronNestVR
         // hinge along the pull axis for translate-type controls (e.g. the War Horn pulley). Real-hand driven → visible.
         // Snapshot _leverT's descendants + their local poses at grab (their REST pose — the press hasn't fired). ApplyLeverPin
         // re-asserts these each frame so the canned lever-press clip can't move them on top of the hand. Bounded subtree only.
-        private void CaptureLeverPinChildren()
+        private void CaptureLeverPinChildren(Vector3 grabPoint)
         {
             _leverPinT = null; _leverPinP = null; _leverPinR = null;
+            _leverDecorT = null; _leverDecorSnapP = null; _leverDecorSnapR = null;
+            _leverDecorRelP = null; _leverDecorRelR = null; _leverDecorActive = null;
             if (_leverT == null) return;
             Transform[] all = null; try { all = _leverT.GetComponentsInChildren<Transform>(true); } catch { all = null; }
-            if (all == null || all.Length <= 1) return;
-            var ts = new System.Collections.Generic.List<Transform>(all.Length);
-            var ps = new System.Collections.Generic.List<Vector3>(all.Length);
-            var rs = new System.Collections.Generic.List<Quaternion>(all.Length);
+            if (all != null && all.Length > 1)
+            {
+                var ts = new System.Collections.Generic.List<Transform>(all.Length);
+                var ps = new System.Collections.Generic.List<Vector3>(all.Length);
+                var rs = new System.Collections.Generic.List<Quaternion>(all.Length);
+                for (int i = 0; i < all.Length; i++)
+                {
+                    var t = all[i]; if (t == null || t == _leverT) continue;   // _leverT itself is posed by DriveHeldStick
+                    ts.Add(t); ps.Add(t.localPosition); rs.Add(t.localRotation);
+                }
+                if (ts.Count > 0) { _leverPinT = ts.ToArray(); _leverPinP = ps.ToArray(); _leverPinR = rs.ToArray(); }
+            }
+            if (DiagFindOrb) { DiagCaptureMovers(grabPoint); DiagHideTwins(); return; }   // diagnostic: find the disconnecting orb
+            CaptureLeverDecor(grabPoint);
+        }
+
+        // DIAGNOSTIC. 'Cylinder.001' sits right at the grab point, drifts the most, exists on EVERY control, and is what the rider
+        // system targets — it's the prime suspect for the orb/knob cap on the lever end. Material paint fails on these
+        // ULOD/instanced meshes, but DISABLING the renderer always works: hide every 'Cylinder'-named mesh under the grabbed switch
+        // and see if the disconnecting orb vanishes.
+        private void DiagHideTwins()
+        {
+            _diagHidden = null;
+            Transform root = _switchRef != null ? _switchRef : _leverParent;
+            if (root == null) return;
+            Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { all = null; }
+            if (all == null) return;
+            var hidden = new System.Collections.Generic.List<Renderer>();
+            var names = new System.Text.StringBuilder();
             for (int i = 0; i < all.Length; i++)
             {
-                var t = all[i]; if (t == null || t == _leverT) continue;   // _leverT itself is posed by DriveHeldStick
-                ts.Add(t); ps.Add(t.localPosition); rs.Add(t.localRotation);
+                var t = all[i]; if (t == null) continue;
+                string nm = null; try { nm = t.name; } catch { nm = null; }
+                if (string.IsNullOrEmpty(nm) || nm.ToLowerInvariant().IndexOf("cylinder") < 0) continue;   // 'Cylinder.001' + 'Cylinder Hoverd Over'
+                Renderer r = null; try { r = t.GetComponent<Renderer>(); } catch { r = null; }
+                if (r == null) continue;
+                bool en = false; try { en = r.enabled; } catch { }
+                if (!en) continue;
+                try { r.enabled = false; hidden.Add(r); names.Append(' ').Append(PathOf(t, root)); } catch { }
+            }
+            if (hidden.Count > 0)
+            {
+                _diagHidden = hidden.ToArray();
+                Log.LogInfo($"[orb] HID {hidden.Count} 'Cylinder' mesh(es) under switch '{SafeName(root)}':{names} — did the disconnecting orb VANISH? (Y → it's Cylinder.001; N → something else)");
+            }
+            else Log.LogInfo("[orb] no 'Cylinder' mesh under the switch to hide.");
+        }
+
+        // DIAGNOSTIC. Snapshot every renderer within 0.55 m of the grab (origin distance — reliable, unlike mesh bounds which read
+        // 0 for the instanced/ULOD parts), recording its position in the HANDLE's local frame. DiagTrackMovers updates each one's
+        // max drift while held; DiagReportMovers logs the ranking on release. The orb that disconnects drifts most.
+        private void DiagCaptureMovers(Vector3 grabPoint)
+        {
+            _diagT = null; _diagLocal0 = null; _diagMaxDrift = null; _diagStartDist = null; _diagRoot = null; _diagTag = null;
+            if (_leverT == null) return;
+            Transform scanRoot = null;
+            if (_leverParent != null) scanRoot = _leverParent.parent != null ? _leverParent.parent : _leverParent;
+            else scanRoot = _switchRef;
+            if (scanRoot == null) return;
+            Transform[] all = null; try { all = scanRoot.GetComponentsInChildren<Transform>(true); } catch { all = null; }
+            if (all == null) return;
+            var ts = new System.Collections.Generic.List<Transform>();
+            var loc = new System.Collections.Generic.List<Vector3>();
+            var sd = new System.Collections.Generic.List<float>();
+            var tag = new System.Collections.Generic.List<string>();
+            for (int i = 0; i < all.Length; i++)
+            {
+                var t = all[i]; if (t == null) continue;
+                Renderer r = null; try { r = t.GetComponent<Renderer>(); } catch { r = null; }
+                if (r == null) continue;
+                float d; try { d = Vector3.Distance(t.position, grabPoint); } catch { continue; }
+                if (d > 0.55f) continue;                       // only the lever's own neighbourhood
+                Vector3 l0; try { l0 = _leverT.InverseTransformPoint(t.position); } catch { continue; }
+                // Classify so the best-guess can skip the handle (which we pin = supposed to follow) and the reload MECHANISM
+                // (cylinder = supposed to move). What's left and drifting is the orb.
+                string g = "other";
+                bool isHandle = false; try { isHandle = t.IsChildOf(_leverT); } catch { isHandle = false; }
+                if (isHandle) g = "HANDLE"; else if (IsUnderMechanism(t, scanRoot)) g = "MECH";
+                ts.Add(t); loc.Add(l0); sd.Add(d); tag.Add(g);
             }
             if (ts.Count == 0) return;
-            _leverPinT = ts.ToArray(); _leverPinP = ps.ToArray(); _leverPinR = rs.ToArray();
+            _diagT = ts.ToArray(); _diagLocal0 = loc.ToArray(); _diagStartDist = sd.ToArray();
+            _diagMaxDrift = new float[ts.Count]; _diagRoot = scanRoot; _diagTag = tag.ToArray();
+            Log.LogInfo($"[orb] tracking {ts.Count} renderer(s) ≤0.55m of grab under '{SafeName(scanRoot)}' — pull the lever fully, then release; I'll report which part drifts off the handle.");
+        }
+
+        // Update each tracked part's max drift, measured in the HANDLE's local frame so the hand's own motion cancels out: a part
+        // rigidly fixed to the handle reads ~0; the orb that follows the canned press (not the hand) reads large.
+        private void DiagTrackMovers()
+        {
+            if (_diagT == null || _leverT == null) return;
+            for (int i = 0; i < _diagT.Length; i++)
+            {
+                var t = _diagT[i]; if (t == null) continue;
+                Vector3 l; try { l = _leverT.InverseTransformPoint(t.position); } catch { continue; }
+                float drift = Vector3.Distance(l, _diagLocal0[i]);
+                if (drift > _diagMaxDrift[i]) _diagMaxDrift[i] = drift;
+            }
+        }
+
+        // Rank the tracked parts by drift and log the top ones; the largest non-handle drifter is the disconnecting orb. Also paint
+        // the single top drifter magenta so the user can visually confirm it's the orb.
+        private void DiagReportMovers()
+        {
+            if (_diagT == null) return;
+            int n = _diagT.Length;
+            var order = new int[n]; for (int i = 0; i < n; i++) order[i] = i;
+            System.Array.Sort(order, (a, b) => _diagMaxDrift[b].CompareTo(_diagMaxDrift[a]));
+            Log.LogInfo("[orb] === drift report (FINAL on-screen pose vs handle; [HANDLE]=pinned, [MECH]=cylinder, [other]=candidate orb) ===");
+            int shown = 0;
+            for (int k = 0; k < n && shown < 18; k++)
+            {
+                int i = order[k]; var t = _diagT[i]; if (t == null) continue;
+                Log.LogInfo($"[orb] [{_diagTag[i]}] drift={_diagMaxDrift[i]:0.000}m startDist={_diagStartDist[i]:0.00}m '{SafeName(t)}' path={PathOf(t, _diagRoot)}");
+                shown++;
+            }
+            // Best guess = the biggest drifter that is NOT the pinned handle and NOT the reload mechanism, preferring one close to
+            // the grabbed lever (startDist<0.30) so a neighbour lever doesn't win.
+            int best = -1; float bestDrift = 0.02f;
+            for (int pass = 0; pass < 2 && best < 0; pass++)
+            {
+                float maxNear = pass == 0 ? 0.30f : 999f;     // pass 0: only near the grab; pass 1: anywhere
+                for (int i = 0; i < n; i++)
+                {
+                    if (_diagTag[i] != "other" || _diagT[i] == null) continue;
+                    if (_diagStartDist[i] > maxNear) continue;
+                    if (_diagMaxDrift[i] > bestDrift) { bestDrift = _diagMaxDrift[i]; best = i; }
+                }
+            }
+            if (best >= 0)
+            {
+                Renderer r = null; try { r = _diagT[best].GetComponent<Renderer>(); } catch { r = null; }
+                if (r != null) PaintRenderer(r, new Color(1f, 0f, 1f));   // magenta = my best guess at the orb
+                Log.LogInfo($"[orb] >>> best guess (now painted MAGENTA): '{SafeName(_diagT[best])}' drift={_diagMaxDrift[best]:0.000}m path={PathOf(_diagT[best], _diagRoot)} — is THAT the orb?");
+            }
+            else Log.LogInfo("[orb] >>> no non-handle/non-mech drifter found — the orb may be the pinned handle parts (LeverLock/LockRod): check if those still visibly disconnect.");
+        }
+
+        private static bool PaintRenderer(Renderer r, Color c)
+        {
+            try
+            {
+                var mat = r.material;   // per-renderer instance → no bleed to other objects sharing the material
+                if (mat == null) return false;
+                try { mat.color = c; } catch { }
+                try { mat.SetColor("_BaseColor", c); } catch { }
+                try { mat.SetColor("_Color", c); } catch { }
+                try { mat.SetColor("_EmissionColor", c * 2f); } catch { }
+                try { mat.EnableKeyword("_EMISSION"); } catch { }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // "a/b/c" path from scanRoot (exclusive) down to t, for locating a coloured part in the hierarchy.
+        private static string PathOf(Transform t, Transform root)
+        {
+            try
+            {
+                var parts = new System.Collections.Generic.List<string>();
+                for (Transform c = t; c != null && c != root; c = c.parent) parts.Add(c.name);
+                parts.Reverse();
+                return string.Join("/", parts.ToArray());
+            }
+            catch { return "?"; }
+        }
+
+        // Make the lever-END ORB-CAP ride the hand. CONFIRMED (drift report + hide test): the orb that disconnects is 'Cylinder.001'
+        // — the knob/cap mesh the game mounts on EVERY control's grab point (NOT the reload drum; dispensers/rammers have one too).
+        // The game's own rider system co-moves it, but the hand-pin path leaves it undriven so it follows the canned press and flies
+        // off the hand. We scope the scan to the GRABBED SWITCH (_switchRef) — neighbour-safe, since each control owns its own
+        // 'Cylinder.001' — take the 'Cylinder'-named renderer(s) NOT under the pinned handle, record each one's REST offset to
+        // _leverT, and ride it rigidly FROM GRAB so it tracks the hand through the whole pull. On release the pin clears and it
+        // returns to the animation's pose (the reload settles correctly). Other switch decor (CircleLight, steam/gas) is left alone.
+        private void CaptureLeverDecor(Vector3 grabPoint)
+        {
+            if (_leverT == null) return;
+            Transform root = _switchRef != null ? _switchRef : _leverParent;
+            if (root == null) return;
+            Transform[] all = null; try { all = root.GetComponentsInChildren<Transform>(true); } catch { all = null; }
+            if (all == null || all.Length <= 1 || all.Length > 400) return;   // bounded: bail if the root is somehow a huge node
+            var ts = new System.Collections.Generic.List<Transform>();
+            var sp = new System.Collections.Generic.List<Vector3>();
+            var sr = new System.Collections.Generic.List<Quaternion>();
+            var rp = new System.Collections.Generic.List<Vector3>();
+            var rr = new System.Collections.Generic.List<Quaternion>();
+            var dbg = new System.Text.StringBuilder();
+            for (int i = 0; i < all.Length; i++)
+            {
+                var t = all[i]; if (t == null || t == root) continue;
+                bool inHandle = true; try { inHandle = t.IsChildOf(_leverT); } catch { inHandle = true; }
+                if (inHandle) continue;                       // handle subtree (incl. _leverT) is already locally pinned
+                string nm = null; try { nm = t.name; } catch { nm = null; }
+                if (string.IsNullOrEmpty(nm) || nm.ToLowerInvariant().IndexOf("cylinder") < 0) continue;   // the orb-cap knob only
+                bool hasRend = false; try { hasRend = t.GetComponent<Renderer>() != null; } catch { }
+                if (!hasRend) continue;                       // a visible mesh, not a logic node
+                Vector3 relP; Quaternion relR;
+                try { relP = _leverT.InverseTransformPoint(t.position); relR = Quaternion.Inverse(_leverT.rotation) * t.rotation; }
+                catch { continue; }
+                ts.Add(t); sp.Add(t.localPosition); sr.Add(t.localRotation); rp.Add(relP); rr.Add(relR);
+                if (dbg.Length < 600) { float d; try { d = NearestApproach(t, grabPoint); } catch { d = -1f; } dbg.Append(' ').Append(SafeName(t)).Append('@').Append(d.ToString("0.00")); }
+            }
+            if (ts.Count == 0) return;
+            _leverDecorT = ts.ToArray(); _leverDecorSnapP = sp.ToArray(); _leverDecorSnapR = sr.ToArray();
+            _leverDecorRelP = rp.ToArray(); _leverDecorRelR = rr.ToArray();
+            _leverDecorActive = new bool[ts.Count];
+            for (int i = 0; i < _leverDecorActive.Length; i++) _leverDecorActive[i] = true;   // ride from grab (switch-scoped → safe)
+            Log.LogInfo($"[manip] orb-cap: riding {ts.Count} 'Cylinder' mesh(es) on the handle from grab under '{SafeName(root)}':{dbg}");
+        }
+
+        // True if t — or any ancestor up to (not past) root — is named like the reload MECHANISM. Walking ancestors means the
+        // cylinder's own unnamed sub-meshes are excluded too, so riding decor can never freeze a moving part of the reload.
+        private static bool IsUnderMechanism(Transform t, Transform root)
+        {
+            for (Transform c = t; c != null && c != root; c = c.parent)
+                if (IsMechanismNode(c)) return true;
+            return false;
+        }
+
+        // Reload MECHANISM names that must keep animating to their own end (NOT be glued to the hand-tracked lever). The cylinder
+        // is a sibling of the reload-cylinder lever; rammer arms/carriages sit under the rammer switches. Decor (lights, orbs)
+        // never matches these, so it stays a candidate to ride the handle.
+        private static bool IsMechanismNode(Transform t)
+        {
+            string n = null; try { n = t.name; } catch { n = null; }
+            if (string.IsNullOrEmpty(n)) return false;
+            n = n.ToLowerInvariant();
+            return n.Contains("cylinder") || n.Contains("rammer") || n.Contains("carrage")
+                || n.Contains("piston") || n.Contains("breach") || n.Contains("chain")
+                || n.Contains("swashplate") || n.Contains("pump") || n.Contains("valve");
         }
 
         // Re-pin the held lever's subtree to its grab-time local poses (called AFTER the game's animator via LateApply): the
@@ -2442,12 +2684,42 @@ namespace IronNestVR
         // tracks the hand exactly — no additive over-travel. The mechanism cylinder is a SIBLING (not in this list) → unaffected.
         private void ApplyLeverPin()
         {
-            if (_leverPinT == null) return;
-            for (int i = 0; i < _leverPinT.Length; i++)
+            if (_leverPinT != null)
             {
-                var t = _leverPinT[i]; if (t == null) continue;
-                try { t.localPosition = _leverPinP[i]; t.localRotation = _leverPinR[i]; } catch { }
+                for (int i = 0; i < _leverPinT.Length; i++)
+                {
+                    var t = _leverPinT[i]; if (t == null) continue;
+                    try { t.localPosition = _leverPinP[i]; t.localRotation = _leverPinR[i]; } catch { }
+                }
             }
+            // Lever-END decor (orbs/lights) that the press moves: rigidly ride it along with _leverT (which DriveHeldStick has
+            // already posed to the hand this frame) so it stays glued to the handle instead of overshooting to the canned end.
+            // Static decor (didn't move) is left untouched; once a node moves it's latched glued for the rest of the hold.
+            if (_leverDecorT != null && _leverT != null)
+            {
+                for (int i = 0; i < _leverDecorT.Length; i++)
+                {
+                    var t = _leverDecorT[i]; if (t == null) continue;
+                    if (!_leverDecorActive[i])
+                    {
+                        bool moved = false;
+                        try
+                        {
+                            moved = (t.localPosition - _leverDecorSnapP[i]).sqrMagnitude > 1e-6f   // >~1 mm
+                                 || Quaternion.Angle(t.localRotation, _leverDecorSnapR[i]) > 0.1f;  // >0.1°
+                        }
+                        catch { moved = false; }
+                        if (!moved) continue;            // static decor (e.g. a console light) → leave it where the game has it
+                        _leverDecorActive[i] = true;     // latch: once the press moves it, keep it glued for the whole hold
+                        Log.LogInfo($"[manip] lever-end decor: '{SafeName(t)}' moved with the press → now riding the handle.");
+                    }
+                    try { t.position = _leverT.TransformPoint(_leverDecorRelP[i]); t.rotation = _leverT.rotation * _leverDecorRelR[i]; }
+                    catch { }
+                }
+            }
+            // Diagnostic LAST: measure each tracked part's drift in the FINAL on-screen pose (after the handle pin), so pinned
+            // handle parts read ~0 and only what the user actually sees disconnect shows up.
+            if (DiagFindOrb) DiagTrackMovers();
         }
 
         private void DriveHeldStick()
