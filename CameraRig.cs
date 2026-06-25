@@ -314,9 +314,9 @@ namespace IronNestVR
             if (_vigMat != null)
             {
                 var c = new Color(0f, 0f, 0f, _vigCurrent);
+                try { if (_vigMat.HasProperty("_BaseColor")) _vigMat.SetColor("_BaseColor", c); } catch { }
                 try { _vigMat.color = c; } catch { }
                 try { if (_vigMat.HasProperty("_Color")) _vigMat.SetColor("_Color", c); } catch { }
-                try { if (_vigMat.HasProperty("_BaseColor")) _vigMat.SetColor("_BaseColor", c); } catch { }
             }
         }
 
@@ -347,18 +347,39 @@ namespace IronNestVR
             try { return LayerMask.LayerToName(layer); } catch { return null; }
         }
 
+        // Configure a URP/Unlit material for alpha-blended, double-sided, depth-write-off transparency at runtime
+        // (URP reads these float props directly in its pass blend state, so it works without the material editor).
+        internal static void MakeTransparentUnlit(Material m)
+        {
+            if (m == null) return;
+            try { m.SetFloat("_Surface", 1f); } catch { }   // 0 opaque, 1 transparent
+            try { m.SetFloat("_Blend", 0f); } catch { }      // alpha blend
+            try { m.SetFloat("_SrcBlend", 5f); } catch { }   // SrcAlpha
+            try { m.SetFloat("_DstBlend", 10f); } catch { }  // OneMinusSrcAlpha
+            try { m.SetFloat("_ZWrite", 0f); } catch { }
+            try { m.SetFloat("_AlphaClip", 0f); } catch { }
+            try { m.SetFloat("_Cull", 0f); } catch { }       // double-sided
+            try { m.EnableKeyword("_SURFACE_TYPE_TRANSPARENT"); } catch { }
+            try { m.DisableKeyword("_ALPHATEST_ON"); } catch { }
+            try { m.DisableKeyword("_ALPHAPREMULTIPLY_ON"); } catch { }
+            m.renderQueue = 3000; // Transparent
+        }
+
         private void EnsureVignette()
         {
             if (_vig[0] != null || _vigLayer[0] < 0 || _vigLayer[1] < 0) return;
             if (_vigMat == null)
             {
-                var sh = Shader.Find("Sprites/Default");      // transparent + Cull Off + multiplies tex by _Color
-                if (sh == null) sh = Shader.Find("UI/Default");
-                if (sh == null) sh = Shader.Find("Universal Render Pipeline/Unlit");
-                _vigMat = new Material(sh) { renderQueue = 5000 };
-                _vigMat.mainTexture = BuildVignetteTexture();
-                try { if (_vigMat.HasProperty("_ZTest")) _vigMat.SetFloat("_ZTest", (float)CompareFunction.Always); } catch { }
-                try { if (_vigMat.HasProperty("_ZWrite")) _vigMat.SetFloat("_ZWrite", 0f); } catch { }
+                // MUST be a real URP shader — built-in "Sprites/Default" silently doesn't draw under this URP
+                // pipeline (the working menu/laser use URP/Unlit). Configure it for alpha-blended transparency.
+                var sh = Shader.Find("Universal Render Pipeline/Unlit");
+                if (sh == null) sh = Shader.Find("Unlit/Transparent");
+                if (sh == null) sh = Shader.Find("Sprites/Default");
+                _vigMat = new Material(sh);
+                MakeTransparentUnlit(_vigMat);
+                var tex = BuildVignetteTexture();
+                _vigMat.mainTexture = tex;
+                try { if (_vigMat.HasProperty("_BaseMap")) _vigMat.SetTexture("_BaseMap", tex); } catch { }
             }
             for (int i = 0; i < 2; i++)
             {
@@ -381,7 +402,11 @@ namespace IronNestVR
                 _vig[i] = go;
                 _vigMr[i] = mr;
             }
-            Log.LogInfo($"[vignette] overlay built (layers {_vigLayer[0]}/{_vigLayer[1]}).");
+            int m0 = _cam[0] != null ? _cam[0].cullingMask : 0;
+            int m1 = _cam[1] != null ? _cam[1].cullingMask : 0;
+            bool e0 = (m0 & (1 << _vigLayer[0])) != 0, e1 = (m1 & (1 << _vigLayer[1])) != 0;
+            Log.LogInfo($"[vignette] overlay built (layers {_vigLayer[0]}/{_vigLayer[1]}; eye0 mask=0x{(uint)m0:X8} hasLayer={e0}, " +
+                        $"eye1 mask=0x{(uint)m1:X8} hasLayer={e1}; shader='{(_vigMat != null && _vigMat.shader != null ? _vigMat.shader.name : "null")}').");
         }
 
         // Black RGB, radial alpha ramp: clear inside ApertureInner, fully opaque by ApertureOuter (of the

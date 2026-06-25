@@ -284,6 +284,7 @@ namespace IronNestVR
                 Color mc = valid ? new Color(0.25f, 1f, 0.4f, 0.85f) : new Color(1f, 0.35f, 0.25f, 0.6f);
                 if (_teleMat != null)
                 {
+                    try { if (_teleMat.HasProperty("_BaseColor")) _teleMat.SetColor("_BaseColor", mc); } catch { }
                     try { _teleMat.color = mc; } catch { }
                     try { if (_teleMat.HasProperty("_Color")) _teleMat.SetColor("_Color", mc); } catch { }
                 }
@@ -374,10 +375,15 @@ namespace IronNestVR
                 go.layer = 0;   // default world layer — rendered by both eye cameras (correct stereo on the floor)
                 var col = go.GetComponent<Collider>();
                 if (col != null) UnityEngine.Object.Destroy(col); // never block the teleport/laser raycasts
-                var sh = Shader.Find("Sprites/Default");
-                if (sh == null) sh = Shader.Find("UI/Default");
-                if (sh == null) sh = Shader.Find("Universal Render Pipeline/Unlit");
-                _teleMat = new Material(sh) { mainTexture = BuildDiscTexture(), renderQueue = 4000 };
+                // Real URP shader — Sprites/Default doesn't draw under this URP pipeline (same trap as the vignette).
+                var sh = Shader.Find("Universal Render Pipeline/Unlit");
+                if (sh == null) sh = Shader.Find("Unlit/Transparent");
+                if (sh == null) sh = Shader.Find("Sprites/Default");
+                _teleMat = new Material(sh);
+                CameraRig.MakeTransparentUnlit(_teleMat);
+                var dtex = BuildDiscTexture();
+                _teleMat.mainTexture = dtex;
+                try { if (_teleMat.HasProperty("_BaseMap")) _teleMat.SetTexture("_BaseMap", dtex); } catch { }
                 var mr = go.GetComponent<MeshRenderer>();
                 if (mr != null) { mr.material = _teleMat; mr.enabled = false; }
                 _teleMarker = go;
