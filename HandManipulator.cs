@@ -114,6 +114,12 @@ namespace IronNestVR
         // its arm (pivot→tip) tracks the hand, clamped to the mechanism's own throw angle. Driven by real hand position,
         // so it's guaranteed visible. Everything else keeps the captured replay (those already move correctly).
         private Transform _leverT;           // the held stick (grabbed node or its visible parent); null => no synthetic swing
+        // The held lever's SUBTREE (descendants of _leverT) + their local poses at grab. While held, DriveHeldStick (which
+        // also runs in LateApply, AFTER the game's animator) re-pins them to these poses every frame so the game's canned
+        // lever-PRESS clip can't ADD its travel on top of the hand's swing — the whole lever rides _leverT rigidly and stays
+        // exactly where the hand is. The reload MECHANISM (cylinder/charges) is a SIBLING of _leverT, never in this list, so
+        // it keeps animating freely to its correct end. Cleared on release → the lever then takes the animation's pose.
+        private Transform[] _leverPinT; private Vector3[] _leverPinP; private Quaternion[] _leverPinR;
         private Transform _leverParent;      // its parent — we work in parent-local so a turret rotation doesn't skew it
         private Vector3 _leverPivotLocal;    // stick localPosition at grab (its origin is the pivot we swing about)
         private Quaternion _leverRestLocalR; // stick localRotation at grab (the swing is measured off this)
@@ -655,18 +661,19 @@ namespace IronNestVR
             // DisableAssemblyAnimators (+ any scrub setup) just disabled animators UP TO the assembly root — which includes the
             // '--Reloading Console' reload rig — so the lever could swing without the idle rig fighting it. But leaving that rig
             // disabled across the reload SWALLOWS its animation events → the state machine never finishes → the cylinder ENDS AT
-            // THE WRONG POSITION (the user's #1 complaint) and plays inconsistently by hold length. The reload state does NOT
-            // pose the synthetic handle (_leverT, captured world-move 0), so we can hand the mechanism's animators straight back
-            // to the game on EVERY grab and the handle still follows. Result: the game plays its reload LIVE, start to finish, and
-            // settles the cylinder exactly where a normal (non-VR) reload leaves it — identical every grab. (Runs on the learn
-            // grab too, where DisableAssemblyAnimators had wrongly disabled the rig the learn pass wanted enabled.)
+            // THE WRONG POSITION (the user's #1 complaint). But that rig is ALSO the lever's own press animator, so re-enabling it
+            // while the hand holds the lever makes the press ADD to the pull (over-travel / yanked out of grip). The animation and
+            // the hand can't both own the lever. RESOLUTION: keep these animators disabled for the WHOLE pull (handle follows the
+            // hand cleanly), ARM at the bottom, and DEFER the reload to RELEASE — ClearSwitchGrab re-enables everything and fires
+            // the click with the hand OFF the lever, so the game plays its full clip + events to the correct end, nothing fighting.
             else if (_leverT != null)
             {
-                Log.LogInfo($"[manip] held-stick follow: '{sw.name}' has a real handle — handle follows during the pull; the game plays its own reload (animators handed back at fire) to the correct end.");
-                // Drop the scrub DRIVE so we never hand-pose the mechanism, but KEEP the mechanism animators DISABLED for now
-                // (do not re-enable, do not null _scrubAnimators): the assembly rig idles the lever back to rest every frame, so
-                // it must stay off while the handle is being pulled or the swing gets overwritten. The fire branch (progress≥0.85)
-                // re-enables them the instant the effect fires, so the game's reload plays live to its correct authored end.
+                Log.LogInfo($"[manip] held-stick follow: '{sw.name}' has a real handle — handle follows during the pull; the game plays its own reload on RELEASE (animators stay off until then) to the correct end.");
+                // Drop the scrub DRIVE so we never hand-pose the mechanism, but KEEP the mechanism animators DISABLED through the
+                // whole pull (do not re-enable, do not null _scrubAnimators): the lever's own/assembly rig would otherwise drive
+                // the canned press onto your hand (over-travel) AND idle the lever back to rest (overwriting the swing). They're
+                // re-enabled only on RELEASE (ClearSwitchGrab → RestoreScrubDrivers), where the deferred reload then plays cleanly
+                // with your hand off the lever — full clip + events to the correct authored end, nothing fighting it.
                 _activeMovers = null; _scrubManual = false;
                 // ALSO hand the EXTRA cluster riders back to the game. GatherExtraRiders (PASS A, capture-keyed → only fires
                 // from grab 2) co-moves 'Cylinder.001' — the actual reload CYLINDER, which the game animates during the reload —
@@ -885,24 +892,22 @@ namespace IronNestVR
             {
                 if (_leverT != null)
                 {
-                    // FOLLOW control: fire the EFFECT the moment the lever reaches the bottom of its throw, so the action happens
-                    // WHILE it's in your hand. The mechanism animators were kept DISABLED through the pull so the handle followed
-                    // cleanly (the assembly rig otherwise idles the lever to rest every frame). NOW, at the fire, hand them back to
-                    // the GAME and let it play its own reload: (1) RE-ENABLE the mechanism animators, then (2) Activate fires the
-                    // click → the gun controller's reload sets the state machine going on the now-LIVE animator, so its full clip +
-                    // animation events run to the correct authored end. Order matters: enabling first means the reload trigger lands
-                    // on a live animator (guaranteed to play), and Unity evaluates animators AFTER Update so there's no stale idle
-                    // frame between the two. This is the key fix: disabling the rig ACROSS the reload swallowed its events and left
-                    // the cylinder at the WRONG position. The reload state doesn't pose the synthetic handle (captured world-move 0),
-                    // so DriveHeldStick keeps the handle in your grip; ClearSwitchGrab eases it back on release.
+                    // FOLLOW control: fire the reload AS you reach the bottom, so the game's reload animation plays WHILE the lever
+                    // is in your hand (you watch the cylinder turn). Re-enable ALL the mechanism animators — INCLUDING the lever's
+                    // own (it carries the reload's animation EVENTS, so it must run for the cylinder to reach its correct end) —
+                    // then fire the click. That animator ALSO plays the canned lever PRESS, which would add to your pull; but
+                    // ApplyLeverPin (run every frame in LateApply, AFTER the animator) re-pins the lever's whole subtree to the
+                    // hand pose, so the press is overwritten and the lever stays exactly where your hand is. On release we stop
+                    // pinning and the lever takes the animation's pose (returned to rest by then). The cylinder is a SIBLING of the
+                    // lever (never pinned) so it animates freely to the correct end regardless of how long you hold.
                     if (!_leverArmed)
                     {
-                        if (_scrubAnimators != null)                 // hand the mechanism animators back FIRST → live when the reload triggers
+                        if (_scrubAnimators != null)
                             for (int i = 0; i < _scrubAnimators.Count; i++)
                                 try { if (_scrubAnimators[i].A != null) _scrubAnimators[i].A.enabled = _scrubAnimators[i].WasEnabled; } catch { }
-                        Activate(_switch, _switchInteractable);      // fire the reload → plays live on the re-enabled rig to the correct end
+                        Activate(_switch, _switchInteractable);
                         _leverArmed = true;
-                        if (!_scrubManual) _learnTriggered = true;   // learn: capture the click's tail after release
+                        if (!_scrubManual) _learnTriggered = true;
                         input.Haptic(Config.HapticAmplitude, Mathf.Max(Config.HapticSeconds, 0.04f));
                     }
                     _switchLatched = true;
@@ -1187,8 +1192,12 @@ namespace IronNestVR
                 catch { _retT = null; }
                 if (_switchAnimator != null) _switchAnimator.enabled = _switchAnimatorWasEnabled;
 
+                // FOLLOW lever: the reload already fired mid-pull and its animator has been running (the cylinder reloaded to its
+                // correct end). Through the hold the lever was hand-PINNED on top of that animation (ApplyLeverPin); now that we
+                // release, the pin is cleared in the teardown below so the lever takes the animation's own pose (back at rest by
+                // now), while _leverT eases to rest above. Nothing left to fire here.
                 if (_leverT != null && _leverArmed)
-                    Log.LogInfo($"[manip] held-stick '{_switchKey}': effect fired mid-pull; handle easing back, game owns the reload.");
+                    Log.LogInfo($"[manip] held-stick '{_switchKey}': released — lever was hand-pinned over the live reload; handing it back to the animation's pose.");
 
                 // LEARN: if the click fired, the animation is still playing — keep the rig snapshot alive and sample a
                 // TAIL after release (in Tick) so the FULL animation is captured regardless of how fast you let go. The
@@ -1202,6 +1211,7 @@ namespace IronNestVR
             _switch = null; _switchInteractable = null; _switchLatched = false;
             _switchScrubDone = false; _scrubManual = false; _activeMovers = null; _scrubAnimators = null;
             _leverT = null; _leverParent = null; _leverCon = null;
+            _leverPinT = null; _leverPinP = null; _leverPinR = null;   // stop pinning → the lever returns to the animation's pose
             _switchRef = null; _switchMovers = null; _switchAnimator = null; _switchKey = null; _scrubKey = null; _switchProgress = 0f;
             // Keep the learn arrays alive ONLY while a tail capture is pending; otherwise drop everything.
             if (!_learnTail)
@@ -1469,6 +1479,10 @@ namespace IronNestVR
             }
             _leverT = pivot; _leverParent = pivot.parent;
             _leverPivotLocal = pivot.localPosition; _leverRestLocalR = pivot.localRotation;
+            // Snapshot the held lever's SUBTREE (every descendant of _leverT) at its REST pose now (the press hasn't fired yet,
+            // so this is the rest/idle pose). DriveHeldStick re-pins these each frame so the canned press can't move them on top
+            // of the hand. Excludes _leverT itself (DriveHeldStick poses that). The mechanism cylinder is a SIBLING → not here.
+            CaptureLeverPinChildren();
             Vector3 armW = grabPoint - pivot.position;
             _leverArmParentDir = _leverParent != null ? _leverParent.InverseTransformDirection(armW) : armW;
             try { _leverGrabLocal = pivot.InverseTransformPoint(grabPoint); } catch { _leverGrabLocal = Vector3.zero; }
@@ -1521,9 +1535,13 @@ namespace IronNestVR
                 // REUSE the axis LEARNED on this lever's first grab (from the user's actual correct pull) — turret-stable
                 // because it's stored in the rest-local frame. This is the RELIABLE source of the correct one-directional sign;
                 // it replaces the captured-hinge derivation below, whose sign came from the lever-CHILD's frame and flipped.
+                // The menu "Direction" toggle (SwitchMotion.Flip) negates it, so a lever learned the WRONG way on a bad first
+                // pull can be corrected by the player (and SwitchFlipDir promotes it to a persistent ManualAxis so it sticks).
                 Quaternion fr = _leverParent != null ? _leverParent.rotation * _leverRestLocalR : _leverRestLocalR;
-                _leverRotAxisW = (fr * axRL).normalized; _leverHasRotAxis = true;
-                Log.LogInfo($"[manip] held-stick follow: reused learned hinge axis ({_leverRotAxisW.x:0.00},{_leverRotAxisW.y:0.00},{_leverRotAxisW.z:0.00}) for '{_switchKey}'.");
+                _leverRotAxisW = (fr * axRL).normalized;
+                if (_switchMotion.Flip) _leverRotAxisW = -_leverRotAxisW;
+                _leverHasRotAxis = true;
+                Log.LogInfo($"[manip] held-stick follow: reused learned hinge axis ({_leverRotAxisW.x:0.00},{_leverRotAxisW.y:0.00},{_leverRotAxisW.z:0.00}) flip={_switchMotion.Flip} for '{_switchKey}'.");
             }
             else if (_leverBuried && !_leverSlide && TryCapturedHingeAxisWorld(out Vector3 capAxW))
             {
@@ -2399,6 +2417,39 @@ namespace IronNestVR
 
         // Make the held stick follow the hand: ROTATE its hinge to point the grab arm at the hand (default), or SLIDE the
         // hinge along the pull axis for translate-type controls (e.g. the War Horn pulley). Real-hand driven → visible.
+        // Snapshot _leverT's descendants + their local poses at grab (their REST pose — the press hasn't fired). ApplyLeverPin
+        // re-asserts these each frame so the canned lever-press clip can't move them on top of the hand. Bounded subtree only.
+        private void CaptureLeverPinChildren()
+        {
+            _leverPinT = null; _leverPinP = null; _leverPinR = null;
+            if (_leverT == null) return;
+            Transform[] all = null; try { all = _leverT.GetComponentsInChildren<Transform>(true); } catch { all = null; }
+            if (all == null || all.Length <= 1) return;
+            var ts = new System.Collections.Generic.List<Transform>(all.Length);
+            var ps = new System.Collections.Generic.List<Vector3>(all.Length);
+            var rs = new System.Collections.Generic.List<Quaternion>(all.Length);
+            for (int i = 0; i < all.Length; i++)
+            {
+                var t = all[i]; if (t == null || t == _leverT) continue;   // _leverT itself is posed by DriveHeldStick
+                ts.Add(t); ps.Add(t.localPosition); rs.Add(t.localRotation);
+            }
+            if (ts.Count == 0) return;
+            _leverPinT = ts.ToArray(); _leverPinP = ps.ToArray(); _leverPinR = rs.ToArray();
+        }
+
+        // Re-pin the held lever's subtree to its grab-time local poses (called AFTER the game's animator via LateApply): the
+        // canned press clip rotates these nodes, but restoring their local pose makes the whole lever ride _leverT rigidly so it
+        // tracks the hand exactly — no additive over-travel. The mechanism cylinder is a SIBLING (not in this list) → unaffected.
+        private void ApplyLeverPin()
+        {
+            if (_leverPinT == null) return;
+            for (int i = 0; i < _leverPinT.Length; i++)
+            {
+                var t = _leverPinT[i]; if (t == null) continue;
+                try { t.localPosition = _leverPinP[i]; t.localRotation = _leverPinR[i]; } catch { }
+            }
+        }
+
         private void DriveHeldStick()
         {
             if (_leverT == null) return;
@@ -2471,6 +2522,7 @@ namespace IronNestVR
                     }
                 }
             }
+            ApplyLeverPin();   // re-pin the lever's subtree to its rest pose so the canned press can't add to the hand's swing
             DriveRider();   // a tip mesh outside the stick's subtree (charge rammer orb-light) rides the swing, synced
 
             // DIAG (rotate only): world travel of the grabbed point. For slide we report the clamped slide distance above
@@ -3204,6 +3256,15 @@ namespace IronNestVR
             if (!HasSwitchSelection) return;
             var m = SwitchMotions.Get(_selSwitchKey);
             m.Flip = !m.Flip;
+            // PROMOTE an auto-LEARNED axis to a DEFINITIVE manual one the moment the player sets the direction. The learned
+            // axis (LeverAxisRestLocal) is otherwise re-derived from the FIRST pull each session — so a fat-fingered wrong
+            // first pull would "ruin the lever" until restart. Baking the learned rest-local axis into the persisted
+            // SwitchMotion (ManualAxis=true) makes this direction stick across sessions and stops it ever re-learning a bad
+            // one. From here the ManualAxis tier owns it and Flip negates it, so the player has definitive per-lever control.
+            if (!m.ManualAxis && LeverAxisRestLocal.TryGetValue(_selSwitchKey, out var axRL) && axRL.sqrMagnitude > 1e-8f)
+            {
+                m.Axis = axRL.normalized; m.ManualAxis = true;
+            }
             SwitchMotions.Set(_selSwitchKey, m);
         }
 
