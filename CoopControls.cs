@@ -55,6 +55,7 @@ namespace IronNestVR
         private const byte MSG_FIRE = 7;     // [t][side u8]                 reliable   gun discharge (0=L,1=R)
         private const byte MSG_SNAP = 13;    // [t][9×f32]                   reliable   join-in-progress turret/gun state
         private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
+        private const byte MSG_POWDER = 39;  // [t][side u8][charges i32]    reliable   per-gun powder/charge state, EITHER→peer (symmetric, last-writer-wins)
 
         // How long remote ownership / streamed state survives without a refresh. The stream runs at
         // CoopSendHz (~30/s), so 2s easily rides minor packet loss but recovers fast if the peer vanishes
@@ -104,6 +105,12 @@ namespace IronNestVR
         private static readonly Dictionary<int, float> _echoUntil = new Dictionary<int, float>();
         private static readonly int FireKeyL = Fnv("__coop_fire_L"), FireKeyR = Fnv("__coop_fire_R");
         private static bool _firedPrevL, _firedPrevR;
+        // Per-gun powder/charge edge-detect: the reload sequence runs locally (the "rammer theatre"), so a button
+        // click alone never reproduces the loaded charge on the peer. We watch each gun's PowderCharges and push the
+        // VALUE itself, either direction, whenever it changes. int.MinValue = "no baseline yet" (seed silently on the
+        // first sample / after join — the JIP snapshot already carried join-time powder). Echo-suppressed via _echoUntil.
+        private static readonly int PowderKeyL = Fnv("__coop_powder_L"), PowderKeyR = Fnv("__coop_powder_R");
+        private static int _powderPrevL = int.MinValue, _powderPrevR = int.MinValue;
 
         // Join-in-progress snapshot received before the turret/guns resolved locally (scene still loading on the
         // joiner). Held here and applied once the registry is ready — see Tick / ApplySnapshot.
@@ -214,6 +221,7 @@ namespace IronNestVR
                     if (_grp[g].RemoteOwned && now >= _grp[g].Until) _grp[g].RemoteOwned = false;
 
                 DetectFire(now);
+                DetectPowder(now);
 
                 // REVIEW-fix (P3): host broadcasts a low-rate CURRENT-state reconcile so the client can correct any
                 // accumulated CurrentAngle/elevation drift (framerate-dependent slew, a missed reliable packet).
@@ -277,6 +285,37 @@ namespace IronNestVR
             bool suppressed = _echoUntil.TryGetValue(echoKey, out var u) && now < u;
             if (fired && !prev && !suppressed) { SendFire(side); Log.LogInfo($"[ctrl] fire gun {side} -> peer"); }
             return fired;
+        }
+
+        // ---------------- powder / charge state (symmetric) ----------------
+
+        // Replicate each gun's loaded charge to the peer. Powder is part of the locally-run reload sim, so the
+        // Charge-Rammer click (a Group.Other LookAtTarget) replays the BUTTON on the peer but doesn't reproduce the
+        // loaded charge when the two reload state machines differ — which is exactly the desync the detector caught.
+        // Edge-triggered on the value: whoever loads (host OR client) pushes the number, the peer adopts it. No host
+        // authority (the recurring reconcile no longer touches powder — see ApplyRecon), so a client-side load holds.
+        private static void DetectPowder(float now)
+        {
+            if (!Config.CoopControlSync) return;
+            _powderPrevL = DetectPowderGun(_gunL, _powderPrevL, 0, PowderKeyL, now);
+            _powderPrevR = DetectPowderGun(_gunR, _powderPrevR, 1, PowderKeyR, now);
+        }
+
+        private static int DetectPowderGun(GunController gun, int prev, byte side, int echoKey, float now)
+        {
+            if (gun == null) return prev;
+            int cur;
+            try { cur = gun.PowderCharges; } catch { return prev; }
+            if (cur == prev) return cur;
+            // prev==MinValue: first sample after (re)connect — seed the baseline silently (no spurious blast; join
+            // state rides MSG_SNAP). suppressed: we just applied the peer's value, don't bounce it straight back.
+            bool suppressed = _echoUntil.TryGetValue(echoKey, out var u) && now < u;
+            if (prev != int.MinValue && !suppressed)
+            {
+                SendPowder(side, cur);
+                Log.LogInfo($"[ctrl] powder gun {side} -> peer ({cur})");
+            }
+            return cur;
         }
 
         // ---------------- after the game's Update: apply remote visuals + snap turret state ----------------
@@ -534,8 +573,11 @@ namespace IronNestVR
                         && Mathf.Abs(_gunR.CurrentElevation - v[6]) > tol)
                         _gunR.CurrentElevation = v[6];
                 }
-                if (_gunL != null && !LocallyOwnsGroup(Group.GunLeft)) { int p = Mathf.RoundToInt(v[7]); try { if (_gunL.PowderCharges != p) _gunL.SetPowderCharge(p); } catch { } }
-                if (_gunR != null && !LocallyOwnsGroup(Group.GunRight)) { int p = Mathf.RoundToInt(v[8]); try { if (_gunR.PowderCharges != p) _gunR.SetPowderCharge(p); } catch { } }
+                // Powder is NO LONGER reconciled here. The recurring reconcile is host→client only, so applying the
+                // host's powder authoritatively clobbered a CLIENT-side load right back to the host's value (the
+                // never-recovering "powder local=1 peer=0" desync). Powder now travels symmetrically via MSG_POWDER
+                // (edge-triggered, either side authors, last-writer-wins). v[7]/v[8] are ignored. (recon still WRITES
+                // them for wire-format/JIP-layout parity — only the apply is dropped.)
             }
             catch (Exception e) { Log.LogWarning("[ctrl] apply recon: " + e.Message); }
         }
@@ -557,6 +599,7 @@ namespace IronNestVR
                 case MSG_GROUP:
                 case MSG_CLICK:
                 case MSG_FIRE:
+                case MSG_POWDER:
                     return true;   // cockpit controls — either crew member operates them
             }
             return type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL
@@ -701,6 +744,22 @@ namespace IronNestVR
                     var gun = side == 0 ? _gunL : _gunR;
                     if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
                     _echoUntil[side == 0 ? FireKeyL : FireKeyR] = now + 0.3f;
+                    break;
+                }
+                case MSG_POWDER:
+                {
+                    if (len < 6) return;   // t + side u8 + charges i32
+                    byte side = a[o++];
+                    int charges = GetInt(a, ref o);
+                    var gun = side == 0 ? _gunL : _gunR;
+                    if (gun != null)
+                    {
+                        try { if (gun.PowderCharges != charges) gun.SetPowderCharge(charges); } catch (Exception e) { Log.LogWarning("[ctrl] apply powder: " + e.Message); }
+                        // Adopt as our baseline + suppress the echo so DetectPowder doesn't bounce it back.
+                        if (side == 0) _powderPrevL = charges; else _powderPrevR = charges;
+                        _echoUntil[side == 0 ? PowderKeyL : PowderKeyR] = now + 0.3f;
+                        Log.LogInfo($"[ctrl] applied remote powder gun {side} <- peer ({charges})");
+                    }
                     break;
                 }
                 case MSG_SNAP:
@@ -870,6 +929,13 @@ namespace IronNestVR
             if (!EnsureBuf()) return;
             int o = 0; _buf[o++] = MSG_FIRE; _buf[o++] = side;
             CoopP2P.Send(_buf, o, true);
+        }
+
+        private static void SendPowder(byte side, int charges)
+        {
+            if (!EnsureBuf()) return;
+            int o = 0; _buf[o++] = MSG_POWDER; _buf[o++] = side; o = PutInt(o, charges);
+            CoopP2P.Send(_buf, o, true);   // reliable: a discrete state change, must not be lost
         }
 
         private static void SendValue(Ctrl c)
@@ -1118,6 +1184,7 @@ namespace IronNestVR
             for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].RemoteOwner = 0; _grp[i].Has = false; }
             _pendingGrab.Clear(); _pendingVal.Clear(); _echoUntil.Clear();
             _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
+            _powderPrevL = int.MinValue; _powderPrevR = int.MinValue;   // re-seed powder baseline on next connect
             RestoreGunDrive();   // hand gun-elevation control back to the local turret controller on link-down
         }
 

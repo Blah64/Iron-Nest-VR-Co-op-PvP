@@ -440,10 +440,13 @@ namespace IronNestVR
         public static bool VignetteEnabled = false;
         // Peak darkness at full motion (0 = none, 1 = fully black surround).
         public static float VignetteStrength = 0.7f;
-        // Overlay quad distance in front of each eye (m). Close, so cockpit geometry rarely occludes it.
-        public static float VignetteDistance = 0.08f;
-        // Oversize vs the exact eye frustum so the dark edge always reaches past the visible FOV (no hard cutoff).
-        public static float VignetteCoverMargin = 1.15f;
+        // TEST: when true the vignette stays fully on regardless of motion — flip it to confirm it renders.
+        public static bool VignetteAlwaysOn = false;
+        // Head-locked overlay distance in front of the eyes (m). Far enough for comfortable convergence, near
+        // enough that cockpit geometry (esp. the close peripheral walls) sits behind it instead of occluding it.
+        public static float VignetteDistance = 0.2f;
+        // Oversize vs the eye frustum so the dark edge always reaches past the visible FOV (no hard cutoff).
+        public static float VignetteCoverMargin = 1.2f;
         // Radial alpha ramp (fraction of half-extent): clear inside Inner, fully dark by Outer.
         public static float VignetteApertureInner = 0.40f;
         public static float VignetteApertureOuter = 0.95f;

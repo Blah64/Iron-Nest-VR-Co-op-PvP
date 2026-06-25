@@ -26,15 +26,15 @@ namespace IronNestVR
         // Unity's render phase while the raw CopyResource runs immediately on the D3D11 immediate context, so
         // the two aren't ordered — both eyes' copies would read whichever blit landed last (broken/mono image).
         private readonly RenderTexture[] _flipRT = new RenderTexture[2];
-        // Comfort tunnelling vignette: one dark-edge overlay quad parented to EACH eye camera, each on its own
-        // private layer that only that eye renders — so the overlay is identical screen-space in both eyes
-        // (zero parallax → it sits at a comfortable infinite depth, no eye strain). Sized to the eye frustum
-        // each RenderEye from the real OpenXR FOV, so it always covers the view edge-to-edge regardless of HMD.
-        private readonly GameObject[] _vig = new GameObject[2];
-        private readonly MeshRenderer[] _vigMr = new MeshRenderer[2];
-        private readonly int[] _vigLayer = { -1, -1 };
-        private Material _vigMat;          // shared by both eyes; its colour alpha is the live darkness
+        // Comfort tunnelling vignette: a single world-space dark-edge quad head-locked in front of the player,
+        // rendered by BOTH eye cameras (same proven path as the settings menu) on a private layer carved out of
+        // the scene mask so only the eyes draw it. Repositioned + sized to the FOV every frame from the eye poses.
+        private GameObject _vig;
+        private MeshRenderer _vigMr;
+        private int _vigLayer = -1;
+        private Material _vigMat;          // its colour alpha is the live darkness
         private float _vigCurrent;         // smoothed 0..1 darkness actually applied
+        private Fovf _lastFov;             // most recent eye FOV, for sizing the head-locked overlay
         private bool _ready;
         private int _eyeMask = -1; // captured scene cull mask (for the eye-cull diagnostic)
         private bool _useEnabledFallback;
@@ -109,7 +109,7 @@ namespace IronNestVR
             var mBg = main.backgroundColor;
             var mMask = main.cullingMask;
             _eyeMask = mMask;
-            AllocVignetteLayers(mMask);   // pick two layers the scene doesn't use, one private to each eye
+            AllocVignetteLayer();         // carve one private layer out of the scene mask for the overlay
             var mDepth = main.depth;
             Dbg.Step($"main props ok: clear={mClear} mask={mMask} depth={mDepth}");
 
@@ -215,8 +215,9 @@ namespace IronNestVR
             if (tr) Dbg.Step($"RenderEye{eye}: set projectionMatrix");
             c.projectionMatrix = ProjectionFromFov(view.Fov, Config.NearClip, Config.FarClip);
 
-            // Keep the comfort vignette covering this eye's exact frustum (FOV can differ per eye/runtime).
-            if (_vigCurrent > 0.0015f && _vig[eye] != null) SizeVignette(eye, view.Fov);
+            // Head-lock the comfort vignette once both eye poses for this frame are set (place on the 2nd eye).
+            _lastFov = view.Fov;
+            if (_vigCurrent > 0.0015f && _vig != null && eye == 1) PlaceVignette();
 
             if (!_useEnabledFallback)
             {
@@ -282,16 +283,10 @@ namespace IronNestVR
         /// real mask. Cheap + idempotent (writes only on change).</summary>
         public void SetEyeSceneRender(bool on)
         {
-            int baseMask = on ? _eyeMask : 0;
+            int m = on ? _eyeMask : 0;
+            if (_vigLayer >= 0) m |= (1 << _vigLayer); // both eyes render the shared overlay layer (gated by renderer.enabled)
             for (int i = 0; i < 2; i++)
-            {
-                if (_cam[i] == null) continue;
-                // Always keep this eye's PRIVATE vignette layer in its mask (the overlay's own renderer.enabled
-                // gates whether it actually shows) — and never the OTHER eye's, so the overlay can't cross-bleed.
-                int m = baseMask;
-                if (_vigLayer[i] >= 0) m |= (1 << _vigLayer[i]);
-                if (_cam[i].cullingMask != m) _cam[i].cullingMask = m;
-            }
+                if (_cam[i] != null && _cam[i].cullingMask != m) _cam[i].cullingMask = m;
         }
 
         // ---------------- comfort vignette ----------------
@@ -309,8 +304,7 @@ namespace IronNestVR
 
             bool show = _vigCurrent > 0.0015f;
             if (show) EnsureVignette();
-            for (int i = 0; i < 2; i++)
-                if (_vigMr[i] != null && _vigMr[i].enabled != show) _vigMr[i].enabled = show;
+            if (_vigMr != null && _vigMr.enabled != show) _vigMr.enabled = show;
             if (_vigMat != null)
             {
                 var c = new Color(0f, 0f, 0f, _vigCurrent);
@@ -320,26 +314,21 @@ namespace IronNestVR
             }
         }
 
-        // Reserve two layers — one private to each eye — so a per-eye overlay renders in exactly one eye.
-        // The main camera here renders "Everything" (all layers), so we can't find an unused bit in the mask;
-        // instead we pick two layers (UNNAMED first — almost certainly no game geometry) and CARVE them OUT of
-        // the eye scene mask, then add each back to exactly one eye in SetEyeSceneRender. Robust to any mask.
-        private void AllocVignetteLayers(int sceneMask)
+        // Reserve ONE layer for the overlay. The main camera renders "Everything", so we can't find an unused bit;
+        // instead pick an UNNAMED layer (no game geometry by convention) and CARVE it OUT of the eye scene mask,
+        // then add it back to BOTH eyes in SetEyeSceneRender. Robust to any mask.
+        private void AllocVignetteLayer()
         {
-            int a = -1, b = -1;
-            // Prefer unnamed layers (no geometry by convention), scanning high indices down.
+            int a = -1;
             for (int layer = 31; layer >= 8; layer--)
             {
                 if (!string.IsNullOrEmpty(SafeLayerName(layer))) continue; // named ⇒ may hold geometry — avoid
-                if (a < 0) a = layer;
-                else { b = layer; break; }
+                a = layer; break;
             }
-            if (a < 0) a = 31;                          // pathological: every layer named — take the top two
-            if (b < 0) b = (a == 31) ? 30 : 31;
-            _vigLayer[0] = a; _vigLayer[1] = b;
-            // Make the two layers private to our overlay: neither eye renders them as "scene".
-            _eyeMask &= ~((1 << a) | (1 << b));
-            Log.LogInfo($"[vignette] reserved eye layers {a}/{b} (carved out of the scene mask).");
+            if (a < 0) a = 31;
+            _vigLayer = a;
+            _eyeMask &= ~(1 << a);
+            Log.LogInfo($"[vignette] reserved overlay layer {a} (carved out of the scene mask).");
         }
 
         private static string SafeLayerName(int layer)
@@ -367,7 +356,7 @@ namespace IronNestVR
 
         private void EnsureVignette()
         {
-            if (_vig[0] != null || _vigLayer[0] < 0 || _vigLayer[1] < 0) return;
+            if (_vig != null || _vigLayer < 0) return;
             if (_vigMat == null)
             {
                 // MUST be a real URP shader — built-in "Sprites/Default" silently doesn't draw under this URP
@@ -381,32 +370,47 @@ namespace IronNestVR
                 _vigMat.mainTexture = tex;
                 try { if (_vigMat.HasProperty("_BaseMap")) _vigMat.SetTexture("_BaseMap", tex); } catch { }
             }
-            for (int i = 0; i < 2; i++)
+            // ONE world-space quad (not a child of a camera) — the exact path the settings menu renders on.
+            var go = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            go.name = "IronNestVR_Vignette";
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            go.hideFlags = HideFlags.HideAndDontSave;
+            var col = go.GetComponent<Collider>();
+            if (col != null) UnityEngine.Object.Destroy(col);    // never block the laser/grab raycasts
+            go.layer = _vigLayer;
+            var mr = go.GetComponent<MeshRenderer>();
+            if (mr != null)
             {
-                if (_cam[i] == null) continue;
-                var go = GameObject.CreatePrimitive(PrimitiveType.Quad);
-                go.name = "IronNestVR_Vignette" + i;
-                var col = go.GetComponent<Collider>();
-                if (col != null) UnityEngine.Object.Destroy(col);    // never block the laser/grab raycasts
-                go.layer = _vigLayer[i];
-                go.transform.SetParent(_cam[i].transform, false);
-                go.transform.localRotation = Quaternion.identity;     // faces the eye; double-sided so facing is moot
-                var mr = go.GetComponent<MeshRenderer>();
-                if (mr != null)
-                {
-                    mr.material = _vigMat;
-                    mr.shadowCastingMode = ShadowCastingMode.Off;
-                    mr.receiveShadows = false;
-                    mr.enabled = false;
-                }
-                _vig[i] = go;
-                _vigMr[i] = mr;
+                mr.material = _vigMat;
+                mr.shadowCastingMode = ShadowCastingMode.Off;
+                mr.receiveShadows = false;
+                mr.enabled = false;
             }
+            _vig = go;
+            _vigMr = mr;
+            PlaceVignette(); // position it now so it isn't drawn at the origin for a frame
             int m0 = _cam[0] != null ? _cam[0].cullingMask : 0;
-            int m1 = _cam[1] != null ? _cam[1].cullingMask : 0;
-            bool e0 = (m0 & (1 << _vigLayer[0])) != 0, e1 = (m1 & (1 << _vigLayer[1])) != 0;
-            Log.LogInfo($"[vignette] overlay built (layers {_vigLayer[0]}/{_vigLayer[1]}; eye0 mask=0x{(uint)m0:X8} hasLayer={e0}, " +
-                        $"eye1 mask=0x{(uint)m1:X8} hasLayer={e1}; shader='{(_vigMat != null && _vigMat.shader != null ? _vigMat.shader.name : "null")}').");
+            bool has = (m0 & (1 << _vigLayer)) != 0;
+            Log.LogInfo($"[vignette] overlay built (layer {_vigLayer}; eye mask=0x{(uint)m0:X8} hasLayer={has}; " +
+                        $"shader='{(_vigMat != null && _vigMat.shader != null ? _vigMat.shader.name : "null")}').");
+        }
+
+        // Head-lock the overlay: centre it in front of the eye-midpoint, facing the head, sized to cover the FOV
+        // (+ a little for the per-eye IPD offset). Called each frame once both eye poses are current.
+        private void PlaceVignette()
+        {
+            if (_vig == null || _cam[0] == null || _cam[1] == null) return;
+            Vector3 p0 = _cam[0].transform.position, p1 = _cam[1].transform.position;
+            Vector3 mid = (p0 + p1) * 0.5f;
+            Quaternion rot = Quaternion.Slerp(_cam[0].transform.rotation, _cam[1].transform.rotation, 0.5f);
+            float d = Mathf.Max(Config.NearClip + 0.03f, Config.VignetteDistance);
+            _vig.transform.SetPositionAndRotation(mid + (rot * Vector3.forward) * d, rot);
+            float m = Mathf.Max(1f, Config.VignetteCoverMargin);
+            float tanX = Mathf.Max(Mathf.Abs(Mathf.Tan(_lastFov.AngleLeft)), Mathf.Tan(_lastFov.AngleRight));
+            float tanY = Mathf.Max(Mathf.Tan(_lastFov.AngleUp), Mathf.Abs(Mathf.Tan(_lastFov.AngleDown)));
+            if (tanX < 0.1f || float.IsNaN(tanX)) tanX = 1f; // FOV not read yet — generous (~45°)
+            if (tanY < 0.1f || float.IsNaN(tanY)) tanY = 1f;
+            _vig.transform.localScale = new Vector3(2f * (d * tanX * m + 0.06f), 2f * (d * tanY * m + 0.06f), 1f);
         }
 
         // Black RGB, radial alpha ramp: clear inside ApertureInner, fully opaque by ApertureOuter (of the
@@ -430,21 +434,6 @@ namespace IronNestVR
             tex.SetPixels32(px);
             tex.Apply(false, false);
             return tex;
-        }
-
-        // Size/position this eye's overlay to exactly cover its frustum at VignetteDistance, from the real
-        // per-eye FOV. Centred on the frustum (the few-degree asymmetry vs the gaze axis is negligible).
-        private void SizeVignette(int eye, Fovf fov)
-        {
-            var go = _vig[eye];
-            if (go == null) return;
-            float d = Mathf.Max(Config.NearClip + 0.01f, Config.VignetteDistance);
-            float xl = d * Mathf.Tan(fov.AngleLeft), xr = d * Mathf.Tan(fov.AngleRight);
-            float yd = d * Mathf.Tan(fov.AngleDown), yu = d * Mathf.Tan(fov.AngleUp);
-            float m = Mathf.Max(1f, Config.VignetteCoverMargin);
-            float w = (xr - xl) * m, h = (yu - yd) * m;
-            go.transform.localPosition = new Vector3((xl + xr) * 0.5f, (yd + yu) * 0.5f, d);
-            go.transform.localScale = new Vector3(w, h, 1f);
         }
 
         /// <summary>Builds an OpenGL-convention asymmetric projection from an OpenXR FOV.</summary>
@@ -474,13 +463,12 @@ namespace IronNestVR
         {
             for (int i = 0; i < 2; i++)
             {
-                // Vignette quads are children of the eye cameras, so destroying the eye GameObject takes them too;
-                // just drop our references so a rebuilt rig recreates them.
-                _vig[i] = null; _vigMr[i] = null;
                 if (_cam[i] != null) UnityEngine.Object.Destroy(_cam[i].gameObject);
                 if (_rt[i] != null) { _rt[i].Release(); UnityEngine.Object.Destroy(_rt[i]); }
                 if (_flipRT[i] != null) { _flipRT[i].Release(); UnityEngine.Object.Destroy(_flipRT[i]); }
             }
+            // The vignette is a standalone world-space object now — destroy it explicitly.
+            if (_vig != null) { UnityEngine.Object.Destroy(_vig); _vig = null; _vigMr = null; }
             if (_vigMat != null) { UnityEngine.Object.Destroy(_vigMat); _vigMat = null; }
             _vigCurrent = 0f;
             if (_origin != null) UnityEngine.Object.Destroy(_origin);

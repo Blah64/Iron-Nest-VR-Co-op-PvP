@@ -148,13 +148,20 @@ namespace IronNestVR
         private void UpdateVignette(VrInput input, CameraRig rig, float dt)
         {
             if (rig == null) return;
+
+            // TEST override: hold the vignette fully on so you can confirm it renders without moving.
+            if (Config.VignetteAlwaysOn) { rig.SetVignette(Mathf.Clamp01(Config.VignetteStrength), dt); return; }
+
             float moveMag = Mathf.Sqrt(input.MoveX * input.MoveX + input.MoveY * input.MoveY);
             float moveT = Mathf.Clamp01((moveMag - Config.MoveDeadzone) / (1f - Config.MoveDeadzone));
             float turnT = (Config.TurnEnabled && !Config.SnapTurn)
                 ? Mathf.Clamp01((Mathf.Abs(input.TurnX) - Config.TurnDeadzone) / (1f - Config.TurnDeadzone))
                 : 0f;
-            float moveContribution = (Config.LocomotionEnabled && !Config.TeleportMove) ? moveT : 0f;
-            float movementVig = Config.VignetteEnabled ? Mathf.Max(moveContribution, turnT) * Config.VignetteStrength : 0f;
+            // Smooth strafing contributes in smooth mode; in teleport mode the held aim-stick stands in for it
+            // (so the vignette is visible while you line up a blink). Smooth turn always contributes.
+            float locoT = Config.TeleportMove ? (_teleAiming ? 1f : 0f)
+                                              : (Config.LocomotionEnabled ? moveT : 0f);
+            float movementVig = Config.VignetteEnabled ? Mathf.Max(locoT, turnT) * Config.VignetteStrength : 0f;
 
             if (_teleFlash > 0f) _teleFlash = Mathf.Max(0f, _teleFlash - dt / Mathf.Max(0.02f, Config.TeleportBlinkTime));
             rig.SetVignette(Mathf.Max(movementVig, _teleFlash), dt);
