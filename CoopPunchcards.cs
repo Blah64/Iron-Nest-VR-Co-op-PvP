@@ -298,7 +298,7 @@ namespace IronNestVR
             try { p = anchor.InverseTransformPoint(c.T.position); r = Quaternion.Inverse(anchor.rotation) * c.T.rotation; }
             catch { return; }
             bool inSlot = IsInReqSlot(c);
-            int o = 0; _buf[o++] = MSG_PUNCH_PLACE; o = PutInt(o, c.Key); o = PutV(o, p); o = PutQ(o, r); _buf[o++] = (byte)(inSlot ? 1 : 0);
+            int o = 0; _buf[o++] = MSG_PUNCH_PLACE; o = PutInt(o, c.Key); o = PutV(o, p); o = PutQ(o, r); o = PutByte(o, (byte)(inSlot ? 1 : 0));
             CoopP2P.Send(_buf, o, true);
             if (log) Log.LogInfo($"[punch] placed card key={c.Key} (slot={inSlot}) -> peer");
         }
@@ -455,9 +455,11 @@ namespace IronNestVR
         private static void BroadcastDeck(List<DeckEntry> entries)
         {
             if (!EnsureBuf()) return;
+            _wover = false;
             int o = 0; _buf[o++] = MSG_PUNCH_DECK;
             o = PutInt(o, entries.Count);
             for (int i = 0; i < entries.Count; i++) { o = PutStr(o, entries[i].Id); o = PutInt(o, entries[i].Uses); }
+            if (_wover) { Log.LogWarning($"[punch] deck too large for {_buf.Length}B buffer ({entries.Count} cards) — not sent"); return; }
             CoopP2P.Send(_buf, o, true);
             _sentDeck++;
             Log.LogInfo($"[punch] deck -> peer ({entries.Count} card(s): {DeckSig(entries)})");
@@ -670,24 +672,37 @@ namespace IronNestVR
             return list;
         }
 
-        private static void SendRedeem(string cardId, List<VarSnap> vars)
+        // Shared var-list wire format for redeem/graph (same bytes, different type byte → OnGraphPacket reuses the
+        // redeem parse). Clamps to the 64-var cap the receiver enforces (OnRedeemPacket) so the peer won't reject
+        // the whole packet, and rides the bounds-checked Put* so it can never run past _buf.
+        private static int WriteVarList(int o, List<VarSnap> vars)
         {
-            if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_PUNCH_REDEEM;
-            o = PutStr(o, cardId);
-            o = PutInt(o, vars.Count);
-            for (int i = 0; i < vars.Count; i++)
+            int n = vars.Count;
+            if (n > 64) { Log.LogWarning($"[punch] var list has {n} vars (>64 cap) — clamping"); n = 64; }
+            o = PutInt(o, n);
+            for (int i = 0; i < n; i++)
             {
                 var v = vars[i];
                 o = PutStr(o, v.Id);
                 o = PutInt(o, v.Type);
                 o = PutInt(o, v.I);
                 o = PutF(o, v.F);
-                _buf[o++] = (byte)(v.B ? 1 : 0);
+                o = PutByte(o, (byte)(v.B ? 1 : 0));
                 o = PutInt(o, v.GridLoc); o = PutInt(o, v.GridX); o = PutInt(o, v.GridY);
                 o = PutInt(o, v.Shell);
                 o = PutStr(o, v.Text);
             }
+            return o;
+        }
+
+        private static void SendRedeem(string cardId, List<VarSnap> vars)
+        {
+            if (!EnsureBuf()) return;
+            _wover = false;
+            int o = 0; _buf[o++] = MSG_PUNCH_REDEEM;
+            o = PutStr(o, cardId);
+            o = WriteVarList(o, vars);
+            if (_wover) { Log.LogWarning($"[punch] redeem '{cardId}' too large for {_buf.Length}B buffer — not sent"); return; }
             CoopP2P.Send(_buf, o, true);
             _sentRedeem++;
         }
@@ -698,21 +713,11 @@ namespace IronNestVR
         {
             if (!EnsureBuf()) return;
             vars ??= new List<VarSnap>();
+            _wover = false;
             int o = 0; _buf[o++] = MSG_PUNCH_GRAPH;
             o = PutStr(o, cardId);
-            o = PutInt(o, vars.Count);
-            for (int i = 0; i < vars.Count; i++)
-            {
-                var v = vars[i];
-                o = PutStr(o, v.Id);
-                o = PutInt(o, v.Type);
-                o = PutInt(o, v.I);
-                o = PutF(o, v.F);
-                _buf[o++] = (byte)(v.B ? 1 : 0);
-                o = PutInt(o, v.GridLoc); o = PutInt(o, v.GridX); o = PutInt(o, v.GridY);
-                o = PutInt(o, v.Shell);
-                o = PutStr(o, v.Text);
-            }
+            o = WriteVarList(o, vars);
+            if (_wover) { Log.LogWarning($"[punch] graph '{cardId}' too large for {_buf.Length}B buffer — not sent"); return; }
             CoopP2P.Send(_buf, o, true);
             _sentGraph++;
             Log.LogInfo($"[punch] graph -> clients '{cardId}' ({vars.Count} var(s)) — run result locally");
@@ -966,7 +971,7 @@ namespace IronNestVR
             if (!Finite(v)) return;
             // Trailing flag byte (index 9) marks the release/final edge so the host relay can keep live turns
             // unreliable but forward the release reliably (REVIEW-fix P1 — see CoopControls.IsMixedFinalStream).
-            int o = 0; _buf[o++] = MSG_PUNCH_DIAL; o = PutInt(o, rd.Key); o = PutF(o, v); _buf[o++] = (byte)(reliable ? 1 : 0);
+            int o = 0; _buf[o++] = MSG_PUNCH_DIAL; o = PutInt(o, rd.Key); o = PutF(o, v); o = PutByte(o, (byte)(reliable ? 1 : 0));
             CoopP2P.Send(_buf, o, reliable);
             _sentDial++;
         }
@@ -1212,12 +1217,20 @@ namespace IronNestVR
         private static bool EnsureBuf()
         {
             if (_buf != null) return true;
-            try { _buf = new Il2CppStructArray<byte>(2048); return true; }
+            // Sized to the shared transport limit so a punchcard packet can never exceed what a peer can receive
+            // (REVIEW-fix P1 — the buffer used to be 2048 while the receiver only read 1200).
+            try { _buf = new Il2CppStructArray<byte>(CoopP2P.MaxInnerPayload); return true; }
             catch (Exception e) { Log.LogWarning("[punch] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static int PutF(int o, float v) { int b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)b; _buf[o + 1] = (byte)(b >> 8); _buf[o + 2] = (byte)(b >> 16); _buf[o + 3] = (byte)(b >> 24); return o + 4; }
+        // Bounds-checked writers (REVIEW-fix P1): a Put* that would run past _buf sets _wover and writes nothing,
+        // instead of throwing / corrupting. The variable-length senders (redeem/graph/deck) reset _wover before
+        // building and refuse to send if it tripped, so an oversized card is dropped with a log, never half-written.
+        private static bool _wover;
+        private static bool Room(int o, int n) { if (o + n <= _buf.Length) return true; _wover = true; return false; }
+        private static int PutByte(int o, byte b) { if (!Room(o, 1)) return o; _buf[o] = b; return o + 1; }
+        private static int PutInt(int o, int v) { if (!Room(o, 4)) return o; _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
+        private static int PutF(int o, float v) { if (!Room(o, 4)) return o; int b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)b; _buf[o + 1] = (byte)(b >> 8); _buf[o + 2] = (byte)(b >> 16); _buf[o + 3] = (byte)(b >> 24); return o + 4; }
         private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
         private static int PutQ(int o, Quaternion q) { o = PutF(o, q.x); o = PutF(o, q.y); o = PutF(o, q.z); o = PutF(o, q.w); return o; }
         private static Vector3 GetV(Il2CppStructArray<byte> a, ref int o) { float x = GetF(a, ref o), y = GetF(a, ref o), z = GetF(a, ref o); return new Vector3(x, y, z); }
@@ -1239,6 +1252,7 @@ namespace IronNestVR
             var bytes = Encoding.UTF8.GetBytes(s);
             int n = bytes.Length; if (n > 200) n = 200;
             o = PutInt(o, n);
+            if (!Room(o, n)) return o;
             for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
             return o + n;
         }

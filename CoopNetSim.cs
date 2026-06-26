@@ -26,7 +26,7 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        private struct Pkt { public byte[] Data; public int Len; public float ReleaseAt; public uint Seq; }
+        private struct Pkt { public byte[] Data; public int Len; public float ReleaseAt; public uint Seq; public ulong Origin; }
         private static readonly List<Pkt> _q = new List<Pkt>();
         private static System.Random _rng;
         private static int _rngSeed = int.MinValue;
@@ -59,8 +59,10 @@ namespace IronNestVR
             return _rng;
         }
 
-        // Called from CoopP2P's receive paths for each incoming packet (a private managed copy we now own).
-        public static void Ingest(byte[] data, int len)
+        // Called from CoopP2P's receive paths for each incoming packet (a private managed copy we now own). The
+        // packet's true origin (Steam `from`) rides through the delay queue so a released packet is dispatched with
+        // its real sender even after reordering/delay — correct at the >2 cap (REVIEW-fix P2).
+        public static void Ingest(byte[] data, int len, ulong origin)
         {
             if (data == null || len < 1) return;
             float now = Time.unscaledTime;
@@ -96,24 +98,24 @@ namespace IronNestVR
                 if (wireAt > release) release = wireAt;
             }
 
-            Enqueue(data, len, release);
+            Enqueue(data, len, release, origin);
 
             // Dup (unreliable only): a second copy a hair later, to exercise echo-suppression / idempotency.
             if (!reliable && Roll(rng, Config.CoopNetSimDupPct))
             {
                 var copy = new byte[len]; Array.Copy(data, copy, len);
-                Enqueue(copy, len, release + (float)rng.NextDouble() * 0.01f);
+                Enqueue(copy, len, release + (float)rng.NextDouble() * 0.01f, origin);
                 _duped++;
             }
         }
 
-        private static void Enqueue(byte[] data, int len, float release)
+        private static void Enqueue(byte[] data, int len, float release, ulong origin)
         {
-            _q.Add(new Pkt { Data = data, Len = len, ReleaseAt = release, Seq = _seqCtr++ });
+            _q.Add(new Pkt { Data = data, Len = len, ReleaseAt = release, Seq = _seqCtr++, Origin = origin });
         }
 
         // Release all due packets (ReleaseAt, then arrival order) into the dispatcher. Called every frame by CoopP2P.
-        public static void Pump(float now, Action<byte[], int> dispatch)
+        public static void Pump(float now, Action<byte[], int, ulong> dispatch)
         {
             _lastNow = now;
             MaybeScheduleDrop(now);
@@ -129,7 +131,7 @@ namespace IronNestVR
 
             for (int i = 0; i < due.Count; i++)
             {
-                try { dispatch(due[i].Data, due[i].Len); _delivered++; }
+                try { dispatch(due[i].Data, due[i].Len, due[i].Origin); _delivered++; }
                 catch (Exception e) { Log.LogWarning("[netsim] dispatch: " + e.Message); }
             }
         }

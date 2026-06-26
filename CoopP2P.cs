@@ -17,10 +17,11 @@ namespace IronNestVR
     /// receiving client strips it and dispatches the inner packet at offset 0 with the reduced length, so every
     /// parser sees the exact byte offsets it did in the 2-player build. client→host packets carry no trailer.
     ///
-    /// At the current cap (2 players) there is one peer, so broadcast == "send to the peer", relay is a no-op
-    /// (the host has no OTHER client to relay to), and behavior is identical to the single-peer build. The
-    /// fan-out / relay machinery is dormant until the lobby cap is lifted (kept at 2 in SteamNet until the
-    /// multi-client path is validated — see PLAN.md §6).
+    /// The lobby cap is Config.CoopMaxPlayers (currently 4). With a single peer the fan-out/relay collapses to one
+    /// unicast (broadcast == "send to the peer", relay is a no-op); with more peers the host fans out to every peer
+    /// and relays each client-authored packet to the OTHERS, stamped with the sender's host-derived origin. The >2
+    /// path is compile-verified and origin-attributed on the live receive path (and now through CoopNetSim too);
+    /// end-to-end WAN/loss/reorder validation with multiple real origins is the remaining open item (PLAN.md §6/§9).
     ///
     /// Poses are sent in WORLD space (both instances load the same scene at the same world coords). If the
     /// rotating cockpit (Barbet) makes avatars drift once turret aim is desynced, switch to Barbet-local later.
@@ -42,6 +43,12 @@ namespace IronNestVR
         // Host→client origin trailer width (PLAN.md §2.2). Appended AFTER the inner packet; the client reads it
         // from the last 8 bytes and dispatches the inner packet with the reduced length, so offsets never move.
         private const int OriginTrailerLen = 8;
+
+        // Largest INNER packet any subsystem may put on the wire (REVIEW-fix P1). The receive buffer is sized to
+        // this + the host→client origin trailer, so a peer can always read the biggest packet a sender can build.
+        // Every subsystem that allocates its own scratch buffer (e.g. CoopPunchcards._buf) caps itself to this and
+        // refuses to send anything larger, rather than silently producing a packet the receiver would truncate.
+        public const int MaxInnerPayload = 2048;
 
         private static bool _inited;
         private static ulong _myId;
@@ -144,8 +151,8 @@ namespace IronNestVR
             {
                 _myId = SteamUser.GetSteamID().m_SteamID;
                 _sendArr = new Il2CppStructArray<byte>(128);
-                _outArr = new Il2CppStructArray<byte>(1280);
-                _recvArr = new Il2CppStructArray<byte>(1200);
+                _outArr = new Il2CppStructArray<byte>(MaxInnerPayload + OriginTrailerLen);
+                _recvArr = new Il2CppStructArray<byte>(MaxInnerPayload + OriginTrailerLen);
                 _cbSession = Callback<P2PSessionRequest_t>.Create((Action<P2PSessionRequest_t>)OnSessionRequest);
                 _inited = true;
                 Log.LogInfo("[p2p] init — P2P session callback registered");
@@ -252,15 +259,21 @@ namespace IronNestVR
         // the Steam path; loopback skips Init() entirely (no SteamAPI), so it allocates here instead.
         private static void EnsureArrays()
         {
+            // Same sizing policy as Init() (REVIEW-fix P1): the loopback test transport must read/stage packets as
+            // large as the Steam path can, or same-machine testing would reject packets real Steam would accept.
+            int wire = MaxInnerPayload + OriginTrailerLen;
             if (_sendArr == null) _sendArr = new Il2CppStructArray<byte>(128);
-            if (_outArr == null) _outArr = new Il2CppStructArray<byte>(1280);
-            if (_recvArr == null) _recvArr = new Il2CppStructArray<byte>(1200);
-            if (_loopScratch == null) _loopScratch = new byte[1200];
+            if (_outArr == null) _outArr = new Il2CppStructArray<byte>(wire);
+            if (_recvArr == null) _recvArr = new Il2CppStructArray<byte>(wire);
+            if (_loopScratch == null) _loopScratch = new byte[wire];
         }
 
+        // Size the outbound staging buffer to the fixed wire max. With the Send-side max-payload guard no caller can
+        // hand us more than MaxInnerPayload + trailer, so this never grows unbounded (REVIEW-fix P1).
         private static void EnsureOut(int need)
         {
-            if (_outArr == null || _outArr.Length < need) _outArr = new Il2CppStructArray<byte>(Math.Max(1280, need));
+            int max = MaxInnerPayload + OriginTrailerLen;
+            if (_outArr == null || _outArr.Length < max) _outArr = new Il2CppStructArray<byte>(max);
         }
 
         private static void ClearPeers()
@@ -516,9 +529,28 @@ namespace IronNestVR
             }
         }
 
+        // Transport-boundary enforcement of the shared max-payload invariant (REVIEW-fix P1). EVERY send funnels
+        // through RawSendTrailer or RawSendPlain, so guarding both makes it IMPOSSIBLE for any subsystem to put an
+        // inner packet larger than MaxInnerPayload (or empty) on the wire — the receiver's _recvArr is sized to
+        // exactly that + the trailer. Rejected sends log a throttled warning carrying the packet type and length.
+        private static float _nextOversizeLog;
+        private static bool ValidOut(Il2CppStructArray<byte> src, int len)
+        {
+            if (len >= 1 && len <= MaxInnerPayload) return true;
+            float now = Time.unscaledTime;
+            if (now >= _nextOversizeLog)
+            {
+                _nextOversizeLog = now + 1f;
+                byte type = (src != null && len >= 1 && src.Length > 0) ? src[0] : (byte)0;
+                Log.LogWarning($"[p2p] refusing out-of-bounds packet (type={type} len={len}, max={MaxInnerPayload}) — sender bug");
+            }
+            return false;
+        }
+
         // Stage [inner | origin(8)] into _outArr and transmit (host→client leg).
         private static bool RawSendTrailer(CSteamID dest, Il2CppStructArray<byte> src, int len, bool reliable, ulong origin)
         {
+            if (!ValidOut(src, len)) return false;
             EnsureOut(len + OriginTrailerLen);
             for (int i = 0; i < len; i++) _outArr[i] = src[i];
             PutU64(_outArr, len, origin);
@@ -528,6 +560,7 @@ namespace IronNestVR
         // Transmit the buffer verbatim (client→host leg — no trailer).
         private static bool RawSendPlain(CSteamID dest, Il2CppStructArray<byte> src, int len, bool reliable)
         {
+            if (!ValidOut(src, len)) return false;
             return WireSend(dest, src, len, reliable);
         }
 
@@ -542,7 +575,7 @@ namespace IronNestVR
         private static bool LoopSend(Il2CppStructArray<byte> buf, int len)
         {
             if (!LoopbackTransport.Connected) return false;
-            if (_loopScratch == null || _loopScratch.Length < len) _loopScratch = new byte[Math.Max(1200, len)];
+            if (_loopScratch == null || _loopScratch.Length < len) _loopScratch = new byte[Math.Max(MaxInnerPayload + OriginTrailerLen, len)];
             for (int i = 0; i < len; i++) _loopScratch[i] = buf[i];
             return LoopbackTransport.Send(_loopScratch, len);
         }
@@ -577,7 +610,7 @@ namespace IronNestVR
                     {
                         int nb = (int)read; var copy = new byte[nb];
                         for (int i = 0; i < nb; i++) copy[i] = _recvArr[i];
-                        CoopNetSim.Ingest(copy, nb);
+                        CoopNetSim.Ingest(copy, nb, from.m_SteamID);   // thread the REAL sender origin (correct at >2)
                     }
                     else DeliverFromWire((int)read, from.m_SteamID);
                 }
@@ -598,7 +631,7 @@ namespace IronNestVR
                     if (CoopNetSim.Active)
                     {
                         var copy = new byte[read]; Array.Copy(frame, copy, read);
-                        CoopNetSim.Ingest(copy, read);
+                        CoopNetSim.Ingest(copy, read, PrimaryRemoteOrigin());   // loopback is single-peer by construction
                     }
                     else
                     {
@@ -611,17 +644,19 @@ namespace IronNestVR
         }
 
         // NetSim release path (test aid): copy a delayed managed packet back into _recvArr and run it through the
-        // SAME deliver path. At the 2-player cap the host has a single client, so PrimaryRemoteOrigin() is its
-        // origin; threading the real per-sender origin through CoopNetSim is the >2 follow-up (PLAN.md §8.2).
-        private static void DispatchManaged(byte[] data, int len)
+        // SAME deliver path. The packet's REAL origin (captured at ingest from the Steam `from`) is threaded through
+        // CoopNetSim, so a delayed/reordered packet is attributed to its true sender even at the >2 cap (REVIEW-fix
+        // P2 — the old code used PrimaryRemoteOrigin(), which is only correct with a single peer).
+        private static void DispatchManaged(byte[] data, int len, ulong origin)
         {
             if (data == null || len < 1 || len > _recvArr.Length) return;
             for (int i = 0; i < len; i++) _recvArr[i] = data[i];
-            DeliverFromWire(len, PrimaryRemoteOrigin());
+            DeliverFromWire(len, origin);
         }
 
-        // The single remote peer's id (host: the one client; client: the host). Used where a per-sender origin
-        // isn't otherwise available (loopback / NetSim release) — exact at the 2-player cap.
+        // The single remote peer's id (host: the one client; client: the host). Used only by the same-machine
+        // loopback test link, which is single-peer by construction; the real Steam + NetSim paths thread the
+        // true per-sender origin (REVIEW-fix P2), so this is no longer on any multi-peer attribution path.
         private static ulong PrimaryRemoteOrigin()
             => IsHost ? (_peers.Count > 0 ? _peers[0].m_SteamID : 0UL) : _hostId.m_SteamID;
 

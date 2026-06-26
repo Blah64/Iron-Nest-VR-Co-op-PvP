@@ -109,6 +109,12 @@ namespace IronNestVR
         // ghost mirror whose DESPAWN was lost. Slower than the keyframe (full records are heavier). 0 disables.
         public static float CoopEntityResyncSec = 5f;
 
+        // Co-op: how often (Hz) the host RE-ENUMERATES the scene for EntityLocation objects. The per-tick position
+        // diff reads cached references every send tick; the expensive scene-wide FindObjectsByType scan only needs
+        // to run often enough to pick up newly spawned/destroyed entities. Decoupled from CoopSendHz to keep the
+        // hot path cheap on weak systems. <= 0 ⇒ scan every send tick (old behavior).
+        public static float CoopEntityScanHz = 5f;
+
         // Phase 4 co-op (4b keystone): replicate the mission/scene transition so both players are co-located.
         // The HOST broadcasts its own phase changes (→MissionActive / back out); the CLIENT follows by driving
         // its own OperationLoadRelay.StartAssignedOperation() / ReturnToMap(). Without this, the host starting a
@@ -212,7 +218,12 @@ namespace IronNestVR
         // — the recurring 2-player test blocker. Steam P2P stays the real shipping transport; nothing here
         // opens a socket unless the operator presses the key. Set false to keep a shipping build inert.
         //   Ctrl+F1 = host (instance A)   Ctrl+F2 = join 127.0.0.1 (instance B)   Ctrl+F3 = stop
-        public static bool CoopLoopback = true;
+#if PUBLIC_BUILD
+        public const bool DefaultCoopLoopback = false;   // public/plugin-only zip: same-machine test transport OFF (flatscreen parity — unmodded pauses when unfocused)
+#else
+        public const bool DefaultCoopLoopback = true;     // diagnostic/tester build: same-machine co-op test link ON by default (Ctrl+F1/F2/F3)
+#endif
+        public static bool CoopLoopback = DefaultCoopLoopback;
         public static int CoopLoopbackPort = 56561;
 
         // Same-machine test: keep each instance in a WINDOW of this size while a loopback link is up. Two
@@ -850,6 +861,11 @@ namespace IronNestVR
                 WF(sb, "CoopFlagScale", CoopFlagScale);
                 WV(sb, "CoopFlagOffset", CoopFlagOffset);
                 WV(sb, "CoopFlagEuler", CoopFlagEuler);
+                WB(sb, "CoopLoopback", CoopLoopback);
+                WI(sb, "CoopLoopbackPort", CoopLoopbackPort);
+                WB(sb, "CoopTestForceWindow", CoopTestForceWindow);
+                WI(sb, "CoopMaxPlayers", CoopMaxPlayers);
+                WF(sb, "CoopEntityScanHz", CoopEntityScanHz);
                 foreach (var kv in ManualHolds)
                 {
                     var h = kv.Value;
@@ -1016,6 +1032,11 @@ namespace IronNestVR
                 case "CoopFlagScale": CoopFlagScale = PF(v, CoopFlagScale); break;
                 case "CoopFlagOffset": CoopFlagOffset = PV(v, CoopFlagOffset); break;
                 case "CoopFlagEuler": CoopFlagEuler = PV(v, CoopFlagEuler); break;
+                case "CoopLoopback": CoopLoopback = PB(v, CoopLoopback); break;
+                case "CoopLoopbackPort": CoopLoopbackPort = PI(v, CoopLoopbackPort); break;
+                case "CoopTestForceWindow": CoopTestForceWindow = PB(v, CoopTestForceWindow); break;
+                case "CoopMaxPlayers": CoopMaxPlayers = PI(v, CoopMaxPlayers); break;
+                case "CoopEntityScanHz": CoopEntityScanHz = PF(v, CoopEntityScanHz); break;
             }
         }
 

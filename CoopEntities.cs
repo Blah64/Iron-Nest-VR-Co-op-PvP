@@ -95,6 +95,8 @@ namespace IronNestVR
 
         private static float _nextSend;
         private static float _lastResync;   // host: last time the full entity-set re-assert (SPAWN re-send + key-set) ran
+        private static Il2CppArrayBase<UnityEngine.Object> _scanArr;   // cached EntityLocation set; re-enumerated at CoopEntityScanHz, not every send tick (REVIEW-fix P2)
+        private static float _nextScan;
         private const float MoveEpsilonSq = 0.0001f;   // ~1cm map-units; ignore sub-pixel jitter
 
         private static Il2CppStructArray<byte> _buf;
@@ -127,11 +129,21 @@ namespace IronNestVR
             if (!InMission())
             {
                 if (_sent.Count > 0) { foreach (var k in _sent.Keys) SendDespawn(k); _sent.Clear(); Log.LogInfo("[ent] left mission — despawned all replicated entities"); }
+                _scanArr = null;   // drop stale refs so the next mission re-enumerates fresh
                 return;
             }
 
-            Il2CppArrayBase<UnityEngine.Object> arr = null;
-            try { arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<EntityLocation>(), FindObjectsSortMode.None); } catch { return; }
+            // REVIEW-fix (P2): the scene-wide FindObjectsByType scan is expensive on weak systems, so re-enumerate
+            // only at CoopEntityScanHz instead of every send tick. The diff below reads CURRENT transforms off the
+            // cached references each tick (only the entity SET changes rarely), so a new spawn/despawn is still
+            // picked up within one scan interval; a destroyed entity drops out of _seen and despawns as before.
+            // CoopEntityScanHz <= 0 ⇒ scan every send tick (old behavior).
+            if (_scanArr == null || Config.CoopEntityScanHz <= 0f || now >= _nextScan)
+            {
+                try { _scanArr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<EntityLocation>(), FindObjectsSortMode.None); } catch { _scanArr = null; }
+                if (Config.CoopEntityScanHz > 0f) _nextScan = now + 1f / Config.CoopEntityScanHz;
+            }
+            var arr = _scanArr;
             if (arr == null) return;
 
             // Periodic FULL re-assert: re-send every live entity as a SPAWN so a SPAWN lost in a link-drop blackout

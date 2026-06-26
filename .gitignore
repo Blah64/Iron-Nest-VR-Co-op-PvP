@@ -28,8 +28,8 @@ Thumbs.db
 desktop.ini
 
 OldFiles/
-REVIEW.md
-PLAN.md
+REVIEW*.md
+PLAN*.md
 
 # Unity project used to build the hands AssetBundle — separate concern, not part of the plugin source
 IronNestHands/

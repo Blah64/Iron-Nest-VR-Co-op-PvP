@@ -15,8 +15,9 @@
     <!-- Copy NuGet (Silk.NET) deps to bin so deploy.ps1 ships them alongside the plugin. -->
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
 
-    <!-- Game / loader locations (resolved at build time) -->
-    <GameDir>C:\Program Files (x86)\Steam\steamapps\common\IRON NEST Heavy Turret Simulator Demo</GameDir>
+    <!-- Game / loader locations (resolved at build time).
+         GameDir can be overridden from the command line: dotnet build -p:GameDir=<path> -->
+    <GameDir Condition="'$(GameDir)'==''">C:\Program Files (x86)\Steam\steamapps\common\IRON NEST Heavy Turret Simulator Demo</GameDir>
     <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
     <CoreDir>$(BepInExDir)\core</CoreDir>
     <InteropDir>$(BepInExDir)\interop</InteropDir>

@@ -1,22 +1,25 @@
 # Builds (optional) and deploys IronNestVR.dll + its Silk.NET deps into the game's BepInEx/plugins.
 # Deploys to BOTH the primary Steam install AND the second "Client" copy used for same-machine co-op
-# testing (the localhost loopback transport — Ctrl+F1/F2/F3; see LoopbackTransport.cs). The client copy is
+# testing (the localhost loopback transport - Ctrl+F1/F2/F3; see LoopbackTransport.cs). The client copy is
 # skipped with a warning if it isn't present, so this still works on a machine that only has the primary.
-param([switch]$NoBuild, [switch]$PrimaryOnly, [string]$BuildProps = "")
+param([switch]$NoBuild, [switch]$PrimaryOnly, [string]$BuildProps = "",
+      [string]$GameDir = "C:\Program Files (x86)\Steam\steamapps\common\IRON NEST Heavy Turret Simulator Demo")
 
 $ErrorActionPreference = "Stop"
 $src = "$PSScriptRoot\bin\Release"
 
 # Plugin-folder destinations (one per game instance).
+# Primary destination is derived from -GameDir (defaults to the primary Steam install path).
 $dests = @(
-    "C:\Program Files (x86)\Steam\steamapps\common\IRON NEST Heavy Turret Simulator Demo\BepInEx\plugins\IronNestVR"
+    "$GameDir\BepInEx\plugins\IronNestVR"
 )
 if (-not $PrimaryOnly) {
     $dests += "F:\Games\IRON NEST Heavy Turret Simulator Demo Client\BepInEx\plugins\IronNestVR"
 }
 
 if (-not $NoBuild) {
-    $buildArgs = @("build", "$PSScriptRoot\IronNestVR.csproj", "-c", "Release", "-v", "minimal")
+    $buildArgs = @("build", "$PSScriptRoot\IronNestVR.csproj", "-c", "Release", "-v", "minimal",
+                   "-p:GameDir=$GameDir")   # pass the (possibly overridden) game path to the csproj
     if ($BuildProps) { $buildArgs += $BuildProps }   # e.g. -BuildProps "-p:PublicBuild=true" (heartbeat OFF)
     dotnet @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
@@ -25,7 +28,7 @@ if (-not $NoBuild) {
 # Copy the plugin assembly + bundled third-party deps (anything in bin\Release that isn't a reference-only
 # game/loader assembly, e.g. Silk.NET) into one plugin folder.
 function Deploy-To([string]$dest) {
-    # Only deploy where the game/BepInEx actually lives — the plugins parent must already exist. This avoids
+    # Only deploy where the game/BepInEx actually lives - the plugins parent must already exist. This avoids
     # silently creating a stray IronNestVR folder on a machine that lacks the second copy.
     $pluginsParent = Split-Path $dest -Parent
     if (-not (Test-Path $pluginsParent)) {
@@ -34,6 +37,13 @@ function Deploy-To([string]$dest) {
     }
 
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+    # Prune stale build outputs so the deployed DLL set always exactly mirrors bin\Release.
+    # Only *.dll is removed - hands.bundle and any other non-DLL assets are left untouched.
+    if (Test-Path $dest) {
+        Get-ChildItem -Path $dest -Filter *.dll -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+
     Copy-Item "$src\IronNestVR.dll" $dest -Force
 
     $skip = @("IronNestVR.dll")
