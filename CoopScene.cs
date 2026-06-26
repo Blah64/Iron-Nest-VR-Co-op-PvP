@@ -62,8 +62,6 @@ namespace IronNestVR
         internal static bool ApplyingRemoteStart;
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
-        private static readonly byte[] _scratch = new byte[256];
 
         // ---------------- per-frame ----------------
 
@@ -143,15 +141,16 @@ namespace IronNestVR
 
         public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
-            int o = 1;
             switch (type)
             {
                 case MSG_MISSION_START:
                 {
                     if (CoopP2P.IsHost) return;   // host drives; never follows
-                    string scene = GetStr(a, ref o, len);
-                    string missionId = GetStr(a, ref o, len);
-                    string operationId = GetStr(a, ref o, len) ?? "";
+                    var r = new CoopWire.Reader(a, len, 1);
+                    string scene = r.Str(100);
+                    string missionId = r.Str(100);
+                    string operationId = r.Str(100) ?? "";
+                    if (r.Bad) return;
                     Log.LogInfo($"[scene] MISSION_START <- peer (scene='{scene}' mission='{missionId}' op='{operationId}')");
                     if (CurrentPhase() == (int)MissionManager.GamePhase.MissionActive) { Log.LogInfo("[scene] already in a mission — ignoring start"); return; }
                     // Arm a bounded retry: try now, and keep trying in Tick until the relay exists or we time out.
@@ -166,7 +165,9 @@ namespace IronNestVR
                 {
                     if (CoopP2P.IsHost) return;
                     if (len < 5) return;
-                    int target = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int target = r.Int();
+                    if (r.Bad) return;
                     Log.LogInfo($"[scene] GO_TO_PHASE <- peer (target phase={target})");
                     ApplyGoToPhase(target);
                     break;
@@ -318,24 +319,30 @@ namespace IronNestVR
                 }
             }
             catch { }
-            int o = 0; _buf[o++] = MSG_MISSION_START; o = PutStr(o, scene); o = PutStr(o, mid); o = PutStr(o, oid);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_MISSION_START); w.Str(scene, 100); w.Str(mid, 100); w.Str(oid, 100);
+            if (w.Overflow) { Log.LogWarning("[scene] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             Log.LogInfo($"[scene] MISSION_START -> peer (scene='{scene}' mission='{mid}' op='{oid}')");
         }
 
         private static void SendGoToPhase(int targetPhase)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_MISSION_END; o = PutInt(o, targetPhase);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_MISSION_END); w.Int(targetPhase);
+            if (w.Overflow) { Log.LogWarning("[scene] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             Log.LogInfo($"[scene] GO_TO_PHASE -> peer (target phase={targetPhase})");
         }
 
         private static void SendMissionReady()
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_MISSION_READY;
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_MISSION_READY);
+            if (w.Overflow) { Log.LogWarning("[scene] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             Log.LogInfo("[scene] MISSION_READY -> peer (client loaded the mission)");
         }
 
@@ -362,30 +369,6 @@ namespace IronNestVR
             if (_buf != null) return true;
             try { _buf = new Il2CppStructArray<byte>(256); return true; }
             catch (Exception e) { Log.LogWarning("[scene] buf: " + e.Message); return false; }
-        }
-
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-
-        private static int PutStr(int o, string s)
-        {
-            s ??= "";
-            var bytes = Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > 100) n = 100;
-            o = PutInt(o, n);
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return Encoding.UTF8.GetString(_scratch, 0, n);
         }
     }
 }

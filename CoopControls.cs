@@ -139,7 +139,6 @@ namespace IronNestVR
 
         // Reusable send buffer (control packets are tiny: 1+4+4 max). Lazily created on the Unity thread.
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
         // Scratch for strict group-packet parsing: read into here, validate every float finite, then publish to
         // gs.V only if the whole frame is intact (REVIEW-fix P2 — no partial/non-finite turret state).
         private static readonly float[] _tmpGroup = new float[5];
@@ -479,17 +478,18 @@ namespace IronNestVR
             if (!EnsureBuf()) return;
             try
             {
-                int o = 0; _buf[o++] = MSG_SNAP;
-                o = PutFloat(o, _turret.DesiredRotation);
-                o = PutFloat(o, _turret.CurrentAngle);
-                o = PutFloat(o, _turret.DesiredElevation);
-                o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
-                o = PutFloat(o, _gunL != null ? _gunL.CurrentElevation : 0f);
-                o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
-                o = PutFloat(o, _gunR != null ? _gunR.CurrentElevation : 0f);
-                o = PutFloat(o, _gunL != null ? _gunL.PowderCharges : 0f);
-                o = PutFloat(o, _gunR != null ? _gunR.PowderCharges : 0f);
-                CoopP2P.Send(_buf, o, true);
+                var w = new CoopWire.Writer(_buf);
+                w.Byte(MSG_SNAP);
+                w.Float(_turret.DesiredRotation);
+                w.Float(_turret.CurrentAngle);
+                w.Float(_turret.DesiredElevation);
+                w.Float(_gunL != null ? _gunL.DesiredElevationAngle : 0f);
+                w.Float(_gunL != null ? _gunL.CurrentElevation : 0f);
+                w.Float(_gunR != null ? _gunR.DesiredElevationAngle : 0f);
+                w.Float(_gunR != null ? _gunR.CurrentElevation : 0f);
+                w.Float(_gunL != null ? _gunL.PowderCharges : 0f);
+                w.Float(_gunR != null ? _gunR.PowderCharges : 0f);
+                CoopP2P.Send(_buf, w.Length, true);
 
                 int owned = 0;
                 foreach (var c in _byId.Values) if (c.LocalOwned) { SendGrab(c); owned++; }
@@ -507,16 +507,16 @@ namespace IronNestVR
             if (_turret == null || v == null || v.Length < 9) return;
             try
             {
-                if (!LocallyOwnsGroup(Group.Rotation) && Finite(v[0]) && Finite(v[1]))
+                if (!LocallyOwnsGroup(Group.Rotation) && CoopWire.Finite(v[0]) && CoopWire.Finite(v[1]))
                 {
                     _turret.DesiredRotation = v[0]; _turret.CurrentAngle = v[1];
                     try { _turret.ApplyRotationToTransforms(); } catch { }
                 }
                 if (!LocallyOwnsGroup(Group.Elevation))
                 {
-                    if (Finite(v[2])) _turret.DesiredElevation = v[2];
-                    if (_gunL != null) { if (Finite(v[3])) _gunL.DesiredElevationAngle = v[3]; if (Finite(v[4])) _gunL.CurrentElevation = v[4]; }
-                    if (_gunR != null) { if (Finite(v[5])) _gunR.DesiredElevationAngle = v[5]; if (Finite(v[6])) _gunR.CurrentElevation = v[6]; }
+                    if (CoopWire.Finite(v[2])) _turret.DesiredElevation = v[2];
+                    if (_gunL != null) { if (CoopWire.Finite(v[3])) _gunL.DesiredElevationAngle = v[3]; if (CoopWire.Finite(v[4])) _gunL.CurrentElevation = v[4]; }
+                    if (_gunR != null) { if (CoopWire.Finite(v[5])) _gunR.DesiredElevationAngle = v[5]; if (CoopWire.Finite(v[6])) _gunR.CurrentElevation = v[6]; }
                 }
                 if (_gunL != null && !LocallyOwnsGroup(Group.GunLeft)) { int p = Mathf.RoundToInt(v[7]); try { if (_gunL.PowderCharges != p) _gunL.SetPowderCharge(p); } catch { } }
                 if (_gunR != null && !LocallyOwnsGroup(Group.GunRight)) { int p = Mathf.RoundToInt(v[8]); try { if (_gunR.PowderCharges != p) _gunR.SetPowderCharge(p); } catch { } }
@@ -535,24 +535,24 @@ namespace IronNestVR
             if (_turret == null || !EnsureBuf()) return;
             try
             {
-                int o = 0; _buf[o++] = MSG_RECON;
+                var w = new CoopWire.Writer(_buf); w.Byte(MSG_RECON);
                 // The host's CURRENT gun elevation is authoritative ONLY while the host is the one driving it.
                 // When the CLIENT drives elevation (or nobody does) the host's gun-elevation reading must not be
                 // imposed on the client — broadcasting it (often stale, since the adopting side's barrel lags or,
                 // pre-fix, never slewed) is exactly what dragged the client's elevation back every reconcile.
-                // Send NaN for the gun CURRENT-elevation fields in that case; the client's Finite() guard skips
+                // Send NaN for the gun CURRENT-elevation fields in that case; the client's CoopWire.Finite() guard skips
                 // them. Rotation stays authoritative — the turret always auto-slews CurrentAngle toward desired.
                 bool elevAuth = LocallyOwnsGroup(Group.Elevation);
-                o = PutFloat(o, _turret.DesiredRotation);
-                o = PutFloat(o, _turret.CurrentAngle);
-                o = PutFloat(o, _turret.DesiredElevation);
-                o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
-                o = PutFloat(o, elevAuth && _gunL != null ? _gunL.CurrentElevation : float.NaN);
-                o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
-                o = PutFloat(o, elevAuth && _gunR != null ? _gunR.CurrentElevation : float.NaN);
-                o = PutFloat(o, _gunL != null ? _gunL.PowderCharges : 0f);
-                o = PutFloat(o, _gunR != null ? _gunR.PowderCharges : 0f);
-                CoopP2P.Send(_buf, o, true);
+                w.Float(_turret.DesiredRotation);
+                w.Float(_turret.CurrentAngle);
+                w.Float(_turret.DesiredElevation);
+                w.Float(_gunL != null ? _gunL.DesiredElevationAngle : 0f);
+                w.Float(elevAuth && _gunL != null ? _gunL.CurrentElevation : float.NaN);
+                w.Float(_gunR != null ? _gunR.DesiredElevationAngle : 0f);
+                w.Float(elevAuth && _gunR != null ? _gunR.CurrentElevation : float.NaN);
+                w.Float(_gunL != null ? _gunL.PowderCharges : 0f);
+                w.Float(_gunR != null ? _gunR.PowderCharges : 0f);
+                CoopP2P.Send(_buf, w.Length, true);
             }
             catch (Exception e) { Log.LogWarning("[ctrl] send recon: " + e.Message); }
         }
@@ -569,7 +569,7 @@ namespace IronNestVR
             try
             {
                 // ROTATION: snap CurrentAngle only if the desired aim already matches and the current angle drifted.
-                if (!LocallyOwnsGroup(Group.Rotation) && Finite(v[0]) && Finite(v[1])
+                if (!LocallyOwnsGroup(Group.Rotation) && CoopWire.Finite(v[0]) && CoopWire.Finite(v[1])
                     && Mathf.Abs(Mathf.DeltaAngle(_turret.DesiredRotation, v[0])) <= tol
                     && Mathf.Abs(Mathf.DeltaAngle(_turret.CurrentAngle, v[1])) > tol)
                 {
@@ -580,11 +580,11 @@ namespace IronNestVR
                 // ELEVATION (per-gun): snap CurrentElevation only where the gun's DESIRED already agrees with the host.
                 if (!LocallyOwnsGroup(Group.Elevation))
                 {
-                    if (_gunL != null && Finite(v[3]) && Finite(v[4])
+                    if (_gunL != null && CoopWire.Finite(v[3]) && CoopWire.Finite(v[4])
                         && Mathf.Abs(_gunL.DesiredElevationAngle - v[3]) <= tol
                         && Mathf.Abs(_gunL.CurrentElevation - v[4]) > tol)
                         _gunL.CurrentElevation = v[4];
-                    if (_gunR != null && Finite(v[5]) && Finite(v[6])
+                    if (_gunR != null && CoopWire.Finite(v[5]) && CoopWire.Finite(v[6])
                         && Mathf.Abs(_gunR.DesiredElevationAngle - v[5]) <= tol
                         && Mathf.Abs(_gunR.CurrentElevation - v[6]) > tol)
                         _gunR.CurrentElevation = v[6];
@@ -658,14 +658,14 @@ namespace IronNestVR
         public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
             float now = Time.unscaledTime;
-            int o = 1;
+            var r = new CoopWire.Reader(a, len, 1);
             switch (type)
             {
                 case MSG_GRAB:
                 {
                     if (len < 6) return;
-                    int id = GetInt(a, ref o);
-                    Group g = (Group)a[o++];
+                    int id = r.Int();
+                    Group g = (Group)r.Byte();
                     if (_byId.TryGetValue(id, out var c))
                     {
                         if (c.LocalOwned)
@@ -691,13 +691,13 @@ namespace IronNestVR
                 case MSG_RELEASE:
                 {
                     if (len < 5) return;
-                    int id = GetInt(a, ref o);
+                    int id = r.Int();
                     // Optional settled group state rides this reliable packet (REVIEW-fix P1). Apply it ONCE,
                     // before clearing ownership, so the dial lands on the final value even if the live unreliable
                     // stream's last frame was lost. Strict-framed + finite-checked like MSG_GROUP.
-                    if (o < len)
+                    if (r.Pos < len)
                     {
-                        Group g = (Group)a[o++];
+                        Group g = (Group)r.Byte();
                         int gi = (int)g;
                         if (gi > 0 && gi < _grp.Length)
                         {
@@ -706,10 +706,10 @@ namespace IronNestVR
                             var gsOwn = _grp[gi];
                             bool ownerOk = !gsOwn.RemoteOwned || now >= gsOwn.Until || gsOwn.RemoteOwner == origin;
                             int n = GroupFloatCount(g);
-                            if (ownerOk && len == o + 4 * n)
+                            if (ownerOk && len == r.Pos + 4 * n)
                             {
                                 bool ok = true;
-                                for (int i = 0; i < n; i++) { float f = GetFloat(a, ref o); if (!Finite(f)) { ok = false; break; } _tmpGroup[i] = f; }
+                                for (int i = 0; i < n; i++) { float f = r.Float(); if (!CoopWire.Finite(f)) { ok = false; break; } _tmpGroup[i] = f; }
                                 if (ok)
                                 {
                                     var gs = _grp[gi];
@@ -729,8 +729,8 @@ namespace IronNestVR
                 case MSG_VALUE:
                 {
                     if (len < 9) return;
-                    int id = GetInt(a, ref o);
-                    float v = GetFloat(a, ref o);
+                    int id = r.Int();
+                    float v = r.Float();
                     // Only the control's current owner may move it. A non-owner's late value (simultaneous-grab
                     // contention at N>2) must not drag a control another origin already won (REVIEW-fix P1a).
                     if (_byId.TryGetValue(id, out var c))
@@ -744,7 +744,7 @@ namespace IronNestVR
                 case MSG_GROUP:
                 {
                     if (len < 2) return;
-                    Group g = (Group)a[o++];
+                    Group g = (Group)r.Byte();
                     int gi = (int)g;
                     if (gi <= 0 || gi >= _grp.Length) return;
                     var gsOwn = _grp[gi];
@@ -752,8 +752,8 @@ namespace IronNestVR
                     // accept if nobody owns it yet (stream beat the grab) — matches the pre-cap behavior. (P1a)
                     if (gsOwn.RemoteOwned && now < gsOwn.Until && gsOwn.RemoteOwner != origin) return;
                     int n = GroupFloatCount(g);
-                    if (len != o + 4 * n) return;                 // strict framing: exactly n floats, no more/less
-                    for (int i = 0; i < n; i++) { float f = GetFloat(a, ref o); if (!Finite(f)) return; _tmpGroup[i] = f; }
+                    if (len != r.Pos + 4 * n) return;                 // strict framing: exactly n floats, no more/less
+                    for (int i = 0; i < n; i++) { float f = r.Float(); if (!CoopWire.Finite(f)) return; _tmpGroup[i] = f; }
                     var gs = _grp[gi];                            // whole frame valid → publish atomically
                     for (int i = 0; i < n; i++) gs.V[i] = _tmpGroup[i];
                     gs.Has = true; gs.Until = now + StaleSec;
@@ -762,7 +762,7 @@ namespace IronNestVR
                 case MSG_CLICK:
                 {
                     if (len < 5) return;
-                    int id = GetInt(a, ref o);
+                    int id = r.Int();
                     if (_byId.TryGetValue(id, out var c) && c.Switch != null)
                     {
                         ReplayClick(c.Switch);
@@ -774,7 +774,7 @@ namespace IronNestVR
                 case MSG_FIRE:
                 {
                     if (len < 2) return;
-                    byte side = a[o++];
+                    byte side = r.Byte();
                     var gun = side == 0 ? _gunL : _gunR;
                     if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
                     _echoUntil[side == 0 ? FireKeyL : FireKeyR] = now + 0.3f;
@@ -783,8 +783,8 @@ namespace IronNestVR
                 case MSG_POWDER:
                 {
                     if (len < 6) return;   // t + side u8 + charges i32
-                    byte side = a[o++];
-                    int charges = GetInt(a, ref o);
+                    byte side = r.Byte();
+                    int charges = r.Int();
                     var gun = side == 0 ? _gunL : _gunR;
                     if (gun != null)
                     {
@@ -801,7 +801,7 @@ namespace IronNestVR
                 {
                     if (len < 1 + 9 * 4) return;
                     var v = new float[9];
-                    for (int i = 0; i < 9; i++) v[i] = GetFloat(a, ref o);
+                    for (int i = 0; i < 9; i++) v[i] = r.Float();
                     Log.LogInfo("[ctrl] received JIP turret snapshot <- peer");
                     if (_turret != null) ApplySnapshot(v);   // apply now if ready …
                     else _pendingSnap = v;                    // … else stash for Tick once the registry resolves
@@ -811,7 +811,7 @@ namespace IronNestVR
                 {
                     if (len < 1 + 9 * 4 || CoopP2P.IsHost || _turret == null) return;   // client applies; needs a turret
                     var v = new float[9];
-                    for (int i = 0; i < 9; i++) v[i] = GetFloat(a, ref o);
+                    for (int i = 0; i < 9; i++) v[i] = r.Float();
                     ApplyRecon(v);
                     break;
                 }
@@ -931,8 +931,8 @@ namespace IronNestVR
         private static void SendGrab(Ctrl c)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_GRAB; o = PutInt(o, c.NetId); _buf[o++] = (byte)c.Grp;
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf); w.Byte(MSG_GRAB); w.Int(c.NetId); w.Byte((byte)c.Grp);
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         private static void SendRelease(Ctrl c)
@@ -941,36 +941,36 @@ namespace IronNestVR
             // REVIEW-fix (P1): carry the SETTLED group state INSIDE the reliable release, instead of a separate
             // unreliable group packet that could be lost or arrive after the release (which clears RemoteOwned and
             // would freeze the dial at its last streamed value). Now release + final value land together, ordered.
-            int o = 0; _buf[o++] = MSG_RELEASE; o = PutInt(o, c.NetId);
-            int grpPos = o; _buf[o++] = (byte)c.Grp;
+            var w = new CoopWire.Writer(_buf); w.Byte(MSG_RELEASE); w.Int(c.NetId);
+            int grpPos = w.Pos; w.Byte((byte)c.Grp);
             if (c.Grp != Group.Other && _turret != null)
             {
-                try { o = WriteGroupFloats(o, c.Grp); }
-                catch { _buf[grpPos] = (byte)Group.Other; o = grpPos + 1; }   // couldn't settle — send a plain release
+                try { WriteGroupFloats(ref w, c.Grp); }
+                catch { w.Pos = grpPos; w.Byte((byte)Group.Other); }   // couldn't settle — send a plain release
             }
-            CoopP2P.Send(_buf, o, true);
+            CoopP2P.Send(_buf, w.Length, true);
             Log.LogInfo($"[ctrl] released '{c.T.name}' -> peer (settled grp={c.Grp})");
         }
 
         private static void SendClick(int netId)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_CLICK; o = PutInt(o, netId);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf); w.Byte(MSG_CLICK); w.Int(netId);
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         private static void SendFire(byte side)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_FIRE; _buf[o++] = side;
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf); w.Byte(MSG_FIRE); w.Byte(side);
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         private static void SendPowder(byte side, int charges)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_POWDER; _buf[o++] = side; o = PutInt(o, charges);
-            CoopP2P.Send(_buf, o, true);   // reliable: a discrete state change, must not be lost
+            var w = new CoopWire.Writer(_buf); w.Byte(MSG_POWDER); w.Byte(side); w.Int(charges);
+            CoopP2P.Send(_buf, w.Length, true);   // reliable: a discrete state change, must not be lost
         }
 
         private static void SendValue(Ctrl c)
@@ -978,17 +978,17 @@ namespace IronNestVR
             if (!EnsureBuf()) return;
             float v;
             try { v = c.Dial != null ? c.Dial.AccumulatedValue : c.Slider.CurrentDistance; } catch { return; }
-            if (!Finite(v)) return;
-            int o = 0; _buf[o++] = MSG_VALUE; o = PutInt(o, c.NetId); o = PutFloat(o, v);
-            CoopP2P.Send(_buf, o, false);
+            if (!CoopWire.Finite(v)) return;
+            var w = new CoopWire.Writer(_buf); w.Byte(MSG_VALUE); w.Int(c.NetId); w.Float(v);
+            CoopP2P.Send(_buf, w.Length, false);
         }
 
         private static void SendGroupState(Group g)
         {
             if (_turret == null || g == Group.Other || !EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_GROUP; _buf[o++] = (byte)g;
-            try { o = WriteGroupFloats(o, g); } catch { return; }
-            CoopP2P.Send(_buf, o, false);
+            var w = new CoopWire.Writer(_buf); w.Byte(MSG_GROUP); w.Byte((byte)g);
+            try { WriteGroupFloats(ref w, g); } catch { return; }
+            CoopP2P.Send(_buf, w.Length, false);
             // DIAG (elevation desync hunt, sender side — self-sufficient on ONE log since host logs keep getting
             // overwritten): what we actually STREAM for elevation. If gunL.des is ~0 while gunL.cur is raised, the
             // control updates CURRENT not the DESIRED we send (capture bug → we must send current). If gunL.des
@@ -1004,31 +1004,29 @@ namespace IronNestVR
 
         // Serialize a group's GroupFloatCount floats at offset o. Shared by the live MSG_GROUP stream and the
         // settled-state payload folded into the reliable MSG_RELEASE (REVIEW-fix P1).
-        private static int WriteGroupFloats(int o, Group g)
+        private static void WriteGroupFloats(ref CoopWire.Writer w, Group g)
         {
             switch (g)
             {
                 case Group.Rotation:
-                    o = PutFloat(o, _turret.DesiredRotation);   // desired aim only (intent sync)
+                    w.Float(_turret.DesiredRotation);   // desired aim only (intent sync)
                     break;
                 case Group.Elevation:
-                    o = PutFloat(o, _turret.DesiredElevation);
-                    o = PutFloat(o, _gunL != null ? _gunL.DesiredElevationAngle : 0f);
-                    o = PutFloat(o, _gunR != null ? _gunR.DesiredElevationAngle : 0f);
+                    w.Float(_turret.DesiredElevation);
+                    w.Float(_gunL != null ? _gunL.DesiredElevationAngle : 0f);
+                    w.Float(_gunR != null ? _gunR.DesiredElevationAngle : 0f);
                     break;
-                case Group.GunLeft:  o = PutGun(o, _gunL); break;
-                case Group.GunRight: o = PutGun(o, _gunR); break;
+                case Group.GunLeft:  PutGun(ref w, _gunL); break;
+                case Group.GunRight: PutGun(ref w, _gunR); break;
             }
-            return o;
         }
 
-        private static int PutGun(int o, GunController gun)
+        private static void PutGun(ref CoopWire.Writer w, GunController gun)
         {
             int powder = 0; bool reloading = false;
             try { if (gun != null) { powder = gun.PowderCharges; reloading = gun.IsReloading; } } catch { }
-            o = PutFloat(o, powder);
-            o = PutFloat(o, reloading ? 1f : 0f);
-            return o;
+            w.Float(powder);
+            w.Float(reloading ? 1f : 0f);
         }
 
         private static int GroupFloatCount(Group g) => g switch
@@ -1278,12 +1276,5 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[ctrl] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static int PutFloat(int o, float v) { int __b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)__b; _buf[o + 1] = (byte)(__b >> 8); _buf[o + 2] = (byte)(__b >> 16); _buf[o + 3] = (byte)(__b >> 24); return o + 4; }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-        private static float GetFloat(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
-
-        private static bool Finite(float f) => !float.IsNaN(f) && !float.IsInfinity(f);
     }
 }

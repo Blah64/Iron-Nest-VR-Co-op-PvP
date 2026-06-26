@@ -29,7 +29,6 @@ namespace IronNestVR
         private const byte FLAG_BUSY = 2;
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
         private static float _nextSend;
 
         // Per-field consecutive-divergence counters (reset when a field is back in tolerance) + an "already logged
@@ -58,15 +57,17 @@ namespace IronNestVR
                 if (hasT) flags |= FLAG_HAS_TURRET;
                 if (busy) flags |= FLAG_BUSY;
 
-                int o = 0; _buf[o++] = MSG_DIGEST; _buf[o++] = flags;
-                o = PutF(o, hasT ? rot : 0f);
-                o = PutF(o, hasT ? eL : 0f);
-                o = PutF(o, hasT ? eR : 0f);
-                o = PutI(o, hasT ? pL : 0);
-                o = PutI(o, hasT ? pR : 0);
-                o = PutI(o, SafeEntityCount());
-                o = PutI(o, SafeMarkerCount());
-                CoopP2P.Send(_buf, o, true);
+                var w = new CoopWire.Writer(_buf);
+                w.Byte(MSG_DIGEST); w.Byte(flags);
+                w.Float(hasT ? rot : 0f);
+                w.Float(hasT ? eL : 0f);
+                w.Float(hasT ? eR : 0f);
+                w.Int(hasT ? pL : 0);
+                w.Int(hasT ? pR : 0);
+                w.Int(SafeEntityCount());
+                w.Int(SafeMarkerCount());
+                if (w.Overflow) { Log.LogWarning("[netdiag] packet too large - not sent"); return; }
+                CoopP2P.Send(_buf, w.Length, true);
             }
             catch (Exception e) { Log.LogWarning("[diag] send digest: " + e.Message); }
         }
@@ -74,17 +75,16 @@ namespace IronNestVR
         public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
         {
             if (type != MSG_DIGEST || !Config.CoopDesyncDetect) return;
-            const int need = 1 + 1 + 4 * 3 + 4 * 4;   // t + flags + 3 floats + 4 ints = 31
-            if (len < need) return;
             try
             {
-                int o = 1;
-                byte flags = a[o++];
+                var r = new CoopWire.Reader(a, len, 1);
+                byte flags = r.Byte();
                 bool remHasT = (flags & FLAG_HAS_TURRET) != 0;
                 bool remBusy = (flags & FLAG_BUSY) != 0;
-                float rRot = GetF(a, ref o), rEL = GetF(a, ref o), rER = GetF(a, ref o);
-                int rPL = GetI(a, ref o), rPR = GetI(a, ref o);
-                int rEnt = GetI(a, ref o), rMarker = GetI(a, ref o);
+                float rRot = r.Float(), rEL = r.Float(), rER = r.Float();
+                int rPL = r.Int(), rPR = r.Int();
+                int rEnt = r.Int(), rMarker = r.Int();
+                if (r.Bad) return;
 
                 // Our own current digest to compare against the peer's.
                 bool locHasT = CoopControls.TryGetTurretDigest(out float lRot, out float lEL, out float lER, out int lPL, out int lPR);
@@ -153,9 +153,5 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[diag] buf: " + e.Message); return false; }
         }
 
-        private static int PutF(int o, float v) { int __b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)__b; _buf[o + 1] = (byte)(__b >> 8); _buf[o + 2] = (byte)(__b >> 16); _buf[o + 3] = (byte)(__b >> 24); return o + 4; }
-        private static int PutI(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static float GetF(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
-        private static int GetI(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
     }
 }

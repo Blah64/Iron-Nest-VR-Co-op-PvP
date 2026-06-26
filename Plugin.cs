@@ -29,6 +29,11 @@ namespace IronNestVR
             // Restore persisted VR settings (menu tunables + hand calibration) before the rig comes up.
             IronNestVR.Config.Load();
 
+            // Verify the shared packet codec round-trips in the REAL Il2Cpp runtime (the standalone golden harness
+            // only exercises managed byte[]; SelfTest exercises an actual Il2CppStructArray<byte>). One-time startup
+            // check; logs PASS/FAIL so a tester log self-proves the serializer on this build.
+            { bool wok = CoopWire.SelfTest(out string werr); Log.LogInfo("[wire] CoopWire self-test: " + (wok ? "PASS" : ("FAIL: " + werr))); }
+
             // Startup banner for the same-machine co-op test link, so a tester's log self-proves THIS build has
             // the loopback transport and whether it's enabled (otherwise nothing prints until a key is pressed).
             Log.LogInfo($"[loop] same-machine co-op test transport: {(IronNestVR.Config.CoopLoopback ? "ENABLED" : "DISABLED")} " +

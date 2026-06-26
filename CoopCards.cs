@@ -35,8 +35,6 @@ namespace IronNestVR
         private static int _sent, _applied;
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
-        private static readonly byte[] _scratch = new byte[512];
 
         // ---------------- capture (Harmony postfix on FireMissionCard.Apply) ----------------
 
@@ -58,9 +56,11 @@ namespace IronNestVR
         private static void Broadcast(string d, string b, string e, string p, string s, string g)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_CARD;
-            o = PutStr(o, d); o = PutStr(o, b); o = PutStr(o, e); o = PutStr(o, p); o = PutStr(o, s); o = PutStr(o, g);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_CARD);
+            w.Str(d, 80); w.Str(b, 80); w.Str(e, 80); w.Str(p, 80); w.Str(s, 80); w.Str(g, 80);
+            if (w.Overflow) { Log.LogWarning("[card] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             _sent++;
             Log.LogInfo($"[card] fire-mission card -> peer (dist='{d}' bear='{b}' elev='{e}' pow='{p}' shell='{s}' gun='{g}')");
         }
@@ -70,15 +70,15 @@ namespace IronNestVR
         public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
         {
             if (type != MSG_CARD) return;
-            int o = 1;
-            string d = GetStr(a, ref o, len);
-            string b = GetStr(a, ref o, len);
-            string e = GetStr(a, ref o, len);
-            string p = GetStr(a, ref o, len);
-            string s = GetStr(a, ref o, len);
-            string g = GetStr(a, ref o, len);
-            if (d == null) return;
-            SpawnMirror(d, b ?? "", e ?? "", p ?? "", s ?? "", g ?? "");
+            var r = new CoopWire.Reader(a, len, 1);
+            string d = r.Str(80);
+            string b = r.Str(80);
+            string e = r.Str(80);
+            string p = r.Str(80);
+            string s = r.Str(80);
+            string g = r.Str(80);
+            if (r.Bad) return;
+            SpawnMirror(d ?? "", b ?? "", e ?? "", p ?? "", s ?? "", g ?? "");
         }
 
         // Spawn a mirror card from the printer's own prefab and fill it in, under the echo guard so our Apply
@@ -143,28 +143,5 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[card] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-
-        private static int PutStr(int o, string s)
-        {
-            s ??= "";
-            var bytes = System.Text.Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > 80) n = 80;   // card fields are short
-            o = PutInt(o, n);
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return System.Text.Encoding.UTF8.GetString(_scratch, 0, n);
-        }
     }
 }

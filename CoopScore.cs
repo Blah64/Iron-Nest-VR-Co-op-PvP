@@ -47,7 +47,6 @@ namespace IronNestVR
         private static bool _prevInMission;            // both sides: edge-detect a fresh mission to reset the above
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
 
         // ---------------- outcome capture (Harmony postfix, registered by CoopSim) ----------------
 
@@ -61,8 +60,9 @@ namespace IronNestVR
                 if (!Config.CoopScoreSync || !CoopP2P.IsHost) return;
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer) return;
                 if (!EnsureBuf()) return;
-                int o = 0; _buf[o++] = MSG_OUTCOME; _buf[o++] = kind;
-                CoopP2P.Send(_buf, o, true);
+                var w = new CoopWire.Writer(_buf); w.Byte(MSG_OUTCOME); w.Byte(kind);
+                if (w.Overflow) return;
+                CoopP2P.Send(_buf, w.Length, true);
                 _lastOutcomeKind = kind;   // remember it so the heartbeat / JIP snapshot can re-assert if this is lost
                 _outcomes++;
                 Log.LogInfo($"[score] mission {(kind == 0 ? "COMPLETE" : "FAILED")} -> peer");
@@ -94,8 +94,8 @@ namespace IronNestVR
                 // this heals it (the client de-dups, so a delivered outcome isn't re-applied).
                 if (_lastOutcomeKind >= 0 && EnsureBuf())
                 {
-                    int oo = 0; _buf[oo++] = MSG_OUTCOME; _buf[oo++] = (byte)_lastOutcomeKind;
-                    CoopP2P.Send(_buf, oo, true);
+                    var wo = new CoopWire.Writer(_buf); wo.Byte(MSG_OUTCOME); wo.Byte((byte)_lastOutcomeKind);
+                    if (!wo.Overflow) CoopP2P.Send(_buf, wo.Length, true);
                 }
 
                 var mm = MissionManager.Instance; if (mm == null) return;
@@ -107,8 +107,9 @@ namespace IronNestVR
                 bool changed = req != _lastReq || pow != _lastPow;
                 _lastReq = req; _lastPow = pow;
                 if (!EnsureBuf()) return;
-                int o = 0; _buf[o++] = MSG_OPSTATE; o = PutInt(o, req); o = PutInt(o, pow);
-                CoopP2P.Send(_buf, o, true);          // re-assert every cycle (idempotent on the client) so a lost opstate self-heals
+                var ws = new CoopWire.Writer(_buf); ws.Byte(MSG_OPSTATE); ws.Int(req); ws.Int(pow);
+                if (ws.Overflow) return;
+                CoopP2P.Send(_buf, ws.Length, true);  // re-assert every cycle (idempotent on the client) so a lost opstate self-heals
                 _opstates++;
                 if (changed) Log.LogInfo($"[score] requisition -> peer (points={req} powder={pow})");
             }
@@ -120,13 +121,13 @@ namespace IronNestVR
         public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
         {
             if (CoopP2P.IsHost) return;   // host is authoritative; never applies
-            int o = 1;
             switch (type)
             {
                 case MSG_OUTCOME:
                 {
-                    if (len < 2) return;
-                    byte kind = a[o++];
+                    var r = new CoopWire.Reader(a, len, 1);
+                    byte kind = r.Byte();
+                    if (r.Bad) return;
                     if (kind == _appliedOutcomeKind) break;   // de-dup: a heartbeat/JIP re-assert of an already-applied outcome
                     try
                     {
@@ -140,9 +141,10 @@ namespace IronNestVR
                 }
                 case MSG_OPSTATE:
                 {
-                    if (len < 1 + 4 + 4) return;
-                    int req = GetInt(a, ref o);
-                    int pow = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int req = r.Int();
+                    int pow = r.Int();
+                    if (r.Bad) return;
                     try
                     {
                         var mm = MissionManager.Instance; if (mm == null) return;
@@ -179,14 +181,14 @@ namespace IronNestVR
                     if (st != null && !string.IsNullOrEmpty(opId) && EnsureBuf())
                     {
                         int req = 0, pow = 0; try { req = st.RequisitionPoints; pow = st.PowderCharges; } catch { }
-                        int o = 0; _buf[o++] = MSG_OPSTATE; o = PutInt(o, req); o = PutInt(o, pow);
-                        CoopP2P.Send(_buf, o, true);
+                        var wss = new CoopWire.Writer(_buf); wss.Byte(MSG_OPSTATE); wss.Int(req); wss.Int(pow);
+                        if (!wss.Overflow) CoopP2P.Send(_buf, wss.Length, true);
                     }
                 }
                 if (_lastOutcomeKind >= 0 && EnsureBuf())
                 {
-                    int o = 0; _buf[o++] = MSG_OUTCOME; _buf[o++] = (byte)_lastOutcomeKind;
-                    CoopP2P.Send(_buf, o, true);
+                    var wj = new CoopWire.Writer(_buf); wj.Byte(MSG_OUTCOME); wj.Byte((byte)_lastOutcomeKind);
+                    if (!wj.Overflow) CoopP2P.Send(_buf, wj.Length, true);
                 }
                 Log.LogInfo($"[score] sent JIP snapshot -> peer (outcome={_lastOutcomeKind})");
             }
@@ -212,7 +214,5 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[score] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
     }
 }

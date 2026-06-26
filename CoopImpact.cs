@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 using BepInEx.Logging;
 using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
@@ -40,8 +39,6 @@ namespace IronNestVR
         public const byte MSG_IMPACT = 30;   // [t][locX f][locY f][shellId str][hitCount i32][entId str]×N  reliable host->client
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
-        private static readonly byte[] _scratch = new byte[512];
         private static int _sent, _applied;
 
         // ShellId -> ShellDefinition, built once on the client (a handful of shell types). Rebuilt if a lookup misses.
@@ -82,13 +79,15 @@ namespace IronNestVR
             }
             if (ids.Count == 0) return;
 
-            int o = 0; _buf[o++] = MSG_IMPACT;
-            o = PutF(o, loc.x); o = PutF(o, loc.y);
-            o = PutStr(o, shellId);
-            o = PutInt(o, ids.Count);
-            for (int i = 0; i < ids.Count; i++) o = PutStr(o, ids[i]);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_IMPACT);
+            w.Float(loc.x); w.Float(loc.y);
+            w.Str(shellId, 200);
+            w.Int(ids.Count);
+            for (int i = 0; i < ids.Count; i++) w.Str(ids[i], 200);
+            if (w.Overflow) { Log.LogWarning("[impact] packet too large for " + _buf.Length + "B - not sent"); return; }
 
-            CoopP2P.Send(_buf, o, true);
+            CoopP2P.Send(_buf, w.Length, true);
             _sent++;
             Log.LogInfo($"[imp] host impact at ({loc.x:0},{loc.y:0}) shell='{shellId}' hits={ids.Count} -> peer");
         }
@@ -99,16 +98,15 @@ namespace IronNestVR
         {
             if (type != MSG_IMPACT) return;
             if (CoopP2P.IsHost) return;   // host authored it
-            int o = 1;
-            if (o + 8 > len) return;
-            float x = GetF(a, ref o), y = GetF(a, ref o);
-            string shellId = GetStr(a, ref o, len);
-            if (o + 4 > len) return;
-            int count = GetInt(a, ref o);
-            if (count < 0 || count > 64) return;
+            var r = new CoopWire.Reader(a, len, 1);
+            float x = r.Float(), y = r.Float();
+            string shellId = r.Str(200);
+            if (r.Bad) return;
+            int count = r.Int();
+            if (r.Bad || count < 0 || count > 64) return;
 
             var ids = new List<string>(count);
-            for (int i = 0; i < count; i++) { string s = GetStr(a, ref o, len); if (s == null) break; ids.Add(s); }
+            for (int i = 0; i < count; i++) { string s = r.Str(200); if (r.Bad) break; ids.Add(s); }
 
             Apply(new Vector2(x, y), shellId, ids);
         }
@@ -223,30 +221,5 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[imp] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static int PutF(int o, float v) { int b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)b; _buf[o + 1] = (byte)(b >> 8); _buf[o + 2] = (byte)(b >> 16); _buf[o + 3] = (byte)(b >> 24); return o + 4; }
-
-        private static int PutStr(int o, string s)
-        {
-            s ??= "";
-            var bytes = Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > 200) n = 200;
-            o = PutInt(o, n);
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-        private static float GetF(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return Encoding.UTF8.GetString(_scratch, 0, n);
-        }
     }
 }

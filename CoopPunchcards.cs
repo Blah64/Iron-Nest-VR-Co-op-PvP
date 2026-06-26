@@ -99,8 +99,6 @@ namespace IronNestVR
         private static int _sentDeck, _appliedDeck, _sentRedeem, _ranRedeem, _sentConsume, _ranConsume, _sentGraph, _ranGraph;
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
-        private static readonly byte[] _scratch = new byte[512];
 
         private struct DeckEntry { public string Id; public int Uses; }
 
@@ -276,8 +274,9 @@ namespace IronNestVR
         private static void SendGrab(int key)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_PUNCH_GRAB; o = PutInt(o, key);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_GRAB); w.Int(key);
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         private static void SendPos(Card c, Transform anchor)
@@ -286,9 +285,10 @@ namespace IronNestVR
             Vector3 p; Quaternion r;
             try { p = anchor.InverseTransformPoint(c.T.position); r = Quaternion.Inverse(anchor.rotation) * c.T.rotation; }
             catch { return; }
-            if (!Finite(p)) return;
-            int o = 0; _buf[o++] = MSG_PUNCH_POS; o = PutInt(o, c.Key); o = PutV(o, p); o = PutQ(o, r);
-            CoopP2P.Send(_buf, o, false);
+            if (!CoopWire.Finite(p)) return;
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_POS); w.Int(c.Key); w.Vec(p); w.Quat(r);
+            CoopP2P.Send(_buf, w.Length, false);
         }
 
         private static void SendPlace(Card c, Transform anchor, bool log = true)
@@ -298,8 +298,9 @@ namespace IronNestVR
             try { p = anchor.InverseTransformPoint(c.T.position); r = Quaternion.Inverse(anchor.rotation) * c.T.rotation; }
             catch { return; }
             bool inSlot = IsInReqSlot(c);
-            int o = 0; _buf[o++] = MSG_PUNCH_PLACE; o = PutInt(o, c.Key); o = PutV(o, p); o = PutQ(o, r); o = PutByte(o, (byte)(inSlot ? 1 : 0));
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_PLACE); w.Int(c.Key); w.Vec(p); w.Quat(r); w.Bool(inSlot);
+            CoopP2P.Send(_buf, w.Length, true);
             if (log) Log.LogInfo($"[punch] placed card key={c.Key} (slot={inSlot}) -> peer");
         }
 
@@ -308,9 +309,10 @@ namespace IronNestVR
         private static void OnGrab(ulong origin, Il2CppStructArray<byte> a, int len)
         {
             if (len < 5) return;
-            float now = Time.unscaledTime; int o = 1;
-            int key = GetInt(a, ref o);
-            if (!_cards.TryGetValue(key, out var c)) return;
+            float now = Time.unscaledTime;
+            var r = new CoopWire.Reader(a, len, 1);
+            int key = r.Int();
+            if (r.Bad || !_cards.TryGetValue(key, out var c)) return;
             if (c.LocalOwned)
             {
                 if (CoopP2P.GrabBeats(CoopP2P.MyId, origin)) return;   // I win — keep mine
@@ -323,10 +325,11 @@ namespace IronNestVR
         private static void OnPos(ulong origin, Il2CppStructArray<byte> a, int len)
         {
             if (len < 1 + 4 + 12 + 16) return;
-            float now = Time.unscaledTime; int o = 1;
-            int key = GetInt(a, ref o);
-            Vector3 p = GetV(a, ref o); Quaternion r = GetQ(a, ref o);
-            if (!_cards.TryGetValue(key, out var c) || !Finite(p)) return;
+            float now = Time.unscaledTime;
+            var rd = new CoopWire.Reader(a, len, 1);
+            int key = rd.Int();
+            Vector3 p = rd.Vec(); Quaternion r = rd.Quat();
+            if (rd.Bad || !_cards.TryGetValue(key, out var c) || !CoopWire.Finite(p)) return;
             if (c.RemoteOwner == 0 || now >= c.RemoteUntil || c.RemoteOwner == origin || CoopP2P.GrabBeats(origin, c.RemoteOwner))
             { c.RemoteLocal = p; c.RemoteRot = r; c.HasRemotePos = true; c.RemoteOwner = origin; c.RemoteUntil = now + StaleSec; }
         }
@@ -334,10 +337,11 @@ namespace IronNestVR
         private static void OnPlace(ulong origin, Il2CppStructArray<byte> a, int len)
         {
             if (len < 1 + 4 + 12 + 16 + 1) return;
-            int o = 1;
-            int key = GetInt(a, ref o);
-            Vector3 p = GetV(a, ref o); Quaternion r = GetQ(a, ref o);
-            bool inSlot = a[o++] != 0;
+            var rd = new CoopWire.Reader(a, len, 1);
+            int key = rd.Int();
+            Vector3 p = rd.Vec(); Quaternion r = rd.Quat();
+            bool inSlot = rd.Bool();
+            if (rd.Bad) return;
             if (!_cards.TryGetValue(key, out var c)) { _pendingPose[key] = new PendPose { P = p, R = r, InSlot = inSlot }; return; }
             ApplyPlace(c, p, r, inSlot);
             // A place is a release: clear ownership if this origin holds it (at the 2-player cap origin == owner).
@@ -353,7 +357,7 @@ namespace IronNestVR
             _applyingRemote = true;
             try
             {
-                if (anchor != null && Finite(p))
+                if (anchor != null && CoopWire.Finite(p))
                 {
                     try { if (!c.Token._externallyControlled) c.Token._externallyControlled = true; } catch { }
                     c.T.position = anchor.TransformPoint(p);
@@ -455,12 +459,12 @@ namespace IronNestVR
         private static void BroadcastDeck(List<DeckEntry> entries)
         {
             if (!EnsureBuf()) return;
-            _wover = false;
-            int o = 0; _buf[o++] = MSG_PUNCH_DECK;
-            o = PutInt(o, entries.Count);
-            for (int i = 0; i < entries.Count; i++) { o = PutStr(o, entries[i].Id); o = PutInt(o, entries[i].Uses); }
-            if (_wover) { Log.LogWarning($"[punch] deck too large for {_buf.Length}B buffer ({entries.Count} cards) — not sent"); return; }
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_DECK);
+            w.Int(entries.Count);
+            for (int i = 0; i < entries.Count; i++) { w.Str(entries[i].Id, 200); w.Int(entries[i].Uses); }
+            if (w.Overflow) { Log.LogWarning($"[punch] deck too large for {_buf.Length}B buffer ({entries.Count} cards) — not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             _sentDeck++;
             Log.LogInfo($"[punch] deck -> peer ({entries.Count} card(s): {DeckSig(entries)})");
         }
@@ -470,16 +474,14 @@ namespace IronNestVR
         private static void OnDeckPacket(Il2CppStructArray<byte> a, int len)
         {
             if (CoopP2P.IsHost || !Config.CoopPunchcardDeckSync) return;   // host is authoritative; overlay dormant by default
-            int o = 1;
-            if (o + 4 > len) return;
-            int count = GetInt(a, ref o);
-            if (count < 0 || count > 256) return;
+            var r = new CoopWire.Reader(a, len, 1);
+            int count = r.Int();
+            if (r.Bad || count < 0 || count > 256) return;
             var entries = new List<DeckEntry>(count);
             for (int i = 0; i < count; i++)
             {
-                string id = GetStr(a, ref o, len); if (id == null) break;
-                if (o + 4 > len) break;
-                int uses = GetInt(a, ref o);
+                string id = r.Str(200); if (r.Bad) break;
+                int uses = r.Int(); if (r.Bad) break;
                 entries.Add(new DeckEntry { Id = id, Uses = uses });
             }
 
@@ -606,8 +608,9 @@ namespace IronNestVR
         private static void SendConsume(string cardId)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_PUNCH_CONSUME; o = PutStr(o, cardId);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_CONSUME); w.Str(cardId, 200);
+            CoopP2P.Send(_buf, w.Length, true);
             _sentConsume++;
             Log.LogInfo($"[punch] consume '{cardId}' -> peers");
         }
@@ -618,9 +621,9 @@ namespace IronNestVR
         private static void OnConsumePacket(Il2CppStructArray<byte> a, int len)
         {
             if (CoopP2P.IsHost) return;
-            int o = 1;
-            string id = GetStr(a, ref o, len);
-            if (string.IsNullOrEmpty(id)) return;
+            var r = new CoopWire.Reader(a, len, 1);
+            string id = r.Str(200);
+            if (r.Bad || string.IsNullOrEmpty(id)) return;
             var mgr = Mgr(); if (mgr == null) return;
             var card = FindDeckCard(mgr, id);
             if (card == null) { Log.LogWarning($"[punch] consume: no local card '{id}'"); return; }
@@ -674,36 +677,35 @@ namespace IronNestVR
 
         // Shared var-list wire format for redeem/graph (same bytes, different type byte → OnGraphPacket reuses the
         // redeem parse). Clamps to the 64-var cap the receiver enforces (OnRedeemPacket) so the peer won't reject
-        // the whole packet, and rides the bounds-checked Put* so it can never run past _buf.
-        private static int WriteVarList(int o, List<VarSnap> vars)
+        // the whole packet, and rides the bounds-checked Writer so it can never run past _buf.
+        private static void WriteVarList(ref CoopWire.Writer w, List<VarSnap> vars)
         {
             int n = vars.Count;
             if (n > 64) { Log.LogWarning($"[punch] var list has {n} vars (>64 cap) — clamping"); n = 64; }
-            o = PutInt(o, n);
+            w.Int(n);
             for (int i = 0; i < n; i++)
             {
                 var v = vars[i];
-                o = PutStr(o, v.Id);
-                o = PutInt(o, v.Type);
-                o = PutInt(o, v.I);
-                o = PutF(o, v.F);
-                o = PutByte(o, (byte)(v.B ? 1 : 0));
-                o = PutInt(o, v.GridLoc); o = PutInt(o, v.GridX); o = PutInt(o, v.GridY);
-                o = PutInt(o, v.Shell);
-                o = PutStr(o, v.Text);
+                w.Str(v.Id, 200);
+                w.Int(v.Type);
+                w.Int(v.I);
+                w.Float(v.F);
+                w.Bool(v.B);
+                w.Int(v.GridLoc); w.Int(v.GridX); w.Int(v.GridY);
+                w.Int(v.Shell);
+                w.Str(v.Text, 200);
             }
-            return o;
         }
 
         private static void SendRedeem(string cardId, List<VarSnap> vars)
         {
             if (!EnsureBuf()) return;
-            _wover = false;
-            int o = 0; _buf[o++] = MSG_PUNCH_REDEEM;
-            o = PutStr(o, cardId);
-            o = WriteVarList(o, vars);
-            if (_wover) { Log.LogWarning($"[punch] redeem '{cardId}' too large for {_buf.Length}B buffer — not sent"); return; }
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_REDEEM);
+            w.Str(cardId, 200);
+            WriteVarList(ref w, vars);
+            if (w.Overflow) { Log.LogWarning($"[punch] redeem '{cardId}' too large for {_buf.Length}B buffer — not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             _sentRedeem++;
         }
 
@@ -713,12 +715,12 @@ namespace IronNestVR
         {
             if (!EnsureBuf()) return;
             vars ??= new List<VarSnap>();
-            _wover = false;
-            int o = 0; _buf[o++] = MSG_PUNCH_GRAPH;
-            o = PutStr(o, cardId);
-            o = WriteVarList(o, vars);
-            if (_wover) { Log.LogWarning($"[punch] graph '{cardId}' too large for {_buf.Length}B buffer — not sent"); return; }
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_GRAPH);
+            w.Str(cardId, 200);
+            WriteVarList(ref w, vars);
+            if (w.Overflow) { Log.LogWarning($"[punch] graph '{cardId}' too large for {_buf.Length}B buffer — not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             _sentGraph++;
             Log.LogInfo($"[punch] graph -> clients '{cardId}' ({vars.Count} var(s)) — run result locally");
         }
@@ -728,25 +730,25 @@ namespace IronNestVR
         private static void OnRedeemPacket(Il2CppStructArray<byte> a, int len)
         {
             if (!CoopP2P.IsHost) return;   // only the host executes redemptions authoritatively
-            int o = 1;
-            string cardId = GetStr(a, ref o, len);
-            if (string.IsNullOrEmpty(cardId)) return;
-            if (o + 4 > len) return;
-            int vc = GetInt(a, ref o);
-            if (vc < 0 || vc > 64) return;
+            var r = new CoopWire.Reader(a, len, 1);
+            string cardId = r.Str(200);
+            if (r.Bad || string.IsNullOrEmpty(cardId)) return;
+            int vc = r.Int();
+            if (r.Bad || vc < 0 || vc > 64) return;
 
             var vars = new List<VarSnap>(vc);
             for (int i = 0; i < vc; i++)
             {
                 var v = new VarSnap();
-                v.Id = GetStr(a, ref o, len); if (v.Id == null) break;
-                if (o + 4 > len) break; v.Type = GetInt(a, ref o);
-                if (o + 4 > len) break; v.I = GetInt(a, ref o);
-                if (o + 4 > len) break; v.F = GetF(a, ref o);
-                if (o + 1 > len) break; v.B = a[o++] != 0;
-                if (o + 12 > len) break; v.GridLoc = GetInt(a, ref o); v.GridX = GetInt(a, ref o); v.GridY = GetInt(a, ref o);
-                if (o + 4 > len) break; v.Shell = GetInt(a, ref o);
-                v.Text = GetStr(a, ref o, len) ?? "";
+                v.Id = r.Str(200); if (r.Bad) break;
+                v.Type = r.Int(); if (r.Bad) break;
+                v.I = r.Int(); if (r.Bad) break;
+                v.F = r.Float(); if (r.Bad) break;
+                v.B = r.Bool(); if (r.Bad) break;
+                v.GridLoc = r.Int(); v.GridX = r.Int(); v.GridY = r.Int(); if (r.Bad) break;
+                v.Shell = r.Int(); if (r.Bad) break;
+                v.Text = r.Str(200) ?? "";
+                if (r.Bad) break;
                 vars.Add(v);
             }
 
@@ -824,25 +826,25 @@ namespace IronNestVR
         {
             if (CoopP2P.IsHost) return;                       // clients run the visual; the host already did its own
             if (!Config.CoopPunchcardSync || !Config.CoopPunchcardRedeemSync || !Config.CoopPunchcardResultSync) return;
-            int o = 1;
-            string cardId = GetStr(a, ref o, len);
-            if (string.IsNullOrEmpty(cardId)) return;
-            if (o + 4 > len) return;
-            int vc = GetInt(a, ref o);
-            if (vc < 0 || vc > 64) return;
+            var r = new CoopWire.Reader(a, len, 1);
+            string cardId = r.Str(200);
+            if (r.Bad || string.IsNullOrEmpty(cardId)) return;
+            int vc = r.Int();
+            if (r.Bad || vc < 0 || vc > 64) return;
 
             var vars = new List<VarSnap>(vc);
             for (int i = 0; i < vc; i++)
             {
                 var v = new VarSnap();
-                v.Id = GetStr(a, ref o, len); if (v.Id == null) break;
-                if (o + 4 > len) break; v.Type = GetInt(a, ref o);
-                if (o + 4 > len) break; v.I = GetInt(a, ref o);
-                if (o + 4 > len) break; v.F = GetF(a, ref o);
-                if (o + 1 > len) break; v.B = a[o++] != 0;
-                if (o + 12 > len) break; v.GridLoc = GetInt(a, ref o); v.GridX = GetInt(a, ref o); v.GridY = GetInt(a, ref o);
-                if (o + 4 > len) break; v.Shell = GetInt(a, ref o);
-                v.Text = GetStr(a, ref o, len) ?? "";
+                v.Id = r.Str(200); if (r.Bad) break;
+                v.Type = r.Int(); if (r.Bad) break;
+                v.I = r.Int(); if (r.Bad) break;
+                v.F = r.Float(); if (r.Bad) break;
+                v.B = r.Bool(); if (r.Bad) break;
+                v.GridLoc = r.Int(); v.GridX = r.Int(); v.GridY = r.Int(); if (r.Bad) break;
+                v.Shell = r.Int(); if (r.Bad) break;
+                v.Text = r.Str(200) ?? "";
+                if (r.Bad) break;
                 vars.Add(v);
             }
 
@@ -968,21 +970,22 @@ namespace IronNestVR
         {
             if (!EnsureBuf()) return;
             float v; try { v = rd.D.AccumulatedValue; } catch { return; }
-            if (!Finite(v)) return;
+            if (!CoopWire.Finite(v)) return;
             // Trailing flag byte (index 9) marks the release/final edge so the host relay can keep live turns
             // unreliable but forward the release reliably (REVIEW-fix P1 — see CoopControls.IsMixedFinalStream).
-            int o = 0; _buf[o++] = MSG_PUNCH_DIAL; o = PutInt(o, rd.Key); o = PutF(o, v); o = PutByte(o, (byte)(reliable ? 1 : 0));
-            CoopP2P.Send(_buf, o, reliable);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PUNCH_DIAL); w.Int(rd.Key); w.Float(v); w.Bool(reliable);
+            CoopP2P.Send(_buf, w.Length, reliable);
             _sentDial++;
         }
 
         private static void OnDialPacket(Il2CppStructArray<byte> a, int len)
         {
             if (len < 9) return;
-            int o = 1;
-            int key = GetInt(a, ref o);
-            float v = GetF(a, ref o);
-            if (!Finite(v)) return;
+            var r = new CoopWire.Reader(a, len, 1);
+            int key = r.Int();
+            float v = r.Float();
+            if (r.Bad || !CoopWire.Finite(v)) return;
             ResolveConsoleDials();
             if (!_consoleDials.TryGetValue(key, out var rd) || rd.D == null) return;
             bool localDragging = false; try { localDragging = rd.D.isDragging; } catch { }
@@ -1223,51 +1226,11 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[punch] buf: " + e.Message); return false; }
         }
 
-        // Bounds-checked writers (REVIEW-fix P1): a Put* that would run past _buf sets _wover and writes nothing,
-        // instead of throwing / corrupting. The variable-length senders (redeem/graph/deck) reset _wover before
-        // building and refuse to send if it tripped, so an oversized card is dropped with a log, never half-written.
-        private static bool _wover;
-        private static bool Room(int o, int n) { if (o + n <= _buf.Length) return true; _wover = true; return false; }
-        private static int PutByte(int o, byte b) { if (!Room(o, 1)) return o; _buf[o] = b; return o + 1; }
-        private static int PutInt(int o, int v) { if (!Room(o, 4)) return o; _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static int PutF(int o, float v) { if (!Room(o, 4)) return o; int b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)b; _buf[o + 1] = (byte)(b >> 8); _buf[o + 2] = (byte)(b >> 16); _buf[o + 3] = (byte)(b >> 24); return o + 4; }
-        private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
-        private static int PutQ(int o, Quaternion q) { o = PutF(o, q.x); o = PutF(o, q.y); o = PutF(o, q.z); o = PutF(o, q.w); return o; }
-        private static Vector3 GetV(Il2CppStructArray<byte> a, ref int o) { float x = GetF(a, ref o), y = GetF(a, ref o), z = GetF(a, ref o); return new Vector3(x, y, z); }
-        private static Quaternion GetQ(Il2CppStructArray<byte> a, ref int o) { float x = GetF(a, ref o), y = GetF(a, ref o), z = GetF(a, ref o), w = GetF(a, ref o); return new Quaternion(x, y, z, w); }
-
         private static int Fnv(string s)
         {
             uint h = 2166136261u;
             for (int i = 0; i < s.Length; i++) { h ^= (byte)s[i]; h *= 16777619u; }
             return unchecked((int)h);
-        }
-
-        private static bool Finite(float f) => !float.IsNaN(f) && !float.IsInfinity(f);
-        private static bool Finite(Vector3 v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
-
-        private static int PutStr(int o, string s)
-        {
-            s ??= "";
-            var bytes = Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > 200) n = 200;
-            o = PutInt(o, n);
-            if (!Room(o, n)) return o;
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-        private static float GetF(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return Encoding.UTF8.GetString(_scratch, 0, n);
         }
     }
 }

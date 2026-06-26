@@ -46,8 +46,6 @@ namespace IronNestVR
         public const byte MSG_ORDER = 22;   // [t][printerType u8][sourceId str][lineCount i32][line str]×N  reliable
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
-        private static readonly byte[] _scratch = new byte[512];
         private static int _sent, _applied, _suppressed;
 
         // Set true around the client's REPLAY submit so the local-print suppressor (SuppressLocalPrint) lets the
@@ -107,27 +105,29 @@ namespace IronNestVR
             int count; try { count = lines.Count; } catch { return; }
             if (count > 64) count = 64;   // sanity cap
 
-            int o = 0; _buf[o++] = MSG_ORDER; _buf[o++] = ptype;
-            o = PutStr(o, sourceId);
-            int countPos = o; o = PutInt(o, count);   // may be trimmed below if we run out of buffer
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_ORDER); w.Byte(ptype);
+            w.Str(sourceId, 200);
+            int countAt = w.Mark();   // back-patched below with the count we actually serialize
             int written = 0;
             for (int i = 0; i < count; i++)
             {
                 string line = null; try { line = lines[i]; } catch { }
                 line ??= "";
-                var bytes = System.Text.Encoding.UTF8.GetBytes(line);
-                int n = bytes.Length; if (n > 240) n = 240;
-                if (o + 4 + n > _buf.Length - 4) break;   // out of room — send what fits
-                o = PutInt(o, n);
-                for (int j = 0; j < n; j++) _buf[o + j] = bytes[j];
-                o += n;
+                // reserveTail:4 reproduces the old "o + 4 + n > _buf.Length - 4" capacity check exactly; TryStr is
+                // transactional, so a line that won't fit stops the loop without dropping the whole packet.
+                if (!w.TryStr(line, 240, 4)) break;   // out of room — send what fits
                 written++;
             }
-            if (written != count) PutIntAt(countPos, written);   // record the actual line count we serialized
+            w.Patch(countAt, written);   // record the actual line count we serialized
+            if (w.Overflow) { Log.LogWarning("[ord] packet too large for " + _buf.Length + "B — not sent"); return; }
 
-            CoopP2P.Send(_buf, o, true);
+            CoopP2P.Send(_buf, w.Length, true);
             _sent++;
-            Log.LogInfo($"[ord] teleprinter {(Teleprinter.Teleprinters)ptype} '{sourceId}' ({written} lines) -> peer");
+            // DIAG (teleprinter "client prints nothing" hunt): log the actual text we captured/broadcast, so a
+            // tester log proves whether the source order has real content or is already blank at the host.
+            DescribeLines(lines, out int dbgChars, out string dbg0);
+            Log.LogInfo($"[ord] teleprinter {(Teleprinter.Teleprinters)ptype} '{sourceId}' ({written} lines, {dbgChars} chars, line0='{dbg0}') -> peer");
         }
 
         // ---------------- client replay ----------------
@@ -136,19 +136,17 @@ namespace IronNestVR
         {
             if (type != MSG_ORDER) return;
             if (CoopP2P.IsHost) return;   // host authored it; never replays
-            int o = 1;
-            if (o >= len) return;
-            byte ptype = a[o++];
-            string sourceId = GetStr(a, ref o, len);
-            if (o + 4 > len) return;
-            int count = GetInt(a, ref o);
-            if (count < 0 || count > 64) return;
+            var r = new CoopWire.Reader(a, len, 1);
+            byte ptype = r.Byte();
+            string sourceId = r.Str(200);
+            int count = r.Int();
+            if (r.Bad || count < 0 || count > 64) return;
 
             var lines = new Il2CppSystem.Collections.Generic.List<string>();
             for (int i = 0; i < count; i++)
             {
-                string s = GetStr(a, ref o, len);
-                if (s == null) break;
+                string s = r.Str(240);
+                if (r.Bad) break;
                 lines.Add(s);
             }
 
@@ -165,7 +163,13 @@ namespace IronNestVR
                 }
                 finally { ApplyingRemote = false; }
                 _applied++;
-                Log.LogInfo($"[ord] applied teleprinter {(Teleprinter.Teleprinters)ptype} '{sourceId}' ({lines.Count} lines) <- peer");
+                // DIAG (teleprinter "client prints nothing" hunt): log the applied text content + which teleprinter
+                // received it (name + active-in-hierarchy), so the next test says empty-lines (serialize/capture) vs
+                // real-text-but-not-rendering (wrong/inactive teleprinter or the print never started).
+                DescribeLines(lines, out int dbgChars, out string dbg0);
+                bool tpActive = false; string tpName = "?";
+                try { tpName = tp.name; var go = tp.gameObject; tpActive = go != null && go.activeInHierarchy; } catch { }
+                Log.LogInfo($"[ord] applied teleprinter {(Teleprinter.Teleprinters)ptype} '{sourceId}' ({lines.Count} lines, {dbgChars} chars, line0='{dbg0}') <- peer (tp='{tpName}' active={tpActive})");
             }
             catch (Exception e) { Log.LogWarning("[ord] replay: " + e.Message); }
         }
@@ -207,29 +211,24 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[ord] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static void PutIntAt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); }
-
-        private static int PutStr(int o, string s)
+        // DIAG helper: summarize a line list for the [ord] logs (total char count + a truncated preview of line 0),
+        // so the broadcast + replay diagnostics print the same shape. Shared by both (teleprinter "prints nothing"
+        // hunt). Remove with the two DIAG log blocks once that regression is resolved.
+        private static void DescribeLines(Il2CppSystem.Collections.Generic.List<string> lines, out int chars, out string first)
         {
-            s ??= "";
-            var bytes = System.Text.Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > 200) n = 200;
-            o = PutInt(o, n);
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return System.Text.Encoding.UTF8.GetString(_scratch, 0, n);
+            chars = 0; first = "";
+            try
+            {
+                int n = lines.Count;
+                for (int i = 0; i < n; i++)
+                {
+                    string ln = null; try { ln = lines[i]; } catch { }
+                    if (ln == null) continue;
+                    chars += ln.Length;
+                    if (i == 0) first = ln.Length > 48 ? ln.Substring(0, 48) : ln;
+                }
+            }
+            catch { }
         }
     }
 }

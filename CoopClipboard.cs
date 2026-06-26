@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 using BepInEx.Logging;
 using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
@@ -39,8 +38,6 @@ namespace IronNestVR
         private const float ScanHz = 5f;     // content changes are infrequent — diff a few times a second
 
         private static Il2CppStructArray<byte> _buf;     // send (lazily created on the Unity thread)
-        private static readonly byte[] _scratch = new byte[1400];
-        private static readonly byte[] _i4 = new byte[4];
 
         private static readonly List<NotepadSection> _sections = new List<NotepadSection>();
         private static ClipboardToolSelector _selector;
@@ -92,14 +89,14 @@ namespace IronNestVR
         public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
         {
             float now = Time.unscaledTime;
-            int o = 1;
             switch (type)
             {
                 case MSG_SECTION:
                 {
-                    string tag = GetStr(a, ref o, len);
-                    string text = GetStr(a, ref o, len);
-                    if (tag == null) return;
+                    var r = new CoopWire.Reader(a, len, 1);
+                    string tag = r.Str(MaxText);
+                    string text = r.Str(MaxText);
+                    if (r.Bad) return;
                     try
                     {
                         var s = NotepadSection.ResolveByTag(tag);
@@ -119,8 +116,9 @@ namespace IronNestVR
                 }
                 case MSG_TOOL:
                 {
-                    if (len < 5) return;
-                    int idx = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int idx = r.Int();
+                    if (r.Bad) return;
                     try
                     {
                         var sel = _selector;
@@ -231,42 +229,19 @@ namespace IronNestVR
         private static void SendSection(string tag, string text)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_SECTION;
-            o = PutStr(o, tag); o = PutStr(o, text);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_SECTION); w.Str(tag, MaxText); w.Str(text, MaxText);
+            if (w.Overflow) { Log.LogWarning("[clip] packet too large for " + _buf.Length + "B — not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         private static void SendTool(int idx)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_TOOL; o = PutInt(o, idx);
-            CoopP2P.Send(_buf, o, true);
-        }
-
-        // ---------------- (de)serialization ----------------
-
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-
-        private static int PutStr(int o, string s)
-        {
-            s ??= "";
-            var bytes = Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > MaxText) n = MaxText;   // truncate over-long notes (rare)
-            o = PutInt(o, n);
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _i4[0] = a[o]; _i4[1] = a[o + 1]; _i4[2] = a[o + 2]; _i4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_i4, 0); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return Encoding.UTF8.GetString(_scratch, 0, n);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_TOOL); w.Int(idx);
+            if (w.Overflow) { Log.LogWarning("[clip] packet too large for " + _buf.Length + "B — not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         private static bool EnsureBuf()

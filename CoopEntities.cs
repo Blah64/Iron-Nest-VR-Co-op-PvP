@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 using BepInEx.Logging;
 using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
@@ -100,8 +99,6 @@ namespace IronNestVR
         private const float MoveEpsilonSq = 0.0001f;   // ~1cm map-units; ignore sub-pixel jitter
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
-        private static readonly byte[] _scratch = new byte[512];
 
         // ---------------- per-frame ----------------
 
@@ -216,9 +213,11 @@ namespace IronNestVR
             if (!EnsureBuf()) return;
             int n = _seen.Count;
             if (5 + n * 4 > 500) { Log.LogWarning($"[ent] live-set too large to re-assert in one packet ({n} keys) — skipping reap this cycle"); return; }
-            int o = 0; _buf[o++] = MSG_ENTSET; o = PutInt(o, n);
-            foreach (var k in _seen) o = PutInt(o, k);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_ENTSET); w.Int(n);
+            foreach (var k in _seen) w.Int(k);
+            if (w.Overflow) { Log.LogWarning("[ent] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         // ---------------- client: maintain template + cleanup ----------------
@@ -263,25 +262,26 @@ namespace IronNestVR
             // Drop entity traffic until our own scene reaches the mission — otherwise we'd clone into the wrong
             // scene. CoopScene re-requests a full snapshot (via MISSION_READY) once we've actually loaded in.
             if (!InMission()) return;
-            int o = 1;
             switch (type)
             {
                 case MSG_SPAWN:
                 {
-                    int key = GetInt(a, ref o);
-                    string id = GetStr(a, ref o, len);
-                    string name = GetStr(a, ref o, len);
-                    string icon = GetStr(a, ref o, len);
-                    if (o + 4 + 12 + 12 > len) return;
-                    int role = GetInt(a, ref o);
-                    Vector3 pos = GetV(a, ref o);
-                    int state = GetInt(a, ref o);
-                    int hp = GetInt(a, ref o);
-                    int maxHp = GetInt(a, ref o);
-                    int armour = GetInt(a, ref o);
-                    int stars = GetInt(a, ref o);
-                    int scale = GetInt(a, ref o);
-                    Vector3 lpos = (o + 12 <= len) ? GetV(a, ref o) : Vector3.zero;   // parent-relative transform placement
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int key = r.Int();
+                    string id = r.Str(200);
+                    string name = r.Str(200);
+                    string icon = r.Str(200);
+                    if (r.Bad) return;
+                    int role = r.Int();
+                    Vector3 pos = r.Vec();
+                    int state = r.Int();
+                    int hp = r.Int();
+                    int maxHp = r.Int();
+                    int armour = r.Int();
+                    int stars = r.Int();
+                    int scale = r.Int();
+                    if (r.Bad) return;
+                    Vector3 lpos = (r.Remaining >= 12) ? r.Vec() : Vector3.zero;   // parent-relative transform placement
                     if (id == null) return;
                     if (_mirrors.TryGetValue(key, out var ex)) { ApplyUpdate(ex, pos, state, hp); return; }   // JIP/dup re-spawn
                     AdoptOrClone(key, id, name, icon, role, pos, state, hp, maxHp, armour, stars, scale, lpos);
@@ -290,11 +290,13 @@ namespace IronNestVR
                 case MSG_UPDATE:
                 {
                     if (len < 1 + 4 + 4 + 12 + 4 + 4) return;
-                    int key = GetInt(a, ref o);
-                    int seq = GetInt(a, ref o);
-                    Vector3 pos = GetV(a, ref o);
-                    int state = GetInt(a, ref o);
-                    int hp = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int key = r.Int();
+                    int seq = r.Int();
+                    Vector3 pos = r.Vec();
+                    int state = r.Int();
+                    int hp = r.Int();
+                    if (r.Bad) return;
                     // Reliable+ordered: always apply state/hp/pos, and advance the position seq so an older unreliable
                     // move delivered late is dropped instead of yanking the entity back (REVIEW-fix P2).
                     if (_mirrors.TryGetValue(key, out var m)) { ApplyUpdate(m, pos, state, hp); if (seq > m.LastSeq) m.LastSeq = seq; }
@@ -303,9 +305,11 @@ namespace IronNestVR
                 case MSG_MOVE:
                 {
                     if (len < 1 + 4 + 4 + 12) return;
-                    int key = GetInt(a, ref o);
-                    int seq = GetInt(a, ref o);
-                    Vector3 pos = GetV(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int key = r.Int();
+                    int seq = r.Int();
+                    Vector3 pos = r.Vec();
+                    if (r.Bad) return;
                     // Drop a stale/reordered move so a late unreliable packet can't settle the entity at an old
                     // position (REVIEW-fix P2). Position-only either way — never touches state/hp.
                     if (_mirrors.TryGetValue(key, out var m) && seq > m.LastSeq) { ApplyMove(m, pos); m.LastSeq = seq; }
@@ -314,7 +318,9 @@ namespace IronNestVR
                 case MSG_DESPAWN:
                 {
                     if (len < 5) return;
-                    int key = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int key = r.Int();
+                    if (r.Bad) return;
                     if (_mirrors.TryGetValue(key, out var m))
                     {
                         if (m.IsClone) { try { if (m.Go != null) UnityEngine.Object.Destroy(m.Go); } catch { } }
@@ -327,10 +333,15 @@ namespace IronNestVR
                 case MSG_ENTSET:
                 {
                     if (len < 5) return;
-                    int count = GetInt(a, ref o);
-                    if (count < 0 || o + count * 4 > len) return;
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int count = r.Int();
+                    // count > r.Remaining/4 (NOT r.Remaining < count*4): the multiply form overflows int for a
+                    // corrupt huge count, bypassing the bound and spinning a multi-billion-iteration loop. Division
+                    // can't overflow and rejects the same packets the old o+count*4>len guard intended to.
+                    if (r.Bad || count < 0 || count > r.Remaining / 4) return;
                     var live = new HashSet<int>();
-                    for (int i = 0; i < count; i++) live.Add(GetInt(a, ref o));
+                    for (int i = 0; i < count; i++) live.Add(r.Int());
+                    if (r.Bad) return;
                     // Reap any mirror the host no longer lists — its DESPAWN was lost (ghost enemy). Reliable+ordered
                     // delivery means an in-flight SPAWN for a key arrives BEFORE this set (which includes that key),
                     // so a freshly-spawned mirror is never falsely reaped.
@@ -550,12 +561,14 @@ namespace IronNestVR
             // Parent-relative transform position = the authored world placement (the grid cell `pos` is DERIVED from it,
             // not vice-versa). Sent so the client can position the clone's TRANSFORM under the shared Fire Mission Root.
             Vector3 lpos = Vector3.zero; try { if (loc != null) lpos = loc.transform.localPosition; } catch { }
-            int o = 0; _buf[o++] = MSG_SPAWN; o = PutInt(o, key);
-            o = PutStr(o, id); o = PutStr(o, name); o = PutStr(o, icon);
-            o = PutInt(o, role); o = PutV(o, pos); o = PutInt(o, state); o = PutInt(o, hp);
-            o = PutInt(o, maxHp); o = PutInt(o, armour); o = PutInt(o, stars); o = PutInt(o, scale);
-            o = PutV(o, lpos);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_SPAWN); w.Int(key);
+            w.Str(id, 200); w.Str(name, 200); w.Str(icon, 200);
+            w.Int(role); w.Vec(pos); w.Int(state); w.Int(hp);
+            w.Int(maxHp); w.Int(armour); w.Int(stars); w.Int(scale);
+            w.Vec(lpos);
+            if (w.Overflow) { Log.LogWarning("[ent] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             Log.LogInfo($"[ent] spawn '{id}' -> peer (role={role} hp={hp}/{maxHp} state={state})");
         }
 
@@ -564,8 +577,9 @@ namespace IronNestVR
         private static void SendUpdate(int key, Vector3 pos, int state, int hp, int seq)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_UPDATE; o = PutInt(o, key); o = PutInt(o, seq); o = PutV(o, pos); o = PutInt(o, state); o = PutInt(o, hp);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_UPDATE); w.Int(key); w.Int(seq); w.Vec(pos); w.Int(state); w.Int(hp);
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         // High-rate position stream — unreliable, position only (no state/hp). Per-entity seq lets the receiver
@@ -573,15 +587,17 @@ namespace IronNestVR
         private static void SendMove(int key, Vector3 pos, int seq)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_MOVE; o = PutInt(o, key); o = PutInt(o, seq); o = PutV(o, pos);
-            CoopP2P.Send(_buf, o, false);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_MOVE); w.Int(key); w.Int(seq); w.Vec(pos);
+            CoopP2P.Send(_buf, w.Length, false);
         }
 
         private static void SendDespawn(int key)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_DESPAWN; o = PutInt(o, key);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_DESPAWN); w.Int(key);
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         // ---------------- template / parent / lookup helpers ----------------
@@ -752,34 +768,6 @@ namespace IronNestVR
             if (_buf != null) return true;
             try { _buf = new Il2CppStructArray<byte>(512); return true; }
             catch (Exception e) { Log.LogWarning("[ent] buf: " + e.Message); return false; }
-        }
-
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static int PutF(int o, float v) { int __b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)__b; _buf[o + 1] = (byte)(__b >> 8); _buf[o + 2] = (byte)(__b >> 16); _buf[o + 3] = (byte)(__b >> 24); return o + 4; }
-        private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
-
-        private static int PutStr(int o, string s)
-        {
-            s ??= "";
-            var bytes = Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > 200) n = 200;   // IDs/names are short; cap guards the buffer
-            o = PutInt(o, n);
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-        private static float GetF(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
-        private static Vector3 GetV(Il2CppStructArray<byte> a, ref int o) { float x = GetF(a, ref o), y = GetF(a, ref o), z = GetF(a, ref o); return new Vector3(x, y, z); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return Encoding.UTF8.GetString(_scratch, 0, n);
         }
 
         private static int Fnv(string s)

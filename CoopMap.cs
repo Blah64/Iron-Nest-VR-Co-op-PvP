@@ -92,8 +92,6 @@ namespace IronNestVR
         private static float _nextScan, _nextSend;
 
         private static Il2CppStructArray<byte> _buf;
-        private static readonly byte[] _f4 = new byte[4];
-        private static readonly byte[] _scratch = new byte[128];   // string (de)serialization for marker prefab names
 
         // --- bearing/range markers (MapMarkerLineUI) ---
         private sealed class Marker
@@ -206,7 +204,7 @@ namespace IronNestVR
             Vector2 origin, target;
             try { origin = ui.OriginLocal; var t = ui.TipLocalPosition; target = origin + new Vector2(t.x, t.y); }
             catch { return false; }
-            if (!Finite(origin.x) || !Finite(origin.y) || !Finite(target.x) || !Finite(target.y)) return false;
+            if (!CoopWire.Finite(origin.x) || !CoopWire.Finite(origin.y) || !CoopWire.Finite(target.x) || !CoopWire.Finite(target.y)) return false;
 
             int netId = NextMarkerId();
             string pname = MarkerPrefabName(go);
@@ -334,13 +332,14 @@ namespace IronNestVR
         public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
             float now = Time.unscaledTime;
-            int o = 1;
             switch (type)
             {
                 case MSG_GRAB:
                 {
                     if (len < 5) return;
-                    int id = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int id = r.Int();
+                    if (r.Bad) return;
                     if (_items.TryGetValue(id, out var it))
                     {
                         if (it.LocalOwned)
@@ -363,9 +362,11 @@ namespace IronNestVR
                 case MSG_POS:
                 {
                     if (len < 17) return;
-                    int id = GetInt(a, ref o);
-                    Vector3 p = GetV(a, ref o);
-                    if (_items.TryGetValue(id, out var it) && Finite(p))
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int id = r.Int();
+                    Vector3 p = r.Vec();
+                    if (r.Bad) return;
+                    if (_items.TryGetValue(id, out var it) && CoopWire.Finite(p))
                     {
                         // Adopt the streaming owner under the same priority guard as a grab (a POS can arrive
                         // before/without its grab). Only refresh visuals/ownership for the held-or-winning origin.
@@ -379,14 +380,16 @@ namespace IronNestVR
                 case MSG_PLACE:
                 {
                     if (len < 21) return;
-                    int id = GetInt(a, ref o);
-                    Vector3 p = GetV(a, ref o);
-                    int slotId = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int id = r.Int();
+                    Vector3 p = r.Vec();
+                    int slotId = r.Int();
+                    if (r.Bad) return;
                     if (_items.TryGetValue(id, out var it) && it.Token != null && it.T != null)
                     {
                         try
                         {
-                            if (Finite(p)) it.T.localPosition = p;   // parent-relative
+                            if (CoopWire.Finite(p)) it.T.localPosition = p;   // parent-relative
                             if (slotId != 0 && _slots.TryGetValue(slotId, out var slot) && slot != null)
                                 slot.PlaceItem(it.Token);        // make a slot placement stick
                         }
@@ -401,11 +404,14 @@ namespace IronNestVR
                 case MSG_MARKER_ADD:
                 {
                     if (len < 9) return;
-                    int netId = GetInt(a, ref o);
-                    string prefabName = GetStr(a, ref o, len);
-                    if (o + 16 > len) return;
-                    Vector2 originLocal = new Vector2(GetF(a, ref o), GetF(a, ref o));   // marker geometry origin (not the packet author)
-                    Vector2 target = new Vector2(GetF(a, ref o), GetF(a, ref o));   // ABSOLUTE endpoint = origin+tip
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int netId = r.Int();
+                    string prefabName = r.Str(64);
+                    float ox = r.Float(); float oy = r.Float();
+                    float tx = r.Float(); float ty = r.Float();
+                    if (r.Bad) return;
+                    Vector2 originLocal = new Vector2(ox, oy);   // marker geometry origin (not the packet author)
+                    Vector2 target = new Vector2(tx, ty);   // ABSOLUTE endpoint = origin+tip
                     if (_markers.ContainsKey(netId)) return;   // already mirrored (dup / JIP re-send)
                     SpawnMirror(netId, prefabName ?? "", originLocal, target);
                     break;
@@ -413,18 +419,22 @@ namespace IronNestVR
                 case MSG_PIECE_MOVE:
                 {
                     if (len < 1 + 4 + 4 + 1 + 12 + 16) return;
-                    int id = GetInt(a, ref o);
-                    int seq = GetInt(a, ref o);
-                    bool final = (a[o++] & 1) != 0;
-                    Vector3 pos = GetV(a, ref o);
-                    Quaternion rot = new Quaternion(GetF(a, ref o), GetF(a, ref o), GetF(a, ref o), GetF(a, ref o));
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int id = r.Int();
+                    int seq = r.Int();
+                    bool final = (r.Byte() & 1) != 0;
+                    Vector3 pos = r.Vec();
+                    Quaternion rot = r.Quat();
+                    if (r.Bad) return;
                     ApplyPieceMove(id, seq, final, pos, rot);
                     break;
                 }
                 case MSG_MARKER_DEL:
                 {
                     if (len < 5) return;
-                    int netId = GetInt(a, ref o);
+                    var r = new CoopWire.Reader(a, len, 1);
+                    int netId = r.Int();
+                    if (r.Bad) return;
                     if (_markers.TryGetValue(netId, out var m))
                     {
                         try { var pm = _placer != null ? _placer.placedMarkers : null; if (pm != null && m.Go != null) pm.Remove(m.Go); } catch { }
@@ -443,8 +453,10 @@ namespace IronNestVR
         private static void SendGrab(int id)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_GRAB; o = PutInt(o, id);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_GRAB); w.Int(id);
+            if (w.Overflow) { Log.LogWarning("[map] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         private static void SendPos(Item it)
@@ -452,9 +464,11 @@ namespace IronNestVR
             if (!EnsureBuf() || it.T == null) return;
             Vector3 local;
             try { local = it.T.localPosition; } catch { return; }
-            if (!Finite(local)) return;
-            int o = 0; _buf[o++] = MSG_POS; o = PutInt(o, it.NetId); o = PutV(o, local);
-            CoopP2P.Send(_buf, o, false);
+            if (!CoopWire.Finite(local)) return;
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_POS); w.Int(it.NetId); w.Vec(local);
+            if (w.Overflow) { Log.LogWarning("[map] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, false);
         }
 
         private static void SendPlace(Item it, bool log = true)
@@ -472,8 +486,10 @@ namespace IronNestVR
                 }
             }
             catch { }
-            int o = 0; _buf[o++] = MSG_PLACE; o = PutInt(o, it.NetId); o = PutV(o, local); o = PutInt(o, slotId);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PLACE); w.Int(it.NetId); w.Vec(local); w.Int(slotId);
+            if (w.Overflow) { Log.LogWarning("[map] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
             if (log) Log.LogInfo($"[map] placed '{it.T.name}' (slot={(slotId != 0)}) -> peer");
         }
 
@@ -550,7 +566,7 @@ namespace IronNestVR
         {
             try
             {
-                if (!Finite(pos)) return;
+                if (!CoopWire.Finite(pos)) return;
                 if (_draggingLocal.Contains(id)) return;   // we're dragging this piece locally — local input wins, ignore the peer
                 // REVIEW-fix (P1): drop a stale/reordered move. The reliable FINAL carries the highest seq of its
                 // drag, so once it lands no older unreliable live move can move the piece back to an in-flight spot.
@@ -567,12 +583,13 @@ namespace IronNestVR
 
         private static void SendPieceMove(int id, Vector3 pos, Quaternion rot, bool reliable, bool final)
         {
-            if (!EnsureBuf() || !Finite(pos)) return;
+            if (!EnsureBuf() || !CoopWire.Finite(pos)) return;
             _pieceSeqOut.TryGetValue(id, out var seq); seq++; _pieceSeqOut[id] = seq;   // per-piece monotonic (REVIEW-fix P1)
-            int o = 0; _buf[o++] = MSG_PIECE_MOVE; o = PutInt(o, id); o = PutInt(o, seq); _buf[o++] = (byte)(final ? 1 : 0);
-            o = PutV(o, pos);
-            o = PutF(o, rot.x); o = PutF(o, rot.y); o = PutF(o, rot.z); o = PutF(o, rot.w);
-            CoopP2P.Send(_buf, o, reliable);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PIECE_MOVE); w.Int(id); w.Int(seq); w.Byte((byte)(final ? 1 : 0));
+            w.Vec(pos); w.Quat(rot);
+            if (w.Overflow) { Log.LogWarning("[map] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, reliable);
         }
 
         // Detect a bearing/range line deleted locally (e.g. the map's reset/clear, or an individual delete) by
@@ -673,10 +690,12 @@ namespace IronNestVR
         private static void SendMarkerAdd(int netId, string prefabName, Vector2 origin, Vector2 target)
         {
             if (!EnsureBuf()) return;
-            if (!Finite(origin.x) || !Finite(origin.y) || !Finite(target.x) || !Finite(target.y)) return;
-            int o = 0; _buf[o++] = MSG_MARKER_ADD; o = PutInt(o, netId); o = PutStr(o, prefabName);
-            o = PutF(o, origin.x); o = PutF(o, origin.y); o = PutF(o, target.x); o = PutF(o, target.y);
-            CoopP2P.Send(_buf, o, true);
+            if (!CoopWire.Finite(origin.x) || !CoopWire.Finite(origin.y) || !CoopWire.Finite(target.x) || !CoopWire.Finite(target.y)) return;
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_MARKER_ADD); w.Int(netId); w.Str(prefabName, 64);
+            w.Float(origin.x); w.Float(origin.y); w.Float(target.x); w.Float(target.y);
+            if (w.Overflow) { Log.LogWarning("[map] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         // JIP re-send: recompute the absolute target from the live marker.
@@ -691,8 +710,10 @@ namespace IronNestVR
         private static void SendMarkerDel(int netId)
         {
             if (!EnsureBuf()) return;
-            int o = 0; _buf[o++] = MSG_MARKER_DEL; o = PutInt(o, netId);
-            CoopP2P.Send(_buf, o, true);
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_MARKER_DEL); w.Int(netId);
+            if (w.Overflow) { Log.LogWarning("[map] packet too large for " + _buf.Length + "B - not sent"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
         }
 
         // The marker prefab's NAME (which encodes its color/style — e.g. "RED"/"Yellow"/"White"). Unity names an
@@ -1009,35 +1030,5 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[map] buf: " + e.Message); return false; }
         }
 
-        private static int PutInt(int o, int v) { _buf[o] = (byte)v; _buf[o + 1] = (byte)(v >> 8); _buf[o + 2] = (byte)(v >> 16); _buf[o + 3] = (byte)(v >> 24); return o + 4; }
-        private static int PutF(int o, float v) { int __b = BitConverter.SingleToInt32Bits(v); _buf[o] = (byte)__b; _buf[o + 1] = (byte)(__b >> 8); _buf[o + 2] = (byte)(__b >> 16); _buf[o + 3] = (byte)(__b >> 24); return o + 4; }
-        private static int PutV(int o, Vector3 v) { o = PutF(o, v.x); o = PutF(o, v.y); o = PutF(o, v.z); return o; }
-
-        private static int PutStr(int o, string s)
-        {
-            s ??= "";
-            var bytes = Encoding.UTF8.GetBytes(s);
-            int n = bytes.Length; if (n > 64) n = 64;   // marker prefab names are short; cap guards the buffer
-            o = PutInt(o, n);
-            for (int i = 0; i < n; i++) _buf[o + i] = bytes[i];
-            return o + n;
-        }
-
-        private static int GetInt(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToInt32(_f4, 0); }
-        private static float GetF(Il2CppStructArray<byte> a, ref int o) { _f4[0] = a[o]; _f4[1] = a[o + 1]; _f4[2] = a[o + 2]; _f4[3] = a[o + 3]; o += 4; return BitConverter.ToSingle(_f4, 0); }
-        private static Vector3 GetV(Il2CppStructArray<byte> a, ref int o) { float x = GetF(a, ref o), y = GetF(a, ref o), z = GetF(a, ref o); return new Vector3(x, y, z); }
-
-        private static string GetStr(Il2CppStructArray<byte> a, ref int o, int len)
-        {
-            if (o + 4 > len) return null;
-            int n = GetInt(a, ref o);
-            if (n < 0 || o + n > len || n > _scratch.Length) return null;
-            for (int i = 0; i < n; i++) _scratch[i] = a[o + i];
-            o += n;
-            return Encoding.UTF8.GetString(_scratch, 0, n);
-        }
-
-        private static bool Finite(float f) => !float.IsNaN(f) && !float.IsInfinity(f);
-        private static bool Finite(Vector3 v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
     }
 }
