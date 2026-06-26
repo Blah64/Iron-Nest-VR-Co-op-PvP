@@ -336,28 +336,6 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[locomotion] teleport: " + e.Message); _fpc = null; _cc = null; }
         }
 
-        private void ShowTeleMarker(Vector3 pos, bool valid)
-        {
-            EnsureTeleMarker();
-            if (_teleMarker == null) return;
-            _teleMarker.transform.position = pos + Vector3.up * 0.02f;
-            _teleMarker.transform.rotation = Quaternion.Euler(90f, 0f, 0f); // lie flat on the ground
-            float diam = valid ? 0.55f : 0.45f;
-            _teleMarker.transform.localScale = new Vector3(diam, diam, 1f);
-            Color c = valid ? new Color(0.25f, 1f, 0.4f, 0.85f) : new Color(1f, 0.35f, 0.25f, 0.7f);
-            if (_teleMat != null)
-            {
-                try { _teleMat.color = c; } catch { }
-                try { if (_teleMat.HasProperty("_Color")) _teleMat.SetColor("_Color", c); } catch { }
-            }
-            if (_teleMr != null && !_teleMr.enabled) _teleMr.enabled = true;
-        }
-
-        private void HideTeleMarker()
-        {
-            if (_teleMr != null && _teleMr.enabled) _teleMr.enabled = false;
-        }
-
         private void EnsureTeleMarker()
         {
             if (_teleMarker != null) return;

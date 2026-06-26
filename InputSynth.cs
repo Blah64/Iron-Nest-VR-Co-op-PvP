@@ -66,6 +66,10 @@ namespace IronNestVR
         }
 
         /// <summary>Queue a keyboard state with a single key held/released (call on edges only).</summary>
+        // Reserved (currently unwired): the keyboard-synthesis counterpart to the live SetMouseLeft, for
+        // driving the game's "[E]" keyboard-interact action (see the class summary) through the Input System.
+        // The interact path uses the mouse-synth/click route today; kept so it can adopt full-state keyboard
+        // events without re-deriving them. Pairs with SetMouseLeft above.
         public static bool SetKey(Key key, bool down)
         {
             if (!Supported) return false;
