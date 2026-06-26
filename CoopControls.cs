@@ -622,16 +622,34 @@ namespace IronNestVR
                 || type == CoopMap.MSG_GRAB || type == CoopMap.MSG_POS || type == CoopMap.MSG_PLACE
                 || type == CoopMap.MSG_MARKER_ADD || type == CoopMap.MSG_MARKER_DEL || type == CoopMap.MSG_PIECE_MOVE
                 || type == CoopScene.MSG_MISSION_READY
-                || type == CoopCards.MSG_CARD;   // fire-mission cards are bidirectional — fan out to the other clients (N>2)
+                || type == CoopCards.MSG_CARD   // fire-mission cards are bidirectional — fan out to the other clients (N>2)
+                // Requisition punchcards are peer/either-authored: any crew member may grab/move/place a card or turn
+                // a recon dial, so the host must relay them to the OTHER clients (REVIEW-fix P1 — without this a
+                // client's punchcard action reached the host but never the other clients at N>2). Host-only types
+                // (MSG_PUNCH_DECK/CONSUME/GRAPH) stay off this list.
+                || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
+                || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_DIAL;
         }
 
         // Streaming packet types the host relays UNRELIABLE (high-rate, loss-tolerant). MSG_POSE is handled by
-        // CoopP2P. Everything else relays reliable so a lost grab/release/click/snapshot/edit isn't dropped.
+        // CoopP2P, and mixed live/final types by IsMixedFinalStream. Everything else relays reliable so a lost
+        // grab/release/click/snapshot/edit isn't dropped.
         public static bool IsUnreliableStream(byte type)
         {
             return type == MSG_VALUE || type == MSG_GROUP
-                || type == CoopMap.MSG_POS || type == CoopMap.MSG_PIECE_MOVE
-                || type == CoopEntities.MSG_MOVE;
+                || type == CoopMap.MSG_POS
+                || type == CoopEntities.MSG_MOVE
+                || type == CoopPunchcards.MSG_PUNCH_POS;   // held-card position stream — loss-tolerant; the reliable PLACE finalizes
+        }
+
+        // Mixed-mode stream types: the SAME packet carries unreliable LIVE updates and a reliable FINAL/RELEASE
+        // edge, distinguished by a flag byte at payload index 9 (flags&1 = final/release). The host relay must read
+        // that flag instead of classifying by type alone, or the reliable final is silently downgraded to
+        // unreliable on the host→client leg and a dropped final leaves the piece/dial stuck off (REVIEW-fix P1 —
+        // mixed live/final relay reliability). Both layouts put the flag at index 9: [t][i32][i32-or-f32][flags].
+        public static bool IsMixedFinalStream(byte type)
+        {
+            return type == CoopMap.MSG_PIECE_MOVE || type == CoopPunchcards.MSG_PUNCH_DIAL;
         }
 
         // origin = the SteamID that authored this packet (derived by CoopP2P from the Steam `from`, or the

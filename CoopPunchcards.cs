@@ -60,7 +60,7 @@ namespace IronNestVR
         public const byte MSG_PUNCH_PLACE   = 35;   // owner->peer:  [t][cardKey i32][pos 3f][rot 4f][inReqSlot u8] reliable  final drop (+ slot state)
         public const byte MSG_PUNCH_CONSUME = 36;   // host->client: [t][cardId str]                              reliable   authoritative "this card was redeemed — drop yours"
         public const byte MSG_PUNCH_GRAPH   = 37;   // host->client: [t][cardId str][varCount i32]( var )*        reliable   "host redeemed this — run the card graph locally (visual result + own bookkeeping)"
-        public const byte MSG_PUNCH_DIAL    = 38;   // either->peer: [t][key i32][value f32]                     unreliable stream / reliable on release — live recon-dial turn
+        public const byte MSG_PUNCH_DIAL    = 38;   // either->peer: [t][key i32][value f32][release u8]         unreliable stream / reliable on release(=1) — live recon-dial turn (flag at index 9 lets the host relay pick reliability per-packet)
         //   key = Fnv(console-relative path) — addresses ANY of the requisition console's dials (the two Grid-Location
         //   .Range Dials + gross/fine bearing), collision-free. Synced HERE, not via CoopControls (their full path-hash
         //   collides with the gun's same-named targeting dials). value = dial.AccumulatedValue; receiver SetDialValue()s
@@ -964,7 +964,9 @@ namespace IronNestVR
             if (!EnsureBuf()) return;
             float v; try { v = rd.D.AccumulatedValue; } catch { return; }
             if (!Finite(v)) return;
-            int o = 0; _buf[o++] = MSG_PUNCH_DIAL; o = PutInt(o, rd.Key); o = PutF(o, v);
+            // Trailing flag byte (index 9) marks the release/final edge so the host relay can keep live turns
+            // unreliable but forward the release reliably (REVIEW-fix P1 — see CoopControls.IsMixedFinalStream).
+            int o = 0; _buf[o++] = MSG_PUNCH_DIAL; o = PutInt(o, rd.Key); o = PutF(o, v); _buf[o++] = (byte)(reliable ? 1 : 0);
             CoopP2P.Send(_buf, o, reliable);
             _sentDial++;
         }

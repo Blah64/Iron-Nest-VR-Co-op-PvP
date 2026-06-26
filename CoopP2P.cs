@@ -99,11 +99,43 @@ namespace IronNestVR
         private static float _nextSend;   // transmit-rate cap (see Config.CoopSendHz)
 
         // Join-in-progress: when the host detects a new peer it schedules a one-time full-world snapshot for
-        // CoopSnapshotDelaySec later (0 = none pending). The delay lets both sides resolve the peer + bring the
-        // session up so the snapshot isn't dropped by the receive-side peer gate. Cleared if the peer leaves.
-        private static float _snapAt;
-        private static CSteamID _snapTarget;   // the freshly-joined peer the pending snapshot is for
+        // CoopSnapshotDelaySec later. The delay lets both sides resolve the peer + bring the session up so the
+        // snapshot isn't dropped by the receive-side peer gate. Each pending snapshot is tracked PER PEER so two
+        // joiners arriving within the delay window each get their own snapshot (REVIEW-fix P2 — a single pending
+        // target was overwritten by the second joiner, so the first never received the full-world snapshot).
+        private struct PendingSnap { public CSteamID Peer; public float DueAt; }
+        private static readonly List<PendingSnap> _pendingSnaps = new List<PendingSnap>();
+        private static CSteamID _snapTarget;   // the peer the IN-FLIGHT snapshot is currently being unicast to
         private static bool _snapActive;       // while true, host Send unicasts to _snapTarget (JIP), not broadcast
+
+        // Queue (or refresh) a join-in-progress snapshot for one peer. De-dupes a re-detected peer.
+        private static void ScheduleSnapshot(CSteamID peer, float now)
+        {
+            for (int i = _pendingSnaps.Count - 1; i >= 0; i--)
+                if (_pendingSnaps[i].Peer.m_SteamID == peer.m_SteamID) _pendingSnaps.RemoveAt(i);
+            _pendingSnaps.Add(new PendingSnap { Peer = peer, DueAt = now + Config.CoopSnapshotDelaySec });
+        }
+
+        // Drop any pending snapshot for a peer that left before its snapshot fired.
+        private static void DropSnapshot(ulong peerId)
+        {
+            for (int i = _pendingSnaps.Count - 1; i >= 0; i--)
+                if (_pendingSnaps[i].Peer.m_SteamID == peerId) _pendingSnaps.RemoveAt(i);
+        }
+
+        // Fire every pending snapshot whose delay has elapsed (host only). Each targets its own joiner.
+        private static void ProcessPendingSnaps(float now)
+        {
+            for (int i = _pendingSnaps.Count - 1; i >= 0; i--)
+            {
+                if (now < _pendingSnaps[i].DueAt) continue;
+                var peer = _pendingSnaps[i].Peer;
+                _pendingSnaps.RemoveAt(i);
+                if (!IsHost || !ContainsId(_peers, peer.m_SteamID)) continue;   // peer left before the snapshot fired
+                _snapTarget = peer;
+                SendJoinSnapshot();
+            }
+        }
 
         public static void Init()
         {
@@ -166,7 +198,7 @@ namespace IronNestVR
             if (_wasLoopback)   // loopback was just stopped — drop the synthetic peer so subsystems clear
             {
                 _wasLoopback = false;
-                ClearPeers(); IsHost = false; PeerName = ""; _snapAt = 0f;
+                ClearPeers(); IsHost = false; PeerName = ""; _pendingSnaps.Clear();
                 ClearRealPoses();
                 Log.LogInfo("[p2p] loopback ended — peers cleared");
             }
@@ -176,7 +208,7 @@ namespace IronNestVR
             UpdatePeer();
             Receive();
             CoopNetSim.Pump(Time.unscaledTime, DispatchManaged);   // release any NetSim-delayed packets (test aid)
-            if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
+            ProcessPendingSnaps(Time.unscaledTime);
             AgeRemotePoses(dt);
         }
 
@@ -200,19 +232,19 @@ namespace IronNestVR
                 _peerNames[peerSyn] = PeerName;
                 Log.LogInfo($"[p2p] loopback link up — role={(IsHost ? "HOST" : "client")}");
                 Notify.PeerJoined(PeerName, IsHost);
-                if (IsHost) { _snapTarget = new CSteamID { m_SteamID = peerSyn }; _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo("[p2p] host: loopback join snapshot scheduled"); }
-                else _snapAt = 0f;
+                if (IsHost) { ScheduleSnapshot(new CSteamID { m_SteamID = peerSyn }, Time.unscaledTime); Log.LogInfo("[p2p] host: loopback join snapshot scheduled"); }
+                else _pendingSnaps.Clear();
             }
             else if (!connected && _peers.Count > 0)
             {
-                _peers.Clear(); _peerNames.Clear(); Notify.PeerLeft(PeerName); PeerName = ""; _snapAt = 0f;
+                _peers.Clear(); _peerNames.Clear(); Notify.PeerLeft(PeerName); PeerName = ""; _pendingSnaps.Clear();
                 ClearRealPoses();
                 Log.LogInfo("[p2p] loopback link down");
             }
 
             ReceiveLoopback();
             CoopNetSim.Pump(Time.unscaledTime, DispatchManaged);   // release any NetSim-delayed packets (test aid)
-            if (_snapAt > 0f && Time.unscaledTime >= _snapAt) { _snapAt = 0f; SendJoinSnapshot(); }
+            ProcessPendingSnaps(Time.unscaledTime);
             AgeRemotePoses(dt);
         }
 
@@ -286,7 +318,7 @@ namespace IronNestVR
             {
                 if (_peers.Count > 0) { Notify.PeerLeft(PeerName); ClearPeers(); PeerName = ""; Log.LogInfo("[p2p] not in lobby — peers cleared"); }
                 IsHost = false;
-                _snapAt = 0f;
+                _pendingSnaps.Clear();
                 ClearRealPoses();
                 return;
             }
@@ -316,8 +348,8 @@ namespace IronNestVR
                     _poses.Remove(m.m_SteamID);   // don't carry a stale avatar onto a (re)joining peer
                     Log.LogInfo($"[p2p] peer + {m.m_SteamID} ('{nm}')  (now {_peers.Count} peer(s))");
                     Notify.PeerJoined(nm, IsHost);
-                    // Host pushes a full-world snapshot to the joiner once the session settles.
-                    if (IsHost) { _snapTarget = m; _snapAt = Time.unscaledTime + Config.CoopSnapshotDelaySec; Log.LogInfo($"[p2p] host: join-in-progress snapshot scheduled in {Config.CoopSnapshotDelaySec:0.0}s"); }
+                    // Host pushes a full-world snapshot to the joiner once the session settles — one per joiner.
+                    if (IsHost) { ScheduleSnapshot(m, Time.unscaledTime); Log.LogInfo($"[p2p] host: join-in-progress snapshot scheduled in {Config.CoopSnapshotDelaySec:0.0}s"); }
                 }
 
                 // Removals: peers no longer in the roster.
@@ -329,11 +361,12 @@ namespace IronNestVR
                     _peers.RemoveAt(i);
                     _poses.Remove(gone.m_SteamID);
                     _peerNames.Remove(gone.m_SteamID);
+                    DropSnapshot(gone.m_SteamID);   // peer left before its pending snapshot fired — discard it
                     Log.LogInfo($"[p2p] peer - {gone.m_SteamID} left  (now {_peers.Count} peer(s))");
                     Notify.PeerLeft(PeerName);
                 }
 
-                if (_peers.Count == 0) { _snapAt = 0f; ClearRealPoses(); }
+                if (_peers.Count == 0) { _pendingSnaps.Clear(); ClearRealPoses(); }
             }
             catch (Exception e) { Log.LogWarning("[p2p] peer: " + e.Message); }
         }
@@ -359,10 +392,14 @@ namespace IronNestVR
             _snapActive = true;
             try
             {
+                // Scene/load command FIRST so the joiner starts traversing toward the host's phase. The cockpit-
+                // dependent snapshots below (controls/map/punchcards) can't apply until the joiner has loaded the
+                // mission scene, so they're ALSO re-sent on the joiner's MISSION_READY ack (CoopScene) — see
+                // REVIEW-fix P2: map/punchcard layout arriving before the joiner has the scene objects was dropped.
+                try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
                 try { CoopControls.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ctrl: " + e.Message); }
                 try { CoopClipboard.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot clip: " + e.Message); }
                 try { CoopMap.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot map: " + e.Message); }
-                try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
                 try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
                 try { CoopPunchcards.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot punch: " + e.Message); }
                 try { CoopScore.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot score: " + e.Message); }
@@ -465,7 +502,13 @@ namespace IronNestVR
         private static void RelayInner(ulong origin, int innerLen)
         {
             byte type = _recvArr[0];
-            bool reliable = !(type == MSG_POSE || CoopControls.IsUnreliableStream(type));
+            bool reliable;
+            if (type == MSG_POSE) reliable = false;
+            // Mixed live/final types carry their own reliability in a flag byte at payload index 9: relay the
+            // final/release edge reliably, the live stream unreliably (REVIEW-fix P1 — type-only classification
+            // downgraded the reliable final and a dropped final left the piece/dial stuck off on other clients).
+            else if (CoopControls.IsMixedFinalStream(type)) reliable = innerLen > 9 && (_recvArr[9] & 1) != 0;
+            else reliable = !CoopControls.IsUnreliableStream(type);
             for (int i = 0; i < _peers.Count; i++)
             {
                 if (_peers[i].m_SteamID == origin) continue;
@@ -604,6 +647,10 @@ namespace IronNestVR
             if (IsHost) { origin = hostSideOrigin; innerLen = read; }
             else
             {
+                // In the star topology only the host sends host→client packets (carrying the origin trailer). Drop
+                // anything from another lobby member so a buggy/malicious peer can't inject a host-formatted packet
+                // with a forged origin trailer (REVIEW-fix P3). Loopback/NetSim pass _hostId here, so they pass.
+                if (hostSideOrigin != _hostId.m_SteamID) return;
                 if (read < OriginTrailerLen) return;       // malformed — must carry the origin trailer
                 innerLen = read - OriginTrailerLen;
                 origin = GetU64(_recvArr, innerLen);

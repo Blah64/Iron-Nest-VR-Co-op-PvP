@@ -174,10 +174,15 @@ namespace IronNestVR
                 case MSG_MISSION_READY:
                 {
                     if (!CoopP2P.IsHost) return;   // only the host answers a joiner's readiness
-                    Log.LogInfo($"[scene] MISSION_READY <- {origin} — re-sending entity snapshot to that peer");
-                    // Target the resync to the joiner that asked — don't re-burst the entity snapshot onto every
-                    // existing client each time someone reports ready (REVIEW-fix P2a).
-                    try { CoopP2P.SendSnapshotTo(origin, () => CoopEntities.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->snapshot: " + e.Message); }
+                    Log.LogInfo($"[scene] MISSION_READY <- {origin} — re-sending world snapshot to that peer");
+                    // Target the resync to the joiner that asked — don't re-burst it onto every existing client each
+                    // time someone reports ready (REVIEW-fix P2a). The joiner is now in the mission cockpit, so the
+                    // map table + requisition console objects finally exist: re-send the map and punchcard layout
+                    // here too. The original join snapshot sent them before the joiner had loaded the scene, so they
+                    // were dropped and never re-sent (REVIEW-fix P2 — late-join map/punchcard sequencing).
+                    try { CoopP2P.SendSnapshotTo(origin, () => CoopEntities.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->entities: " + e.Message); }
+                    try { CoopP2P.SendSnapshotTo(origin, () => CoopMap.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->map: " + e.Message); }
+                    try { CoopP2P.SendSnapshotTo(origin, () => CoopPunchcards.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->punch: " + e.Message); }
                     break;
                 }
             }
