@@ -77,6 +77,21 @@ namespace IronNestVR
         private readonly Dictionary<int, Camera> _origTeleCam = new Dictionary<int, Camera>();
         private int _teleCount = -1;
 
+        // Base-game SETTINGS panel (Kamgam SettingsGenerator uGUI — the game's one conventional UI canvas; the rest
+        // of the cockpit is physical Interactables driven by the cursor manager's physics raycast). It's driven by
+        // the EventSystem's VirtualCursorInputModule instead — the virtual cursor's SCREEN position raycast through
+        // the canvas's event camera — and out of the box that camera is the flat Main Camera AND the module doesn't
+        // process UI in FPSLocked, so our centre-pinned cursor never reaches it. While the panel is OPEN we repoint
+        // its canvas(es) down our pointer cam (input projection only — world-space canvas rendering is unaffected)
+        // and force UI-in-FPSLocked on; restored the moment it closes. Captured per instance id like the map/teleprinter.
+        private readonly Dictionary<int, Canvas> _menuCanvases = new Dictionary<int, Canvas>();
+        private readonly Dictionary<int, Camera> _origMenuCanvasCam = new Dictionary<int, Camera>();
+        private readonly Dictionary<int, VirtualCursorInputModule> _menuModules = new Dictionary<int, VirtualCursorInputModule>();
+        private readonly Dictionary<int, bool> _origModuleUiFps = new Dictionary<int, bool>();
+        private readonly Dictionary<int, bool> _origModuleBlockWorld = new Dictionary<int, bool>();
+        private bool _settingsOpen;
+        private VirtualCursorInputModule _uiModule;   // cached while the panel is open: lets the laser colour green over a clickable row (_isOverInteractableUI)
+
         /// <param name="active">true only when the session is focused and input is ready.</param>
         /// <param name="suppressClick">true while the VR settings menu owns the trigger: keep the
         /// laser/hover alive but don't synthesize clicks/keys into the game.</param>
@@ -132,6 +147,7 @@ namespace IronNestVR
                     RepointInteractionCameras(activeCam);
                     RepointMapCameras(activeCam);
                     RepointTeleprinters(activeCam);
+                    RepointSettingsMenu(activeCam);
                 }
 
                 // Menus flip the cursor manager to FreeMouse (cursor follows the OS mouse, off-centre),
@@ -223,6 +239,7 @@ namespace IronNestVR
             RepointInteractionCameras(_cam);
             RepointMapCameras(_cam);
             RepointTeleprinters(_cam);
+            RepointSettingsMenu(_cam);
             _engaged = true;
             Log.LogInfo($"[interact] ENGAGED (origCam={(_origCam != null ? _origCam.name : "null")}, origMode={_origMode}).");
         }
@@ -367,6 +384,173 @@ namespace IronNestVR
             _teleprinters.Clear(); _origTeleCam.Clear(); _teleCount = -1;
         }
 
+        // While the base-game settings panel is open, make our laser + trigger operate it. It's a Kamgam uGUI
+        // canvas driven by the EventSystem's VirtualCursorInputModule (the virtual cursor's SCREEN position raycast
+        // through the canvas's event camera) — NOT the physics-Interactable path the rest of the cockpit uses (the
+        // game's "menus", e.g. mission-select cards, are physical Interactables our raycastCamera repoint already
+        // handles; the settings panel is the lone conventional UI surface). Out of the box its event camera is the
+        // flat Main Camera and the module doesn't process UI while we hold FPSLocked, so our centre-pinned cursor
+        // can't reach it. Fix (only while open, scoped to the Kamgam canvas so mission-select / HUD canvases are
+        // never touched — re-aiming THOSE is the known break): repoint the settings canvas's worldCamera down our
+        // pointer cam (centre then projects along the controller, exactly like RepointMapCameras), turn UI-in-
+        // FPSLocked on, and block the world raycast while over UI (so a clicked row doesn't also fire a cockpit
+        // control behind it). The existing centre-pin + trigger->mouse-click then drive it. Restored when it closes.
+        private void RepointSettingsMenu(Camera cam)
+        {
+            if (!Config.SettingsMenuVrEnabled) { if (_settingsOpen) RestoreSettingsMenu(); return; }
+
+            bool open = false;
+            try
+            {
+                // Find the panel via its Kamgam settings widgets (SelectionUGUI wraps every selectable; the widget
+                // types hedge against a customized prefab that drops the wrapper). FindObjectsByType excludes
+                // inactive GameObjects, so this is false whenever the panel is closed (its root is SetActive(false)).
+                CollectMenuCanvases(Il2CppType.Of<Kamgam.UGUIComponentsForSettings.SelectionUGUI>(), cam, ref open);
+                CollectMenuCanvases(Il2CppType.Of<Kamgam.UGUIComponentsForSettings.TabButtonUGUI>(), cam, ref open);
+                CollectMenuCanvases(Il2CppType.Of<Kamgam.UGUIComponentsForSettings.SliderUGUI>(), cam, ref open);
+                CollectMenuCanvases(Il2CppType.Of<Kamgam.UGUIComponentsForSettings.ToggleUGUI>(), cam, ref open);
+            }
+            catch (Exception e) { Log.LogWarning("[settings] scan: " + e.Message); }
+
+            if (open)
+            {
+                // Let the cursor module process UI while we hold FPSLocked + centre (the game disables UI in
+                // FPSLocked so gameplay clicks reach cockpit controls), and stop the physics cursor from also
+                // firing a control behind a clicked row. Captured per module id, restored on close.
+                try
+                {
+                    var mods = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<VirtualCursorInputModule>(), FindObjectsSortMode.None);
+                    if (mods != null)
+                        for (int i = 0; i < mods.Length; i++)
+                        {
+                            var m = mods[i].TryCast<VirtualCursorInputModule>();
+                            if (m == null) continue;
+                            int id = m.GetInstanceID();
+                            _menuModules[id] = m;
+                            if (!_origModuleUiFps.ContainsKey(id)) _origModuleUiFps[id] = m.enableUIInFPSLockedMode;
+                            if (!m.enableUIInFPSLockedMode) m.enableUIInFPSLockedMode = true;
+                            if (!_origModuleBlockWorld.ContainsKey(id)) _origModuleBlockWorld[id] = m.blockWorldRaycastsWhenOverUI;
+                            if (!m.blockWorldRaycastsWhenOverUI) m.blockWorldRaycastsWhenOverUI = true;
+                            _uiModule = m;   // cache for the laser's over-UI green check
+                        }
+                }
+                catch (Exception e) { Log.LogWarning("[settings] module: " + e.Message); }
+
+                // Keep the virtual cursor centred (so screen-centre through the repointed canvas cam == the laser);
+                // MenuForceCenter also re-asserts FPSLocked each frame.
+                if (_mgr != null) { try { PinCursor(_mgr.virtualCursor); } catch { } }
+            }
+
+            if (open != _settingsOpen)
+            {
+                if (open) LogSettingsOpen();
+                else RestoreSettingsMenu();
+                _settingsOpen = open;
+            }
+        }
+
+        // Find every Kamgam settings widget of type <paramref name="t"/> and repoint its enclosing + root canvas
+        // (world-space only) down our pointer cam. Sets <paramref name="open"/> true if any active widget exists.
+        private void CollectMenuCanvases(Il2CppSystem.Type t, Camera cam, ref bool open)
+        {
+            var arr = UnityEngine.Object.FindObjectsByType(t, FindObjectsSortMode.None);
+            if (arr == null) return;
+            for (int i = 0; i < arr.Length; i++)
+            {
+                var comp = arr[i].TryCast<MonoBehaviour>();
+                if (comp == null) continue;
+                open = true;
+                // Repoint the nearest enclosing canvas AND its root canvas (the root is where the GraphicRaycaster
+                // lives; a nested canvas may carry its own). Both are deduped by instance id in RepointMenuCanvas.
+                var c = FindUp<Canvas>(comp.transform);
+                if (c != null)
+                {
+                    RepointMenuCanvas(c, cam);
+                    try { var rc = c.rootCanvas; if (rc != null && rc != c) RepointMenuCanvas(rc, cam); } catch { }
+                }
+            }
+        }
+
+        // Repoint a settings canvas's event camera, world-space only — there worldCamera affects input projection,
+        // not rendering, so the panel stays visible. (A Screen-Space-Camera canvas renders THROUGH worldCamera, so
+        // reassigning it would blank it — the renderMode guard keeps us off those, same rule as RepointCanvas.)
+        private void RepointMenuCanvas(Canvas c, Camera cam)
+        {
+            if (c == null || c.renderMode != RenderMode.WorldSpace) return;
+            int id = c.GetInstanceID();
+            if (!_origMenuCanvasCam.ContainsKey(id)) _origMenuCanvasCam[id] = c.worldCamera;
+            _menuCanvases[id] = c;
+            if (c.worldCamera != cam) c.worldCamera = cam;
+        }
+
+        // Restore the settings canvas event cameras + the input-module flags we overrode, then forget them. Stale
+        // refs from a destroyed scene throw on access and are skipped.
+        private void RestoreSettingsMenu()
+        {
+            foreach (var kv in _menuCanvases)
+            {
+                var c = kv.Value;
+                if (c == null) continue;
+                try { if (_origMenuCanvasCam.TryGetValue(kv.Key, out var cam)) c.worldCamera = cam; } catch { }
+            }
+            foreach (var kv in _menuModules)
+            {
+                var m = kv.Value;
+                if (m == null) continue;
+                try { if (_origModuleUiFps.TryGetValue(kv.Key, out var b)) m.enableUIInFPSLockedMode = b; } catch { }
+                try { if (_origModuleBlockWorld.TryGetValue(kv.Key, out var b2)) m.blockWorldRaycastsWhenOverUI = b2; } catch { }
+            }
+            _menuCanvases.Clear(); _origMenuCanvasCam.Clear();
+            _menuModules.Clear(); _origModuleUiFps.Clear(); _origModuleBlockWorld.Clear();
+            _settingsOpen = false;
+            _uiModule = null;
+        }
+
+        // Intersect an aim ray with the open settings panel's canvas plane(s), bounded by each canvas RectTransform's
+        // rect (the panel has no physics collider — uGUI uses a GraphicRaycaster — so Physics.Raycast can't land the
+        // laser on it). Returns the nearest in-front, in-bounds hit so the laser visibly ends on the panel.
+        private bool TrySettingsLaserHit(Vector3 origin, Vector3 dir, out float dist)
+        {
+            dist = 0f; bool any = false; float best = float.MaxValue;
+            foreach (var kv in _menuCanvases)
+            {
+                var c = kv.Value;
+                if (c == null) continue;
+                RectTransform rt = null;
+                try { rt = c.transform.TryCast<RectTransform>(); } catch { }
+                if (rt == null) continue;
+                Vector3 n = rt.forward;
+                float denom = Vector3.Dot(dir, n);
+                if (Mathf.Abs(denom) < 1e-6f) continue;                // ray parallel to the panel
+                float t = Vector3.Dot(rt.position - origin, n) / denom;
+                if (t <= 0f || t >= best) continue;                    // behind us, or farther than a closer panel
+                Vector3 local = rt.InverseTransformPoint(origin + dir * t);
+                Rect r = rt.rect;
+                if (local.x < r.xMin || local.x > r.xMax || local.y < r.yMin || local.y > r.yMax) continue;
+                best = t; any = true;
+            }
+            if (any) dist = best;
+            return any;
+        }
+
+        // True while the panel is open AND the laser is over a clickable settings row (the module tracks this from
+        // the centre-pinned cursor, which == the controller forward via our repoint). Drives the green laser cue —
+        // CurrentHover stays null over pure uGUI, so without this the laser would never go green on the settings UI.
+        private bool OverSettingsUI()
+        {
+            if (!_settingsOpen || _uiModule == null) return false;
+            try { return _uiModule._isOverInteractableUI; } catch { return false; }
+        }
+
+        // One concise breadcrumb when the panel becomes laser-operable (mirrors the [map]/[teleprinter] repoint
+        // lines). Silent in the public build per the gate-diagnostics rule.
+        private void LogSettingsOpen()
+        {
+#if !PUBLIC_BUILD
+            Log.LogInfo($"[settings] VR settings panel — repointed {_menuCanvases.Count} canvas(es) to controller cam, {_menuModules.Count} input module(s) UI-in-FPSLocked.");
+#endif
+        }
+
         // Only world-space canvases are safe to re-aim: their event camera affects input projection, not
         // rendering. (Screen-space-camera canvases — e.g. the menus — render THROUGH worldCamera, so
         // reassigning it there breaks them; the renderMode guard keeps us off those.)
@@ -491,6 +675,7 @@ namespace IronNestVR
                 EndAllInput();
                 RestoreMapCameras();
                 RestoreTeleprinters();
+                RestoreSettingsMenu();
                 var restoreCam = _origCam != null ? _origCam : Camera.main;
                 if (_mgr != null)
                 {
@@ -606,16 +791,20 @@ namespace IronNestVR
             float len = Config.LaserMaxDistance;
             if (Physics.Raycast(origin, dir, out RaycastHit hit, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Ignore))
                 len = hit.distance;
+            // The base-game settings panel has no physics collider; land the laser on its canvas plane so it reads
+            // as a real pointer (nearest of the panel hit vs. any solid behind it).
+            if (_settingsOpen && TrySettingsLaserHit(origin, dir, out float sd) && sd < len) len = sd;
             _laser.SetPosition(0, origin);
             _laser.SetPosition(1, origin + dir * len);
 
             bool hovering = false;
             if (activeCursor) { try { hovering = _mgr.CurrentHover != null; } catch { } }
+            if (!hovering && activeCursor) hovering = OverSettingsUI();   // green over a clickable settings row (uGUI hover, not physics)
             if (hovering != _hoverColor) { _hoverColor = hovering; ApplyLaserColor(hovering); }
-            // Always-on draws it constantly; force-on while the VR menu is open; otherwise only when
-            // aimed at an interactable (CurrentHover). But hide it whenever the RIGHT hand is busy grip-
-            // holding something (clipboard/manual/dial/lever/switch) — a laser from a full hand is just noise.
-            ShowLaser(!HandGripping(2) && (Config.LaserAlwaysOn || hovering || _forceLaser));
+            // Always-on draws it constantly; force-on while a VR menu OR the base-game settings panel is open;
+            // otherwise only when aimed at an interactable (CurrentHover). But hide it whenever the RIGHT hand is
+            // busy grip-holding something (clipboard/manual/dial/lever/switch) — a laser from a full hand is noise.
+            ShowLaser(!HandGripping(2) && (Config.LaserAlwaysOn || hovering || _forceLaser || _settingsOpen));
         }
 
         // True when the given hand (1 left, 2 right) is currently grip-holding a prop (GrabManager) or
@@ -689,8 +878,10 @@ namespace IronNestVR
                 len = Config.LaserMaxDistance;
                 if (Physics.Raycast(origin, dir, out RaycastHit hit, Config.LaserMaxDistance, ~0, QueryTriggerInteraction.Ignore))
                     len = hit.distance;
+                if (_settingsOpen && TrySettingsLaserHit(origin, dir, out float sd) && sd < len) len = sd;
                 hovering = false;
                 try { hovering = _mgr != null && _mgr.CurrentHover != null; } catch { }
+                if (!hovering) hovering = OverSettingsUI();   // green over a clickable settings row
             }
             else
             {

@@ -81,6 +81,9 @@
     <Reference Include="UnityEngine.UIModule"><HintPath>$(InteropDir)\UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.TextCoreTextEngineModule"><HintPath>$(InteropDir)\UnityEngine.TextCoreTextEngineModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.TextCoreFontEngineModule"><HintPath>$(InteropDir)\UnityEngine.TextCoreFontEngineModule.dll</HintPath><Private>false</Private></Reference>
+    <!-- Kamgam SettingsGenerator UGUI widgets — used to identify the base-game settings panel's canvas so the
+         VR laser/trigger can operate it (the game's one conventional uGUI surface; rest is physical Interactables). -->
+    <Reference Include="Kamgam.UGUIComponentsForSettings"><HintPath>$(InteropDir)\Kamgam.UGUIComponentsForSettings.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 
 </Project>

@@ -697,6 +697,18 @@ namespace IronNestVR
         // game's flat cameras alone.
         public static bool MapVrEnabled = true;
 
+        // --- Base-game settings / options panel ---
+        // The game's settings panel is the one conventional uGUI surface (Kamgam SettingsGenerator); every other
+        // "menu" in the cockpit is a physical Interactable our cursor manager already drives. The panel is driven
+        // by the EventSystem's VirtualCursorInputModule (the virtual cursor's SCREEN position raycast through the
+        // canvas's event camera), and out of the box its event camera is the flat Main Camera AND the module
+        // doesn't process UI while we hold FPSLocked — so with our centre-pinned cursor the laser can't reach it.
+        // When on, while the panel is OPEN we repoint its canvas's event camera down our pointer cam (centre then
+        // projects along the controller, exactly like the tactical-map canvas) and turn UI-in-FPSLocked on, so the
+        // existing centre-pin + trigger->click drive it; everything is restored the moment the panel closes. Scoped
+        // to the Kamgam canvas only, so mission-select / HUD canvases are never touched. Off = leave it desktop-only.
+        public static bool SettingsMenuVrEnabled = true;
+
         // On-demand map-tools palette: pop the pencil colours + compass (and raise the HUD clipboard) WITHOUT the
         // focus-camera move. Trigger = A (right) / X (left) while that hand holds the HUD clipboard. See MapTools.
         public static bool MapToolsOnDemand = true;
