@@ -56,6 +56,7 @@ namespace IronNestVR
         private const byte MSG_SNAP = 13;    // [t][9×f32]                   reliable   join-in-progress turret/gun state
         private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
         private const byte MSG_POWDER = 39;  // [t][side u8][charges i32]    reliable   per-gun powder/charge state, EITHER→peer (symmetric, last-writer-wins)
+        private const byte MSG_AIM = 41;     // [t][desRot f32][turretElev f32][gunLElev f32][gunRElev f32]  reliable  EITHER→peer, symmetric firing-solution edge-replicate (40=entities ENTSET). The FDC graph resolves the aim with NO drag, so it never rides the drag-owned MSG_GROUP stream → the peer kept its stale default and missed.
 
         // How long remote ownership / streamed state survives without a refresh. The stream runs at
         // CoopSendHz (~30/s), so 2s easily rides minor packet loss but recovers fast if the peer vanishes
@@ -117,6 +118,19 @@ namespace IronNestVR
         private static bool _powderAuthoredL, _powderAuthoredR;
         private static float _nextPowderBeat;
         private const float PowderHeartbeatSec = 2f;
+        // Aim / firing-solution edge-replication (mirrors the powder pattern above). The bearing+elevation is often
+        // resolved INDIRECTLY — the fire-direction-center punchcard graph slews the turret on submit, with NO drag
+        // on a group-mapped control — so MSG_GROUP (which only streams while a drag OWNS the group) never carries it
+        // and the peer keeps its stale default aim → its replayed shot misses (the "both consoles read the same
+        // bearing but the shells land differently" desync). So, like powder, we edge-replicate the RESOLVED values
+        // whenever they change, however produced. NaN = "no baseline yet" (seed silently; join-time aim rides the
+        // JIP MSG_SNAP). Echo-suppressed via _echoUntil[AimKey]; adopt-clears-authorship so the two never flap.
+        private static float _aimPrevRot = float.NaN, _aimPrevElev = float.NaN, _aimPrevElevL = float.NaN, _aimPrevElevR = float.NaN;
+        private static bool _aimAuthored;
+        private static float _nextAimBeat;
+        private const float AimHeartbeatSec = 2f;
+        private const float AimEps = 0.05f;   // deg threshold: ignore sub-tenth jitter so we don't spam the stream
+        private static readonly int AimKey = Fnv("__coop_aim__");
 
         // Join-in-progress snapshot received before the turret/guns resolved locally (scene still loading on the
         // joiner). Held here and applied once the registry is ready — see Tick / ApplySnapshot.
@@ -227,6 +241,7 @@ namespace IronNestVR
 
                 DetectFire(now);
                 DetectPowder(now);
+                DetectAim(now);
 
                 // REVIEW-fix (P3): host broadcasts a low-rate CURRENT-state reconcile so the client can correct any
                 // accumulated CurrentAngle/elevation drift (framerate-dependent slew, a missed reliable packet).
@@ -331,6 +346,57 @@ namespace IronNestVR
                 Log.LogInfo($"[ctrl] powder gun {side} -> peer ({cur})");
             }
             return cur;
+        }
+
+        // ---------------- aim / firing-solution (symmetric, value-edge) ----------------
+
+        // Edge-replicate the RESOLVED turret aim so it converges however it was produced. The fire-direction-center
+        // punchcard graph slews the turret on submit with NO drag on a group-mapped control, so the drag-owned
+        // MSG_GROUP stream never carries it and the peer keeps its stale default (its replayed shot then misses).
+        // Mirrors DetectPowder: send on change, re-assert what WE authored on a low-rate heartbeat (self-heals a lost
+        // reliable packet), adopt-clears-authorship so the two never flap. Skipped while WE actively drag an aim
+        // group — the live MSG_GROUP stream already carries that and our input must win.
+        private static void DetectAim(float now)
+        {
+            if (!Config.CoopControlSync || _turret == null) return;
+            if (LocallyOwnsGroup(Group.Rotation) || LocallyOwnsGroup(Group.Elevation)) return;
+
+            float rot, elev, eL = 0f, eR = 0f;
+            try { rot = _turret.DesiredRotation; elev = _turret.DesiredElevation; } catch { return; }
+            try { if (_gunL != null) eL = _gunL.DesiredElevationAngle; } catch { }
+            try { if (_gunR != null) eR = _gunR.DesiredElevationAngle; } catch { }
+            if (!CoopWire.Finite(rot) || !CoopWire.Finite(elev) || !CoopWire.Finite(eL) || !CoopWire.Finite(eR)) return;
+
+            bool suppressed = _echoUntil.TryGetValue(AimKey, out var u) && now < u;
+            bool seeded = !float.IsNaN(_aimPrevRot);
+            // DeltaAngle for the wrap-around bearing; plain diff for the (bounded) elevations.
+            bool changed = seeded && (Mathf.Abs(Mathf.DeltaAngle(rot, _aimPrevRot)) > AimEps
+                                      || Mathf.Abs(elev - _aimPrevElev) > AimEps
+                                      || Mathf.Abs(eL - _aimPrevElevL) > AimEps
+                                      || Mathf.Abs(eR - _aimPrevElevR) > AimEps);
+            if (changed && !suppressed)
+            {
+                SendAim(rot, elev, eL, eR);
+                _aimAuthored = true;   // a local aim change → we own re-asserting it until we adopt the peer's
+                Log.LogInfo($"[ctrl] aim -> peer rot={rot:0.0} elev={elev:0.0} gunL={eL:0.0} gunR={eR:0.0}");
+            }
+            _aimPrevRot = rot; _aimPrevElev = elev; _aimPrevElevL = eL; _aimPrevElevR = eR;
+
+            // Heartbeat self-heal: re-assert the aim WE authored at a low rate so a value lost in a link-drop blackout
+            // re-converges (the peer adopts it idempotently; its diff-guard makes a matching value a silent no-op).
+            if (now >= _nextAimBeat)
+            {
+                _nextAimBeat = now + AimHeartbeatSec;
+                if (_aimAuthored) { try { SendAim(rot, elev, eL, eR); } catch { } }
+            }
+        }
+
+        private static void SendAim(float rot, float elev, float elevL, float elevR)
+        {
+            if (!EnsureBuf()) return;
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_AIM); w.Float(rot); w.Float(elev); w.Float(elevL); w.Float(elevR);
+            CoopP2P.Send(_buf, w.Length, true);   // reliable: a discrete firing-solution change, must not be lost
         }
 
         // ---------------- after the game's Update: apply remote visuals + snap turret state ----------------
@@ -616,6 +682,7 @@ namespace IronNestVR
                 case MSG_CLICK:
                 case MSG_FIRE:
                 case MSG_POWDER:
+                case MSG_AIM:
                     return true;   // cockpit controls — either crew member operates them
             }
             return type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL
@@ -795,6 +862,39 @@ namespace IronNestVR
                         _echoUntil[side == 0 ? PowderKeyL : PowderKeyR] = now + 0.3f;
                         Log.LogInfo($"[ctrl] applied remote powder gun {side} <- peer ({charges})");
                     }
+                    break;
+                }
+                case MSG_AIM:
+                {
+                    if (len < 1 + 4 * 4) return;   // t + 4 floats
+                    float rot = r.Float(), elev = r.Float(), eL = r.Float(), eR = r.Float();
+                    if (r.Bad || !CoopWire.Finite(rot) || !CoopWire.Finite(elev) || !CoopWire.Finite(eL) || !CoopWire.Finite(eR)) return;
+                    if (_turret == null) break;
+                    if (LocallyOwnsGroup(Group.Rotation) || LocallyOwnsGroup(Group.Elevation)) break;   // our live drag wins
+                    // Adopt the peer's resolved firing solution through the SAME path the drag stream uses:
+                    // OverrideGunDrive so the controller stops re-deriving elevation from our PARKED dial, and the gun
+                    // elevation MUST go through SetDesiredElevation (the DesiredElevationAngle property alone is an
+                    // inert reported field — see ApplyGroupValues). Skip a no-op heartbeat so we don't churn/log @2s.
+                    bool diff = Mathf.Abs(Mathf.DeltaAngle(rot, _turret.DesiredRotation)) > AimEps
+                             || Mathf.Abs(elev - _turret.DesiredElevation) > AimEps
+                             || (_gunL != null && Mathf.Abs(eL - _gunL.DesiredElevationAngle) > AimEps)
+                             || (_gunR != null && Mathf.Abs(eR - _gunR.DesiredElevationAngle) > AimEps);
+                    if (diff)
+                    {
+                        try
+                        {
+                            _turret.DesiredRotation = rot;
+                            OverrideGunDrive();
+                            _turret.DesiredElevation = elev;
+                            if (_gunL != null) _gunL.SetDesiredElevation(eL);
+                            if (_gunR != null) _gunR.SetDesiredElevation(eR);
+                        }
+                        catch (Exception e) { Log.LogWarning("[ctrl] apply aim: " + e.Message); }
+                        Log.LogInfo($"[ctrl] applied remote aim rot={rot:0.0} elev={elev:0.0} gunL={eL:0.0} gunR={eR:0.0} <- peer");
+                    }
+                    _aimPrevRot = rot; _aimPrevElev = elev; _aimPrevElevL = eL; _aimPrevElevR = eR;
+                    _aimAuthored = false;   // adopting the peer's value yields authorship — they re-assert, not us
+                    _echoUntil[AimKey] = now + 0.3f;
                     break;
                 }
                 case MSG_SNAP:
@@ -1219,6 +1319,8 @@ namespace IronNestVR
             _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
             _powderPrevL = int.MinValue; _powderPrevR = int.MinValue;   // re-seed powder baseline on next connect
             _powderAuthoredL = false; _powderAuthoredR = false; _nextPowderBeat = 0f;
+            _aimPrevRot = float.NaN; _aimPrevElev = float.NaN; _aimPrevElevL = float.NaN; _aimPrevElevR = float.NaN;
+            _aimAuthored = false; _nextAimBeat = 0f;
             RestoreGunDrive();   // hand gun-elevation control back to the local turret controller on link-down
         }
 
