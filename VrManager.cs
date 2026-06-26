@@ -44,6 +44,7 @@ namespace IronNestVR
         private float _loopDiagNext;   // same-machine loopback test: per-second focus/runInBackground/timeScale log
         private float _focusedSince = -1f; // unscaledTime the session last became focused (LowSpec settle window)
         private float _lowSpecSlowAccum;   // continuous seconds spent below LowSpecFpsTrigger while focused
+        private int _savedQualityLevel = -1; // game QualitySettings level LowSpec lowered (-1 = untouched, restore in TeardownVr)
 
         // Phase 1 scene probe (still handy).
         private float _nextScan;
@@ -228,7 +229,14 @@ namespace IronNestVR
         // can't latch it — we judge in-game framerate only.
         private void AutoLowSpecTick()
         {
-            if (Config.EyeLowSpec || Config.EyeLowSpecExplicit || !Config.EyeLowSpecAuto) return;
+            // Already on (pinned via cfg, or latched earlier this session): once focused, make sure the global
+            // game-quality drop is applied too (the per-eye trim is handled at camera creation), then we're done.
+            if (Config.EyeLowSpec)
+            {
+                if (_savedQualityLevel < 0 && _xr != null && _xr.IsFocused) ApplyLowSpecQuality();
+                return;
+            }
+            if (Config.EyeLowSpecExplicit || !Config.EyeLowSpecAuto) return;
             bool focused = _xr != null && _xr.IsFocused && _rig != null && _rig.Ready;
             if (!focused) { _focusedSince = -1f; _lowSpecSlowAccum = 0f; return; }
 
@@ -245,9 +253,50 @@ namespace IronNestVR
             {
                 Config.EyeLowSpec = true;
                 try { _rig.ApplyEyeQuality(); } catch (Exception e) { Log.LogWarning("[perf] LowSpec apply failed: " + e.Message); }
+                ApplyLowSpecQuality();
                 Log.LogInfo($"[perf] LowSpec AUTO-ENABLED — sustained <{Config.LowSpecFpsTrigger:0} fps for {Config.LowSpecSustainSec:0}s. " +
-                            "Eye shadows/post/MSAA off (flatscreen untouched). Set EyeLowSpec=false in IronNestVR.cfg to keep full quality.");
+                            "Eye shadows/post/MSAA off + game quality lowered (flatscreen untouched). Set EyeLowSpec=false in IronNestVR.cfg to keep full quality.");
             }
+        }
+
+        // Force the GAME'S OWN graphics quality level down (QualitySettings) while LowSpec is active — the
+        // tester-proven "lower the game settings first" workaround, automated. Broader than the per-eye trim:
+        // it cuts pixel-light count / LOD bias / texture resolution / shadow cascades the eye cameras inherit
+        // globally (the per-eye shadow toggle alone didn't move the tester's render bucket). Global, so the
+        // prior level is saved here and restored in TeardownVr (covers the VR→flatscreen fallback). Index 0 =
+        // Unity's conventional lowest ("Very Low"); names are logged so it's verifiable + cfg-tunable
+        // (Config.LowSpecQualityLevel) if the game orders its levels unusually. Idempotent (guards on saved).
+        private void ApplyLowSpecQuality()
+        {
+            if (!Config.LowSpecForceQualityLevel || _savedQualityLevel >= 0) return;
+            try
+            {
+                var names = QualitySettings.names;
+                int count = names != null ? names.Length : 0;
+                int target = Config.LowSpecQualityLevel;
+                if (target < 0 || target >= count) target = 0;
+                int cur = QualitySettings.GetQualityLevel();
+                if (count <= 1 || target >= cur)
+                {
+                    Log.LogInfo($"[perf] LowSpec: game quality NOT lowered (cur idx {cur}, {count} level(s), target idx {target} — already at/below).");
+                    return;
+                }
+                string list = "";
+                for (int i = 0; i < count; i++) list += (i > 0 ? ", " : "") + names[i];
+                _savedQualityLevel = cur;
+                QualitySettings.SetQualityLevel(target, true);   // applyExpensiveChanges=true so texture/LOD/shadow drops actually take effect
+                Log.LogInfo($"[perf] LowSpec: game quality '{names[cur]}'(idx {cur}) -> '{names[target]}'(idx {target}); levels=[{list}]; restored on VR exit.");
+            }
+            catch (Exception e) { Log.LogWarning("[perf] LowSpec quality apply failed: " + e.Message); _savedQualityLevel = -1; }
+        }
+
+        // Put the game's graphics quality back to whatever it was before LowSpec lowered it. No-op if untouched.
+        private void RestoreQuality()
+        {
+            if (_savedQualityLevel < 0) return;
+            try { QualitySettings.SetQualityLevel(_savedQualityLevel, true); Log.LogInfo($"[perf] restored game quality level to idx {_savedQualityLevel}."); }
+            catch (Exception e) { Log.LogWarning("[perf] quality restore failed: " + e.Message); }
+            _savedQualityLevel = -1;
         }
 
         private bool _mirrorBlanked;
@@ -667,6 +716,7 @@ namespace IronNestVR
         private void TeardownVr()
         {
             _xrReady = false;
+            RestoreQuality();   // put the game's graphics quality back if LowSpec lowered it (also covers VR→flatscreen)
             try { _interactor?.Dispose(); } catch { }
             _interactor = null;
             _locomotion?.Reset();

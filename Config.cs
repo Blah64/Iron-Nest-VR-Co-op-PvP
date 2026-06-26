@@ -367,6 +367,15 @@ namespace IronNestVR
         public static float LowSpecFpsTrigger = 35f;   // below this average fps ⇒ struggling for VR
         public static float LowSpecSustainSec = 6f;    // must stay slow this long (continuous) before latching
         public static float LowSpecGraceSec = 8f;      // ignore the first seconds after focus (scene load)
+        // When LowSpec engages, also force the GAME'S OWN graphics quality level down (QualitySettings) — the
+        // tester-proven "lower settings in flatscreen first" workaround, automated. Broader than the per-eye
+        // trim: it cuts pixel-light count / LOD bias / texture resolution / shadow cascades that the eye cameras
+        // inherit globally (the per-eye shadow toggle alone did NOT move the tester's render bucket). Saved +
+        // restored on VR exit (covers the VR→flatscreen fallback). LowSpecQualityLevel = target index (0 =
+        // Unity's conventional lowest "Very Low"); applied + available level names are logged so it's verifiable
+        // and cfg-tunable if a game orders its levels oddly. VR-only ⇒ flatscreen parity intact.
+        public static bool LowSpecForceQualityLevel = true;
+        public static int LowSpecQualityLevel = 0;
 
         // Crash-proof per-frame heartbeat breadcrumb (Dbg.Beat) — leaves the last frame-loop phases on disk so
         // a DELAYED native crash can be pinpointed. DIAGNOSTIC/tester builds default it ON (the whole reason
@@ -949,6 +958,8 @@ namespace IronNestVR
                 case "LowSpecFpsTrigger": LowSpecFpsTrigger = PF(v, LowSpecFpsTrigger); break;
                 case "LowSpecSustainSec": LowSpecSustainSec = PF(v, LowSpecSustainSec); break;
                 case "LowSpecGraceSec": LowSpecGraceSec = PF(v, LowSpecGraceSec); break;
+                case "LowSpecForceQualityLevel": LowSpecForceQualityLevel = PB(v, LowSpecForceQualityLevel); break;
+                case "LowSpecQualityLevel": LowSpecQualityLevel = PI(v, LowSpecQualityLevel); break;
                 case "CrashHeartbeat": CrashHeartbeat = PB(v, CrashHeartbeat); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
