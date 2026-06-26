@@ -21,6 +21,9 @@ namespace IronNestVR
 
         private GameObject _origin;
         private readonly Camera[] _cam = new Camera[2];
+        // Per-eye URP camera data — the hook for the LowSpec quality profile (shadows/post/MSAA off per eye,
+        // so the flatscreen Main Camera is untouched). Captured at creation in EnsureCameras.
+        private readonly UniversalAdditionalCameraData[] _camData = new UniversalAdditionalCameraData[2];
         private readonly RenderTexture[] _rt = new RenderTexture[2];
         // One flip buffer PER EYE. A single shared buffer is NOT safe here: Graphics.Blit is deferred into
         // Unity's render phase while the raw CopyResource runs immediately on the D3D11 immediate context, so
@@ -171,13 +174,48 @@ namespace IronNestVR
                     c.backgroundColor = i == 0 ? new Color(0.10f, 0.10f, 0.45f) : new Color(0.10f, 0.45f, 0.10f);
                 }
                 _cam[i] = c;
+                Dbg.Step($"eye{i}: UniversalAdditionalCameraData");
+                var ucd = c.GetComponent<UniversalAdditionalCameraData>();
+                if (ucd == null) ucd = c.gameObject.AddComponent<UniversalAdditionalCameraData>();
+                _camData[i] = ucd;
                 Dbg.Step($"eye{i}: DONE");
             }
 
             if (Config.UseEnabledCameras) _useEnabledFallback = true;
+            ApplyEyeQuality(); // push the current LowSpec (or full) per-eye URP quality profile onto both eyes
             Log.LogInfo($"Eye cameras created ({w}x{h}, {fmt}). Mode={(Config.UseEnabledCameras ? "enabled-cameras" : "render-request")}.");
             _ready = true;
             return true;
+        }
+
+        /// <summary>
+        /// Push the current <see cref="Config.EyeLowSpec"/> quality profile onto BOTH eye cameras' URP
+        /// per-camera settings. LowSpec ON ⇒ real-time shadows / post / MSAA off — the heaviest per-eye draw
+        /// work, paid TWICE per frame on a single thread (gfx-direct), so the biggest CPU-draw relief on a
+        /// weak system. Per-camera only: the game's Main Camera (desktop mirror / no-headset flatscreen play)
+        /// is never touched, so parity holds with no global state to save/restore. Idempotent; callable at
+        /// creation and whenever the flag flips. No-op until the eyes exist.
+        /// </summary>
+        public void ApplyEyeQuality()
+        {
+            bool low = Config.EyeLowSpec;
+            for (int i = 0; i < 2; i++)
+            {
+                var d = _camData[i];
+                if (d == null) continue;
+                try
+                {
+                    d.renderShadows = !low;        // off in LowSpec — drops the per-eye shadow pass (the big win)
+                    if (low)
+                    {
+                        d.renderPostProcessing = false;
+                        d.antialiasing = AntialiasingMode.None;
+                        d.dithering = false;
+                    }
+                }
+                catch (Exception e) { Log.LogWarning($"[perf] eye{i} quality apply failed: " + e.Message); }
+            }
+            if (low) Log.LogInfo("[perf] LowSpec eye profile applied: shadows OFF, post OFF, MSAA OFF (per-eye; flatscreen untouched).");
         }
 
         public void UpdateOrigin()
@@ -463,6 +501,7 @@ namespace IronNestVR
             for (int i = 0; i < 2; i++)
             {
                 if (_cam[i] != null) UnityEngine.Object.Destroy(_cam[i].gameObject);
+                _camData[i] = null; // destroyed with the camera GameObject above; just drop our ref
                 if (_rt[i] != null) { _rt[i].Release(); UnityEngine.Object.Destroy(_rt[i]); }
                 if (_flipRT[i] != null) { _flipRT[i].Release(); UnityEngine.Object.Destroy(_flipRT[i]); }
             }

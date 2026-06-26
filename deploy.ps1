@@ -2,7 +2,7 @@
 # Deploys to BOTH the primary Steam install AND the second "Client" copy used for same-machine co-op
 # testing (the localhost loopback transport — Ctrl+F1/F2/F3; see LoopbackTransport.cs). The client copy is
 # skipped with a warning if it isn't present, so this still works on a machine that only has the primary.
-param([switch]$NoBuild, [switch]$PrimaryOnly)
+param([switch]$NoBuild, [switch]$PrimaryOnly, [string]$BuildProps = "")
 
 $ErrorActionPreference = "Stop"
 $src = "$PSScriptRoot\bin\Release"
@@ -16,7 +16,9 @@ if (-not $PrimaryOnly) {
 }
 
 if (-not $NoBuild) {
-    dotnet build "$PSScriptRoot\IronNestVR.csproj" -c Release -v minimal
+    $buildArgs = @("build", "$PSScriptRoot\IronNestVR.csproj", "-c", "Release", "-v", "minimal")
+    if ($BuildProps) { $buildArgs += $BuildProps }   # e.g. -BuildProps "-p:PublicBuild=true" (heartbeat OFF)
+    dotnet @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 }
 

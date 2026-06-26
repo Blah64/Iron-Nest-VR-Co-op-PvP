@@ -21,7 +21,9 @@ namespace IronNestVR
     /// </summary>
     internal static class Dbg
     {
-        public static bool Enabled = true;
+        // Build-flavor default (diagnostic builds ON, public builds OFF); Config.Load overrides it from the
+        // cfg's CrashHeartbeat= key right after parsing. Const ⇒ inlined, so no Config static-init dependency.
+        public static bool Enabled = Config.DefaultCrashHeartbeat;
 
         private static readonly string TracePath;
         private static readonly string BeatPath;
@@ -33,6 +35,8 @@ namespace IronNestVR
         private static long _seq;
         private static readonly object _lock = new object();
         private static readonly StringBuilder _sb = new StringBuilder(4096);
+        private static FileStream _beatFs;                   // persistent heartbeat handle, opened on first Beat
+        private static byte[] _beatBytes = new byte[8192];   // reused encode buffer (grows only if a beat exceeds it)
 
         /// <summary>The most recent breadcrumb, also kept in memory for the startup env dump / logs.</summary>
         public static string Last { get; private set; } = "(none)";
@@ -92,7 +96,21 @@ namespace IronNestVR
                         var line = _ring[(int)(i % RingSize)];
                         if (line != null) _sb.Append(line).Append('\n');
                     }
-                    File.WriteAllText(BeatPath, _sb.ToString());
+                    // Persistent handle: open once, then rewind + overwrite + truncate + flush each beat,
+                    // instead of File.WriteAllText's open/write/close on EVERY call (~4×/frame). The syscall
+                    // churn — not the few KB — is the cost on a weak/contended disk. Flush() pushes the bytes
+                    // to the OS file cache, so the last breadcrumb still survives a native crash (same
+                    // durability as the old close-per-write), just far cheaper.
+                    if (_beatFs == null)
+                        _beatFs = new FileStream(BeatPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                    string text = _sb.ToString();
+                    int need = Encoding.UTF8.GetByteCount(text);
+                    if (_beatBytes.Length < need) _beatBytes = new byte[need + 1024];
+                    int wrote = Encoding.UTF8.GetBytes(text, 0, text.Length, _beatBytes, 0);
+                    _beatFs.Seek(0, SeekOrigin.Begin);
+                    _beatFs.Write(_beatBytes, 0, wrote);
+                    _beatFs.SetLength(wrote);
+                    _beatFs.Flush();
                 }
             }
             catch { }

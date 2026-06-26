@@ -23,6 +23,13 @@
     <PluginDeployDir>$(BepInExDir)\plugins\IronNestVR</PluginDeployDir>
   </PropertyGroup>
 
+  <!-- Build flavor: `dotnet build -p:PublicBuild=true` defines PUBLIC_BUILD (the public/plugin-only zip from
+       package-public.ps1 → crash heartbeat OFF by default). Unset = diagnostic/tester build (heartbeat ON). -->
+  <PropertyGroup>
+    <PublicBuild Condition="'$(PublicBuild)'==''">false</PublicBuild>
+    <DefineConstants Condition="'$(PublicBuild)'=='true'">$(DefineConstants);PUBLIC_BUILD</DefineConstants>
+  </PropertyGroup>
+
   <!-- The Unity project 'IronNestHands' (used to build the hand AssetBundle) lives under this source
        dir; keep its package-cache/sample scripts out of the plugin's default compile glob. -->
   <ItemGroup>

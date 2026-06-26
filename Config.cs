@@ -346,6 +346,40 @@ namespace IronNestVR
         // when the flag is dropped and the same callback lands on Unity's render thread. See PLANXR.md.
         public static bool RenderThreadCopy = false;
 
+        // --- Low-spec eye-render profile (CPU draw-submission relief for weak systems) ---
+        // The two eye cameras are clones of the game's Main Camera, so the scene is rendered at full quality
+        // TWICE every frame on ONE thread (gfx-direct). On a weak CPU that draw submission is the wall — the
+        // [probe] is render-phase-bound AND resolution-independent (RenderScale doesn't move fps). LowSpec
+        // strips the heaviest per-eye work — real-time SHADOWS (a whole extra pass PER EYE), post, and MSAA —
+        // through each eye's UniversalAdditionalCameraData. Per-camera, so the game's Main Camera (the desktop
+        // mirror / no-headset flatscreen play) is never touched: parity is automatic and there's no global
+        // state to restore. Applied at eye-camera creation and whenever the flag flips. See CameraRig.ApplyEyeQuality.
+        public static bool EyeLowSpec = false;
+        // True once EyeLowSpec is read from the cfg — an explicit choice wins, so auto-enable leaves it alone
+        // (matches RenderScaleExplicit). A cfg "EyeLowSpec=false" therefore also HARD-disables auto-enable.
+        public static bool EyeLowSpecExplicit = false;
+
+        // Auto-enable LowSpec when the headset is up + focused and the framerate stays below LowSpecFpsTrigger
+        // for LowSpecSustainSec continuous seconds, after a LowSpecGraceSec settle window that ignores the
+        // scene-load spike. One-way latch for the process (once weak, stay reduced — no shadow on/off flicker).
+        // No-op when EyeLowSpecExplicit (cfg pinned a choice). See VrManager.AutoLowSpecTick.
+        public static bool EyeLowSpecAuto = true;
+        public static float LowSpecFpsTrigger = 35f;   // below this average fps ⇒ struggling for VR
+        public static float LowSpecSustainSec = 6f;    // must stay slow this long (continuous) before latching
+        public static float LowSpecGraceSec = 8f;      // ignore the first seconds after focus (scene load)
+
+        // Crash-proof per-frame heartbeat breadcrumb (Dbg.Beat) — leaves the last frame-loop phases on disk so
+        // a DELAYED native crash can be pinpointed. DIAGNOSTIC/tester builds default it ON (the whole reason
+        // that build exists); PUBLIC builds (-p:PublicBuild=true ⇒ PUBLIC_BUILD) default it OFF (players want
+        // smoothness, not breadcrumbs). The cfg key always wins, so a tester chasing a crash can force it on
+        // and a weak-system player can force it off. Applied to Dbg.Enabled at the end of Load().
+#if PUBLIC_BUILD
+        public const bool DefaultCrashHeartbeat = false;
+#else
+        public const bool DefaultCrashHeartbeat = true;
+#endif
+        public static bool CrashHeartbeat = DefaultCrashHeartbeat;
+
         // --- Diagnostics / quick toggles for live tuning ---
         // Phase 2.5 isolation: render each eye as a flat clear color (no scene) to prove the
         // swapchain copy + projection-layer submission path independent of scene rendering.
@@ -838,6 +872,12 @@ namespace IronNestVR
                 Plugin.Logger?.LogInfo("[config] loaded settings from " + SettingsPath);
             }
             catch (Exception e) { Plugin.Logger?.LogWarning("[config] load failed: " + e.Message); }
+            finally
+            {
+                // Runs even on the no-cfg early-return / parse-exception paths, so a fresh install still gets
+                // the build-flavor default. A cfg "CrashHeartbeat=" line (if present) has overridden it by here.
+                Dbg.Enabled = CrashHeartbeat;
+            }
         }
 
         /// <summary>
@@ -904,6 +944,12 @@ namespace IronNestVR
                 case "LeaderboardCamHz": LeaderboardCamHz = PF(v, LeaderboardCamHz); break;
                 case "RenderThreadProbeTest": RenderThreadProbeTest = PB(v, RenderThreadProbeTest); break;
                 case "RenderThreadCopy": RenderThreadCopy = PB(v, RenderThreadCopy); break;
+                case "EyeLowSpec": EyeLowSpec = PB(v, EyeLowSpec); EyeLowSpecExplicit = true; break;
+                case "EyeLowSpecAuto": EyeLowSpecAuto = PB(v, EyeLowSpecAuto); break;
+                case "LowSpecFpsTrigger": LowSpecFpsTrigger = PF(v, LowSpecFpsTrigger); break;
+                case "LowSpecSustainSec": LowSpecSustainSec = PF(v, LowSpecSustainSec); break;
+                case "LowSpecGraceSec": LowSpecGraceSec = PF(v, LowSpecGraceSec); break;
+                case "CrashHeartbeat": CrashHeartbeat = PB(v, CrashHeartbeat); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;

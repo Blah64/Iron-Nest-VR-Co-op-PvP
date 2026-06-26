@@ -42,6 +42,8 @@ namespace IronNestVR
         private float _nextErrLog;
         private float _nextPoseLog;
         private float _loopDiagNext;   // same-machine loopback test: per-second focus/runInBackground/timeScale log
+        private float _focusedSince = -1f; // unscaledTime the session last became focused (LowSpec settle window)
+        private float _lowSpecSlowAccum;   // continuous seconds spent below LowSpecFpsTrigger while focused
 
         // Phase 1 scene probe (still handy).
         private float _nextScan;
@@ -217,6 +219,37 @@ namespace IronNestVR
             Config.AutoTuneRenderScale();
         }
 
+        // Auto-enable the LowSpec eye profile (Config.EyeLowSpec) when a weak system can't keep up. Once the
+        // headset is focused and running below Config.LowSpecFpsTrigger for Config.LowSpecSustainSec straight
+        // seconds — past a LowSpecGraceSec settle window so the scene-load spike doesn't trip it — strip the
+        // per-eye shadows/post/MSAA via CameraRig.ApplyEyeQuality. One-way latch for the process (no shadow
+        // flicker). Skipped if the cfg pinned EyeLowSpec (EyeLowSpecExplicit) or auto is off. De-focus
+        // (dashboard up / headset off) pauses AND resets the timer, so the multi-second focus-loss freezes
+        // can't latch it — we judge in-game framerate only.
+        private void AutoLowSpecTick()
+        {
+            if (Config.EyeLowSpec || Config.EyeLowSpecExplicit || !Config.EyeLowSpecAuto) return;
+            bool focused = _xr != null && _xr.IsFocused && _rig != null && _rig.Ready;
+            if (!focused) { _focusedSince = -1f; _lowSpecSlowAccum = 0f; return; }
+
+            float now = Time.unscaledTime;
+            if (_focusedSince < 0f) { _focusedSince = now; _lowSpecSlowAccum = 0f; }
+            if (now - _focusedSince < Config.LowSpecGraceSec) return;   // ignore the load-in spike window
+
+            float dt = Time.unscaledDeltaTime;
+            float fps = dt > 0.0001f ? 1f / dt : 999f;
+            if (fps < Config.LowSpecFpsTrigger) _lowSpecSlowAccum += dt;
+            else _lowSpecSlowAccum = Mathf.Max(0f, _lowSpecSlowAccum - 2f * dt); // recover faster than it builds
+
+            if (_lowSpecSlowAccum >= Config.LowSpecSustainSec)
+            {
+                Config.EyeLowSpec = true;
+                try { _rig.ApplyEyeQuality(); } catch (Exception e) { Log.LogWarning("[perf] LowSpec apply failed: " + e.Message); }
+                Log.LogInfo($"[perf] LowSpec AUTO-ENABLED — sustained <{Config.LowSpecFpsTrigger:0} fps for {Config.LowSpecSustainSec:0}s. " +
+                            "Eye shadows/post/MSAA off (flatscreen untouched). Set EyeLowSpec=false in IronNestVR.cfg to keep full quality.");
+            }
+        }
+
         private bool _mirrorBlanked;
         private int _mirrorSavedMask;
         // Blank the desktop mirror (Camera.main) while VR is active: it's a full 3rd scene render the
@@ -329,6 +362,7 @@ namespace IronNestVR
             AutoTuneOnce();
             RenderThreadProbe.Tick();   // PLANXR feasibility test (self-terminating; logs one [rtprobe] RESULT)
             PerfTick();
+            AutoLowSpecTick();   // weak-system relief: latch the LowSpec eye profile if fps stays low while focused
             ScanSceneOnce();
             Diagnostics.Tick();
             MapToolsProbe.Tick();  // F1 dump / Shift+F1 live-test: decouple map-tools palette from the focus camera

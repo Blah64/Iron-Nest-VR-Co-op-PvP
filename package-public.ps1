@@ -22,7 +22,8 @@ $zip       = "$outDir\IRON-NEST-VR-Mod-public.zip"
 $pluginSrc = "$game\BepInEx\plugins\IronNestVR"
 
 # 1. Build + deploy the latest plugin into the game (deploy.ps1 throws on build failure).
-if (-not $NoBuild) { & "$root\deploy.ps1" }
+#    PublicBuild=true ⇒ PUBLIC_BUILD ⇒ crash heartbeat OFF by default in this public zip.
+if (-not $NoBuild) { & "$root\deploy.ps1" -BuildProps "-p:PublicBuild=true" }
 
 # 2. Stage a plugin-only overlay.
 $stage     = Join-Path $env:TEMP ("invr_pub_" + [System.Guid]::NewGuid().ToString("N"))
