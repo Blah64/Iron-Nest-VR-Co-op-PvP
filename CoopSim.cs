@@ -165,15 +165,15 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[sim] deterministic-fire patch: " + e.Message); }
 
-            // SHELL VISUAL COPY: on a REMOTE shot the prefix replaces ShellVisual's board-local TARGET (the visible
-            // arc + fall-of-shot crater) with the shooter's; the postfix re-writes the stored targetLocalPos field as a
-            // belt-and-suspenders against ref-arg no-op and logs the read-back. On a LOCAL shot the postfix captures
-            // the shooter's real board target to ship (the adjudication map point is copied separately, StartImpact
-            // above). Host + solo + local shots' visuals are otherwise untouched.
+            // SHELL VISUAL COPY (postfix only): on a LOCAL shot the postfix reads the real flight (start/target/
+            // travelTime) and announces it; on a REMOTE shot it overwrites our shell's flight FIELDS with the
+            // shooter's so the whole arc + crater match. Field writes, NOT a ref-arg prefix - the latter silently
+            // no-ops on IL2CPP (it's what made earlier logs match while screens didn't). Host + solo + local shots
+            // are otherwise untouched.
             try
             {
                 var mi = AccessTools.Method(typeof(ShellVisual), "Initialize");
-                if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopBallistics), nameof(CoopBallistics.OnShellVisualPre)), postfix: new HarmonyMethod(typeof(CoopBallistics), nameof(CoopBallistics.OnShellVisualPost))); Log.LogInfo("[sim] shell-visual copy patched (ShellVisual.Initialize -> shooter board target)"); }
+                if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopBallistics), nameof(CoopBallistics.OnShellVisualPost))); Log.LogInfo("[sim] shell-visual copy patched (ShellVisual.Initialize -> shooter flight)"); }
                 else Log.LogWarning("[sim] ShellVisual.Initialize not found — co-op fall-of-shot visual won't copy");
             }
             catch (Exception e) { Log.LogWarning("[sim] shell-visual patch: " + e.Message); }

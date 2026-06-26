@@ -5,33 +5,33 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op: SHOOTER-AUTHORITATIVE SHELL LANDING (visible fall-of-shot).
+    /// Phase 4 co-op: SHOOTER-AUTHORITATIVE SHELL FLIGHT (visible arc + fall-of-shot).
     ///
     /// THE PROBLEM (LAN tests 2026-06): a fired shell lands in different spots on host vs client even after aim/
-    /// powder/shell sync. Long dead-end chain proved NO pre-shot input can be reliably synced, so we copy the
-    /// shooter's RESOLVED shot instead. The thing the players actually SEE is ShellVisual: the shell arcs across the
-    /// tactical-map board (a RectTransform) and drops its crater at <c>targetLocalPos</c> (board-local UI space).
+    /// powder/shell sync. A long dead-end chain proved NO pre-shot input can be reliably synced, so we copy the
+    /// shooter's RESOLVED shot instead. Artillery here is 2D: the shell the players SEE is a <c>ShellVisual</c> that
+    /// arcs across the tactical-map board (a RectTransform) from <c>startLocalPos</c> to <c>targetLocalPos</c> and
+    /// drops its crater there. Because the shell IS the visual, State_ImpactStart adjudicates the hit at wherever it
+    /// lands - so map-space == board-space, and copying the visual's flight syncs the crater AND the hit for free.
     ///
-    /// TIMING (what broke the earlier attempts):
-    ///   - hasFired flips at RequestFire, a whole fireDelay BEFORE FireShell runs -> announcing there shipped NaN.
-    ///   - The map-space hit point (State_ImpactStart.StartImpact's impactLocation) is NOT resolved inside FireShell;
-    ///     the shell ARCS for its travelTime and StartImpact only runs when it LANDS (seconds later). Gating the
-    ///     announce on that point meant the announce never fired in time and the peer never fired at all.
-    /// What IS known at fire time, inside FireShell, is ShellVisual.Initialize(start, TARGET, travelTime, shell) -
-    /// the board-local landing target. So announce from there.
+    /// TIMING (what broke the earlier attempts): hasFired flips at RequestFire, BEFORE FireShell runs (announcing
+    /// there shipped NaN); and the map hit point isn't resolved until the shell LANDS, seconds later (announcing
+    /// there fired the peer too late / not at all). What IS known at fire time, inside FireShell, is
+    /// ShellVisual.Initialize(start, target, travelTime, shell) - the whole flight. So announce from there.
     ///
-    /// FLOW. SHOOTER (local shot): the ShellVisual.Initialize postfix reads the real stored board target and ships it
-    /// in MSG_FIRE immediately. PEER: the MSG_FIRE handler stashes it as "pending" + replays RequestFire (gun recoils);
-    /// the peer runs its own FireShell, and its ShellVisual.Initialize prefix+postfix force targetLocalPos to the
-    /// shooter's board target -> the visible arc + crater land at the identical spot. The target is copied VERBATIM
-    /// from the shooter's own ShellVisual, so its coordinate space never matters. Dispersion is still zeroed so the
-    /// shooter's own shot is itself a clean point.
+    /// FLOW. SHOOTER (local shot): the ShellVisual.Initialize postfix reads the real stored flight (start, target,
+    /// travelTime) and ships it in MSG_FIRE immediately. PEER: the MSG_FIRE handler stashes it as "pending" + replays
+    /// RequestFire (gun recoils); the peer runs its own FireShell, and its ShellVisual.Initialize postfix overwrites
+    /// startLocalPos / targetLocalPos / travelTime (and recomputes totalPathDistance) with the shooter's -> the
+    /// visible arc flies the same launch point, direction, speed and curve to the identical crater.
     ///
-    /// NOTE: the map-space adjudication (which MapEntities a shell hits) is NOT overridden here - that stays
-    /// host-authoritative via CoopImpact's MSG_IMPACT hit broadcast. We log the map point next to the board target at
-    /// landing purely as a diagnostic (to confirm the two spaces differ). See [[ironnest-aim-desync]].
+    /// IL2CPP NOTE: we override by writing the INSTANCE FIELDS in the postfix, NOT by modifying ref value-type args
+    /// in a prefix - the latter silently no-ops here (it's what made earlier builds' logs match while the screens
+    /// didn't). The fields are copied VERBATIM from the shooter's own ShellVisual, so their coordinate space never
+    /// matters. Dispersion is still zeroed so the shooter's own shot is itself a clean point.
     ///
-    /// SCOPE: co-op lobby + peer + MissionActive only. Solo/flatscreen fire stock (parity). See [[ironnest-flatscreen-parity]].
+    /// Adjudication stays host-authoritative via CoopImpact's MSG_IMPACT hit broadcast (we don't touch StartImpact).
+    /// SCOPE: co-op lobby + peer + MissionActive only. Solo/flatscreen fire stock. See [[ironnest-aim-desync]] [[ironnest-flatscreen-parity]].
     /// </summary>
     internal static class CoopBallistics
     {
@@ -48,15 +48,14 @@ namespace IronNestVR
 
         // ---- SHOOTER per-shot state (reset in OnFireShellPre) ----
         private static GunController _capGun;          // the firing gun (NOT nulled by Restore) -> side at send time
-        private static bool _shotWasRemote;            // a replayed/remote shot -> do NOT announce (breaks the loop)
         private static bool _sentThisShot;
-        private static bool _lastLocalTgtValid; private static Vector2 _lastLocalTgt;   // diagnostic: last local board target
 
-        // ---- PEER pending (the shooter's board target to force onto our about-to-fire shell) ----
+        // ---- PEER pending (the shooter's flight to force onto our about-to-fire shell) ----
         // Set when MSG_FIRE arrives, consumed at our ShellVisual.Initialize (fire time, same FireShell), cleared in
         // OnFireShellPost. The expiry is a backstop if our replayed RequestFire is rejected; it must exceed fireDelay.
         private static bool _pendingValid;
-        private static Vector2 _pendingTgt;
+        private static Vector2 _pendingTgt, _pendingStart;
+        private static float _pendingTime;
         private static float _pendingExpiry;
 
         // ================= FireShell prefix/postfix (dispersion + per-shot reset) =================
@@ -88,7 +87,7 @@ namespace IronNestVR
 
                 _stashed = true;
                 _shots++;
-                _shotWasRemote = false; _sentThisShot = false;
+                _sentThisShot = false;
             }
             catch (Exception e) { try { Log.LogWarning("[ball] pre: " + e.Message); } catch { } }
         }
@@ -96,8 +95,8 @@ namespace IronNestVR
         public static void OnFireShellPost()
         {
             try { Restore(); } catch (Exception e) { try { Log.LogWarning("[ball] post: " + e.Message); } catch { } }
-            // The pending board target was consumed by our ShellVisual.Initialize during this FireShell; clear it so a
-            // later LOCAL shot can never inherit a stale remote target.
+            // The pending flight was consumed by our ShellVisual.Initialize during this FireShell; clear it so a later
+            // LOCAL shot can never inherit a stale remote target.
             _pendingValid = false;
         }
 
@@ -119,25 +118,11 @@ namespace IronNestVR
             _stashed = false; _gun = null; _shell = null;
         }
 
-        // ================= ShellVisual.Initialize (board-local landing) — announce + override =================
+        // ================= ShellVisual.Initialize — announce (shooter) / override flight (peer) =================
 
-        // ShellVisual.Initialize(start, target, travelTime, shell); __1 == target. Peer: override the visible target.
-        public static void OnShellVisualPre(ref Vector2 __1)
-        {
-            try
-            {
-                if (IsApplyingRemoteImpact)
-                {
-                    __1 = _pendingTgt; _shotWasRemote = true; _copied++;
-                    Log.LogInfo($"[ball] copied shooter target -> shell visual ({__1.x:0.0},{__1.y:0.0})");
-                }
-            }
-            catch { }
-        }
-
-        // Peer: belt-and-suspenders write of the stored field (in case the ref-arg override didn't propagate) +
-        // read-back so the log proves where the visible shell will land. Shooter: capture the REAL stored board target
-        // and announce it to the peer NOW (fire time) - this is the first and only moment it exists in FireShell.
+        // ShellVisual.Initialize(start, target, travelTime, shell) postfix. PEER: overwrite the whole flight with the
+        // shooter's (instance-field writes - reliable, unlike a ref-arg prefix). SHOOTER: capture the real flight and
+        // announce it to the peer NOW (fire time) - the first and only moment it exists inside FireShell.
         public static void OnShellVisualPost(ShellVisual __instance)
         {
             try
@@ -145,16 +130,29 @@ namespace IronNestVR
                 if (__instance == null) return;
                 if (IsApplyingRemoteImpact)
                 {
-                    try { __instance.targetLocalPos = _pendingTgt; } catch { }
-                    Vector2 now; try { now = __instance.targetLocalPos; } catch { return; }
-                    Log.LogInfo($"[ball] shell target now ({now.x:0.0},{now.y:0.0})");
+                    bool haveStart = CoopWire.Finite(_pendingStart.x) && CoopWire.Finite(_pendingStart.y);
+                    try
+                    {
+                        __instance.targetLocalPos = _pendingTgt;          // the crater - always present
+                        if (haveStart)                                    // the launch point / arc - guard against an old/short packet
+                        {
+                            __instance.startLocalPos = _pendingStart;
+                            if (_pendingTime > 0f) __instance.travelTime = _pendingTime;
+                            try { __instance.totalPathDistance = Vector2.Distance(_pendingStart, _pendingTgt); } catch { }
+                            try { __instance.previousPos = _pendingStart; } catch { }
+                        }
+                    }
+                    catch { }
+                    _copied++;
+                    Vector2 s, t; try { s = __instance.startLocalPos; t = __instance.targetLocalPos; } catch { return; }
+                    Log.LogInfo($"[ball] shell flight now start=({s.x:0.0},{s.y:0.0}) target=({t.x:0.0},{t.y:0.0})");
                 }
-                else if (!_shotWasRemote && !_sentThisShot && Active())
+                else if (!_sentThisShot && Active())
                 {
-                    Vector2 tgt; try { tgt = __instance.targetLocalPos; } catch { return; }
-                    _lastLocalTgt = tgt; _lastLocalTgtValid = true;
+                    Vector2 s, t; float time;
+                    try { s = __instance.startLocalPos; t = __instance.targetLocalPos; time = __instance.travelTime; } catch { return; }
                     _sentThisShot = true;
-                    try { CoopControls.SendLocalShot(_capGun, tgt); }
+                    try { CoopControls.SendLocalShot(_capGun, t, s, time); }
                     catch (Exception e) { try { Log.LogWarning("[ball] send: " + e.Message); } catch { } }
                 }
             }
@@ -163,18 +161,15 @@ namespace IronNestVR
 
         // ================= plumbing =================
 
-        // True while a remote shooter's target is in force (peer side, during the replayed shell's FireShell).
+        // True while a remote shooter's flight is in force (peer side, during the replayed shell's FireShell).
         internal static bool IsApplyingRemoteImpact => _pendingValid && Config.CoopDeterministicFire && Time.unscaledTime < _pendingExpiry;
 
-        // Peer MSG_FIRE handler: the shooter's board target to force onto our about-to-fire shell.
-        internal static void SetPending(Vector2 tgt)
+        // Peer MSG_FIRE handler: the shooter's flight to force onto our about-to-fire shell.
+        internal static void SetPending(Vector2 tgt, Vector2 start, float time)
         {
-            _pendingTgt = tgt; _pendingValid = true;
+            _pendingTgt = tgt; _pendingStart = start; _pendingTime = time; _pendingValid = true;
             try { _pendingExpiry = Time.unscaledTime + 6f; } catch { _pendingExpiry = 0f; }
         }
-
-        // Diagnostic: the board target of our last local shot (for CoopImpact to log next to the landing map point).
-        internal static bool TryGetLastLocalTarget(out Vector2 tgt) { tgt = _lastLocalTgt; return _lastLocalTgtValid; }
 
         // ================= helpers =================
 

@@ -52,7 +52,7 @@ namespace IronNestVR
         private const byte MSG_VALUE = 4;    // [t][netId i32][value f32]    unreliable drag-control value
         private const byte MSG_GROUP = 5;    // [t][group u8][f32 ...]       unreliable turret/gun state
         private const byte MSG_CLICK = 6;    // [t][netId i32]               reliable   LookAtTarget click
-        private const byte MSG_FIRE = 7;     // [t][side u8][tgtX f32][tgtY f32]  reliable  gun discharge (0=L,1=R) + the SHOOTER's board-local ShellVisual landing target; the peer forces it onto its own shell's visual so the crater lands identically regardless of pre-shot desync (see CoopBallistics)
+        private const byte MSG_FIRE = 7;     // [t][side u8][tgtX f32][tgtY f32][startX f32][startY f32][travelTime f32]  reliable  gun discharge (0=L,1=R) + the SHOOTER's full ShellVisual flight (crater + launch point + travel time); the peer forces it onto its own shell so the whole arc + crater match regardless of pre-shot desync (see CoopBallistics)
         private const byte MSG_SNAP = 13;    // [t][9×f32]                   reliable   join-in-progress turret/gun state
         private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
         private const byte MSG_POWDER = 39;  // [t][side u8][charges i32]    reliable   per-gun powder/charge state, EITHER→peer (symmetric, last-writer-wins)
@@ -294,13 +294,14 @@ namespace IronNestVR
         // shooter's did. So we ship THAT. See [[ironnest-aim-desync]].
         //
         // Called by CoopBallistics for a LOCAL shot only (a replayed/remote shot is skipped there, which also breaks
-        // the fire loop - no echo guard needed).
-        internal static void SendLocalShot(GunController gun, Vector2 tgt)
+        // the fire loop - no echo guard needed). Ships the whole flight (start, target, travelTime) so the peer's arc
+        // matches launch point + direction + speed, not just the crater.
+        internal static void SendLocalShot(GunController gun, Vector2 tgt, Vector2 start, float time)
         {
             if (!Config.CoopClickSync || !SteamNet.InLobby || !CoopP2P.HasPeer) return;
             byte side = ((object)gun == (object)_gunR) ? (byte)1 : (byte)0;
-            SendFire(side, tgt);
-            Log.LogInfo($"[ctrl] fire gun {side} -> peer  tgt=({tgt.x:0.0},{tgt.y:0.0})");
+            SendFire(side, tgt, start, time);
+            Log.LogInfo($"[ctrl] fire gun {side} -> peer  start=({start.x:0.0},{start.y:0.0}) tgt=({tgt.x:0.0},{tgt.y:0.0})");
         }
 
         // ---------------- powder / charge state (symmetric) ----------------
@@ -838,15 +839,17 @@ namespace IronNestVR
                 {
                     if (len < 2) return;
                     byte side = r.Byte();
-                    float tx = float.NaN, ty = float.NaN;
-                    if (len >= 10) { tx = r.Float(); ty = r.Float(); }   // board-local visible target
-                    // Set the shooter's board target BEFORE RequestFire so our replayed FireShell's ShellVisual hooks
-                    // (CoopBallistics) force the visible arc + crater onto it -> identical landing, regardless of our
-                    // own angle/elevation/powder. No echo guard needed: our replayed shell is a "remote" shot, which
-                    // CoopBallistics skips announcing, so it can't bounce back as a second shot.
-                    if (CoopWire.Finite(tx) && CoopWire.Finite(ty)) CoopBallistics.SetPending(new Vector2(tx, ty));
+                    float tx = float.NaN, ty = float.NaN, sx = float.NaN, sy = float.NaN, tt = 0f;
+                    if (len >= 10) { tx = r.Float(); ty = r.Float(); }                 // board-local target (crater)
+                    if (len >= 22) { sx = r.Float(); sy = r.Float(); tt = r.Float(); } // launch point + travelTime (arc)
+                    // Set the shooter's flight BEFORE RequestFire so our replayed FireShell's ShellVisual postfix
+                    // (CoopBallistics) overwrites our shell's start/target/travelTime onto it -> identical arc + crater,
+                    // regardless of our own angle/elevation/powder. No echo guard needed: our replayed shell is a
+                    // "remote" shot, which CoopBallistics skips announcing, so it can't bounce back as a second shot.
+                    if (CoopWire.Finite(tx) && CoopWire.Finite(ty))
+                        CoopBallistics.SetPending(new Vector2(tx, ty), new Vector2(sx, sy), tt);
                     var gun = side == 0 ? _gunL : _gunR;
-                    if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer  tgt=({tx:0.0},{ty:0.0})"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
+                    if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer  start=({sx:0.0},{sy:0.0}) tgt=({tx:0.0},{ty:0.0})"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
                     break;
                 }
                 case MSG_POWDER:
@@ -1061,13 +1064,13 @@ namespace IronNestVR
             CoopP2P.Send(_buf, w.Length, true);
         }
 
-        private static void SendFire(byte side, Vector2 tgt)
+        private static void SendFire(byte side, Vector2 tgt, Vector2 start, float time)
         {
             if (!EnsureBuf()) return;
-            // Ship the SHOOTER's board-local landing target (ShellVisual). The peer forces it onto its own shell's
-            // visual so both craters land identically — no pre-shot sync needed.
+            // Ship the SHOOTER's whole ShellVisual flight: target (crater) + start (launch) + travelTime. The peer
+            // forces these onto its own shell so the arc AND the crater match — no pre-shot sync needed.
             var w = new CoopWire.Writer(_buf);
-            w.Byte(MSG_FIRE); w.Byte(side); w.Float(tgt.x); w.Float(tgt.y);
+            w.Byte(MSG_FIRE); w.Byte(side); w.Float(tgt.x); w.Float(tgt.y); w.Float(start.x); w.Float(start.y); w.Float(time);
             CoopP2P.Send(_buf, w.Length, true);
         }
 
