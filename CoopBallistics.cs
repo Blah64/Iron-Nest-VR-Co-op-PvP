@@ -145,7 +145,7 @@ namespace IronNestVR
                     catch { }
                     _copied++;
                     Vector2 s, t; try { s = __instance.startLocalPos; t = __instance.targetLocalPos; } catch { return; }
-                    Log.LogInfo($"[ball] shell flight now start=({s.x:0.0},{s.y:0.0}) target=({t.x:0.0},{t.y:0.0})");
+                    Diagnostics.V($"[ball] shell flight now start=({s.x:0.0},{s.y:0.0}) target=({t.x:0.0},{t.y:0.0})");
                 }
                 else if (!_sentThisShot && Active())
                 {

@@ -60,7 +60,7 @@ namespace IronNestVR
                 // This postfix runs when the shell LANDS - impactLocation is the map hit point (== the ShellVisual
                 // crater, confirmed; artillery is 2D). Adjudication stays host-authoritative via the MSG_IMPACT
                 // broadcast below; the visible flight is copied at fire time by CoopBallistics.
-                Log.LogInfo($"[imp] {(CoopP2P.IsHost ? "HOST" : "client")} impact at ({impactLocation.x:0.0},{impactLocation.y:0.0}) shell='{shellId}' hits={count}");
+                Diagnostics.V($"[imp] {(CoopP2P.IsHost ? "HOST" : "client")} impact at ({impactLocation.x:0.0},{impactLocation.y:0.0}) shell='{shellId}' hits={count}");
 
                 if (!CoopP2P.IsHost) return;          // only the host broadcasts the authoritative hit set
                 if (__result == null || count <= 0) return;   // replicate HITS only — client keeps its own fall-of-shot for misses
@@ -95,7 +95,7 @@ namespace IronNestVR
 
             CoopP2P.Send(_buf, w.Length, true);
             _sent++;
-            Log.LogInfo($"[imp] host impact at ({loc.x:0},{loc.y:0}) shell='{shellId}' hits={ids.Count} -> peer");
+            Diagnostics.V($"[imp] host impact at ({loc.x:0},{loc.y:0}) shell='{shellId}' hits={ids.Count} -> peer");
         }
 
         // ---------------- client replay ----------------
@@ -132,7 +132,7 @@ namespace IronNestVR
 
                 int fired = DispatchToIndicators(ed);
                 _applied++;
-                Log.LogInfo($"[imp] applied host impact ({loc.x:0},{loc.y:0}) shell='{shellId}' hits={resolved}/{ids.Count} -> {fired} indicator(s)");
+                Diagnostics.V($"[imp] applied host impact ({loc.x:0},{loc.y:0}) shell='{shellId}' hits={resolved}/{ids.Count} -> {fired} indicator(s)");
             }
             catch (Exception e) { Log.LogWarning("[imp] apply: " + e.Message); }
         }

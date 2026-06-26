@@ -200,7 +200,7 @@ namespace IronNestVR
                             c.LocalOwned = true;
                             SendGrab(c);
                             _grabs++;
-                            if (_grabs <= 50) Log.LogInfo($"[ctrl] grabbed '{c.T.name}' (grp={c.Grp}) — local owner");
+                            if (_grabs <= 50) Diagnostics.V($"[ctrl] grabbed '{c.T.name}' (grp={c.Grp}) — local owner");
                         }
                     }
                     else if (!dragging && c.PrevDragging && c.LocalOwned)
@@ -266,7 +266,7 @@ namespace IronNestVR
             if (clicked && !c.PrevClicked && !suppressed)
             {
                 SendClick(c.NetId);
-                Log.LogInfo($"[ctrl] click '{c.T.name}' -> peer");
+                Diagnostics.V($"[ctrl] click '{c.T.name}' -> peer");
             }
             c.PrevClicked = clicked;
         }
@@ -279,7 +279,7 @@ namespace IronNestVR
             try
             {
                 foreach (var c in _byId.Values)
-                    if ((object)c.Switch == sw) { SendClick(c.NetId); Log.LogInfo($"[ctrl] click '{c.T.name}' (glove) -> peer"); return; }
+                    if ((object)c.Switch == sw) { SendClick(c.NetId); Diagnostics.V($"[ctrl] click '{c.T.name}' (glove) -> peer"); return; }
             }
             catch { }
         }
@@ -301,7 +301,7 @@ namespace IronNestVR
             if (!Config.CoopClickSync || !SteamNet.InLobby || !CoopP2P.HasPeer) return;
             byte side = ((object)gun == (object)_gunR) ? (byte)1 : (byte)0;
             SendFire(side, tgt, start, time);
-            Log.LogInfo($"[ctrl] fire gun {side} -> peer  start=({start.x:0.0},{start.y:0.0}) tgt=({tgt.x:0.0},{tgt.y:0.0})");
+            Diagnostics.V($"[ctrl] fire gun {side} -> peer  start=({start.x:0.0},{start.y:0.0}) tgt=({tgt.x:0.0},{tgt.y:0.0})");
         }
 
         // ---------------- powder / charge state (symmetric) ----------------
@@ -340,7 +340,7 @@ namespace IronNestVR
             {
                 SendPowder(side, cur);
                 authored = true;   // a local change → we own re-asserting this gun's powder until we adopt the peer's
-                Log.LogInfo($"[ctrl] powder gun {side} -> peer ({cur})");
+                Diagnostics.V($"[ctrl] powder gun {side} -> peer ({cur})");
             }
             return cur;
         }
@@ -375,7 +375,7 @@ namespace IronNestVR
             {
                 SendAim(rot, elev, eL, eR);
                 _aimAuthored = true;   // a local aim change → we own re-asserting it until we adopt the peer's
-                Log.LogInfo($"[ctrl] aim -> peer rot={rot:0.0} elev={elev:0.0} gunL={eL:0.0} gunR={eR:0.0}");
+                Diagnostics.V($"[ctrl] aim -> peer rot={rot:0.0} elev={elev:0.0} gunL={eL:0.0} gunR={eR:0.0}");
             }
             _aimPrevRot = rot; _aimPrevElev = elev; _aimPrevElevL = eL; _aimPrevElevR = eR;
 
@@ -482,7 +482,7 @@ namespace IronNestVR
                         if (Time.unscaledTime >= _nextElevDiag)
                         {
                             _nextElevDiag = Time.unscaledTime + 1f;
-                            Log.LogInfo($"[ctrl] applied peer elevation: turret={gs.V[0]:0.0} gunL={gs.V[1]:0.0} gunR={gs.V[2]:0.0} " +
+                            Diagnostics.V($"[ctrl] applied peer elevation: turret={gs.V[0]:0.0} gunL={gs.V[1]:0.0} gunR={gs.V[2]:0.0} " +
                                         $"(now gunL.des={(_gunL != null ? _gunL.DesiredElevationAngle : 0f):0.0} gunL.cur={(_gunL != null ? _gunL.CurrentElevation : 0f):0.0} drive={(_turret != null && _turret.driveGunElevationsFromController)})");
                         }
                         break;
@@ -746,7 +746,7 @@ namespace IronNestVR
                         {
                             c.RemoteOwner = origin; c.RemoteUntil = now + StaleSec;
                             MarkGroupRemote(c.Grp, origin, now);
-                            Log.LogInfo($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- {origin}");
+                            Diagnostics.V($"[ctrl] remote grabbed '{c.T.name}' (grp={c.Grp}) <- {origin}");
                         }
                     }
                     else { _pendingGrab[id] = origin; }
@@ -786,7 +786,7 @@ namespace IronNestVR
                     }
                     // Only the current owner's release clears ownership — so player B's release can't free a
                     // control player C is holding (at the 2-player cap origin always == the owner).
-                    if (_byId.TryGetValue(id, out var c) && c.RemoteOwner == origin) { c.RemoteOwner = 0; RecomputeGroupRemote(c.Grp); Log.LogInfo($"[ctrl] remote released '{c.T.name}' <- {origin}"); }
+                    if (_byId.TryGetValue(id, out var c) && c.RemoteOwner == origin) { c.RemoteOwner = 0; RecomputeGroupRemote(c.Grp); Diagnostics.V($"[ctrl] remote released '{c.T.name}' <- {origin}"); }
                     if (_pendingGrab.TryGetValue(id, out var po) && po == origin) _pendingGrab.Remove(id);
                     break;
                 }
@@ -831,7 +831,7 @@ namespace IronNestVR
                     {
                         ReplayClick(c.Switch);
                         _echoUntil[id] = now + 0.3f;   // don't bounce our own replay back
-                        Log.LogInfo($"[ctrl] applied remote click '{c.T.name}' <- peer");
+                        Diagnostics.V($"[ctrl] applied remote click '{c.T.name}' <- peer");
                     }
                     break;
                 }
@@ -849,7 +849,7 @@ namespace IronNestVR
                     if (CoopWire.Finite(tx) && CoopWire.Finite(ty))
                         CoopBallistics.SetPending(new Vector2(tx, ty), new Vector2(sx, sy), tt);
                     var gun = side == 0 ? _gunL : _gunR;
-                    if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer  start=({sx:0.0},{sy:0.0}) tgt=({tx:0.0},{ty:0.0})"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
+                    if (gun != null) { try { gun.RequestFire(); Diagnostics.V($"[ctrl] applied remote fire gun {side} <- peer  start=({sx:0.0},{sy:0.0}) tgt=({tx:0.0},{ty:0.0})"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
                     break;
                 }
                 case MSG_POWDER:
@@ -865,7 +865,7 @@ namespace IronNestVR
                         // peer's value yields authorship: the peer now re-asserts this gun's powder, not us (no flap).
                         if (side == 0) { _powderPrevL = charges; _powderAuthoredL = false; } else { _powderPrevR = charges; _powderAuthoredR = false; }
                         _echoUntil[side == 0 ? PowderKeyL : PowderKeyR] = now + 0.3f;
-                        Log.LogInfo($"[ctrl] applied remote powder gun {side} <- peer ({charges})");
+                        Diagnostics.V($"[ctrl] applied remote powder gun {side} <- peer ({charges})");
                     }
                     break;
                 }
@@ -895,7 +895,7 @@ namespace IronNestVR
                             if (_gunR != null) _gunR.SetDesiredElevation(eR);
                         }
                         catch (Exception e) { Log.LogWarning("[ctrl] apply aim: " + e.Message); }
-                        Log.LogInfo($"[ctrl] applied remote aim rot={rot:0.0} elev={elev:0.0} gunL={eL:0.0} gunR={eR:0.0} <- peer");
+                        Diagnostics.V($"[ctrl] applied remote aim rot={rot:0.0} elev={elev:0.0} gunL={eL:0.0} gunR={eR:0.0} <- peer");
                     }
                     _aimPrevRot = rot; _aimPrevElev = elev; _aimPrevElevL = eL; _aimPrevElevR = eR;
                     _aimAuthored = false;   // adopting the peer's value yields authorship — they re-assert, not us
@@ -1054,7 +1054,7 @@ namespace IronNestVR
                 catch { w.Pos = grpPos; w.Byte((byte)Group.Other); }   // couldn't settle — send a plain release
             }
             CoopP2P.Send(_buf, w.Length, true);
-            Log.LogInfo($"[ctrl] released '{c.T.name}' -> peer (settled grp={c.Grp})");
+            Diagnostics.V($"[ctrl] released '{c.T.name}' -> peer (settled grp={c.Grp})");
         }
 
         private static void SendClick(int netId)
@@ -1105,7 +1105,7 @@ namespace IronNestVR
             if (g == Group.Elevation && Time.unscaledTime >= _nextElevSendDiag)
             {
                 _nextElevSendDiag = Time.unscaledTime + 1f;
-                Log.LogInfo($"[ctrl] streaming elevation -> peer: turret.des={_turret.DesiredElevation:0.0} " +
+                Diagnostics.V($"[ctrl] streaming elevation -> peer: turret.des={_turret.DesiredElevation:0.0} " +
                             $"gunL.des={(_gunL != null ? _gunL.DesiredElevationAngle : 0f):0.0} gunL.cur={(_gunL != null ? _gunL.CurrentElevation : 0f):0.0}");
             }
         }

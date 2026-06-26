@@ -235,6 +235,19 @@ namespace IronNestVR
         public static bool CoopLoopback = DefaultCoopLoopback;
         public static int CoopLoopbackPort = 56561;
 
+        // Verbose co-op debug logging: the per-EVENT replication breadcrumbs (fire/powder/aim/click/grab "-> peer" /
+        // "<- peer", the per-frame elevation stream, the periodic "[coop] --- status ---" dump). Invaluable while
+        // chasing a desync, pure noise for a shipped player. PUBLIC builds default it OFF (clean LogOutput.log);
+        // tester/diagnostic builds default it ON. The cfg key always wins, so a tester can force it on in the field
+        // and a player can force it off. One-time lifecycle logs (connect/join/JIP/registry) and warnings are NOT
+        // gated by this - they always print. Routed through Diagnostics.V(...).
+#if PUBLIC_BUILD
+        public const bool DefaultCoopVerboseLog = false;
+#else
+        public const bool DefaultCoopVerboseLog = true;
+#endif
+        public static bool CoopVerboseLog = DefaultCoopVerboseLog;
+
         // Same-machine test: keep each instance in a WINDOW of this size while a loopback link is up. Two
         // standalone instances can't both hold Windows EXCLUSIVE fullscreen on one display, so when the host
         // grabs it on a mission scene-load the background client gets knocked to a tiny resolution. Forcing a
@@ -872,6 +885,7 @@ namespace IronNestVR
                 WV(sb, "CoopFlagEuler", CoopFlagEuler);
                 WB(sb, "CoopLoopback", CoopLoopback);
                 WI(sb, "CoopLoopbackPort", CoopLoopbackPort);
+                WB(sb, "CoopVerboseLog", CoopVerboseLog);
                 WB(sb, "CoopTestForceWindow", CoopTestForceWindow);
                 WI(sb, "CoopMaxPlayers", CoopMaxPlayers);
                 WF(sb, "CoopEntityScanHz", CoopEntityScanHz);
@@ -1043,6 +1057,7 @@ namespace IronNestVR
                 case "CoopFlagEuler": CoopFlagEuler = PV(v, CoopFlagEuler); break;
                 case "CoopLoopback": CoopLoopback = PB(v, CoopLoopback); break;
                 case "CoopLoopbackPort": CoopLoopbackPort = PI(v, CoopLoopbackPort); break;
+                case "CoopVerboseLog": CoopVerboseLog = PB(v, CoopVerboseLog); break;
                 case "CoopTestForceWindow": CoopTestForceWindow = PB(v, CoopTestForceWindow); break;
                 case "CoopMaxPlayers": CoopMaxPlayers = PI(v, CoopMaxPlayers); break;
                 case "CoopEntityScanHz": CoopEntityScanHz = PF(v, CoopEntityScanHz); break;

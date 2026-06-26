@@ -20,6 +20,11 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
+        // Verbose co-op breadcrumb. Per-EVENT replication logs (fire/powder/aim/click/grab) route through here so a
+        // PUBLIC build stays quiet (Config.CoopVerboseLog defaults off there; the cfg key forces it on for a tester).
+        // One-time lifecycle logs and warnings call Log.LogInfo/LogWarning directly and are NOT gated.
+        internal static void V(string msg) { if (Config.CoopVerboseLog) { try { Log.LogInfo(msg); } catch { } } }
+
         private static bool _banner;
         private static bool _hadPeer;
         private static float _next;
@@ -51,6 +56,7 @@ namespace IronNestVR
                 if (Time.unscaledTime < _next) return;
                 _next = Time.unscaledTime + Config.CoopDiagIntervalSec;
                 if (!SteamNet.InLobby) return;   // stay quiet during solo play
+                if (!Config.CoopVerboseLog) return;   // public build: no periodic status flood (cfg key can force it on)
 
                 Log.LogInfo("[coop] --- status ---");
                 Log.LogInfo("[coop] " + CoopP2P.Status());

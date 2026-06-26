@@ -1,6 +1,9 @@
-# IRON NEST VR
+# IRON NEST VR & CO-OP
 > This package contains **only the mod**. You install BepInEx yourself first
 > (step 1) — it's a one-time setup.
+
+This mod lets players play in VR and to play cooperative multiplayer with up to 3 other players in the same Iron Nest.
+Crossplay is supported with flatscreen players.
 
 ## 1. Install BepInEx 6 (IL2CPP, x64)
 This is an IL2CPP Unity game, so it needs **BepInEx 6 (IL2CPP)** — *not*
@@ -9,7 +12,7 @@ BepInEx 5 (Mono).
 1. Download the latest **BepInEx 6 bleeding-edge** build for **Unity IL2CPP /
    win-x64** from <https://builds.bepinex.dev/projects/bepinex_be> (the
    `BepInEx-Unity.IL2CPP-win-x64` artifact, which bundles the .NET runtime).
-   *(Developed against build `6.0.0-be.764`; any recent IL2CPP x64 build works.)*
+   *(Developed against build `6.0.0-be.764`; but any recent IL2CPP x64 build should work.)*
 2. Open the game folder: in Steam, right-click the demo → **Manage → Browse
    local files**.
 3. Extract the BepInEx zip into that folder so **`winhttp.dll`** and the
@@ -45,6 +48,13 @@ Steam. No headset? It also runs in flatscreen.
    -'Grab' grabs on to clipboards and Iron Nest controls.
    -Trigger interacts with map, maps pieces, punchcards, record player discs and coffee.  It is also a back up in case you do not like grabbing and pulling levers.
 
+## Known Issues
+-VR crashing and low frame rate is usually a CPU issue. The mod should automatically downgrade settings to 'very low' on its own if performance is struggling, but if
+   it fails, then launching in flatscreen to turn graphics settings down to 'very low' can help.
+   * '-force-d3d11 -force-gfx-direct'  in the launch parameters is also mandatory.  VR crashes will happen without it.
+-'Mission Start' is on the clipboard after selecting a mission.  Pick up your clipboard from your waist to start a mission.
+-Testing has never actually completed a full mission in co-op.  I expect bugs.
+-More than 2 players is supported, but it has not been tested at all.  I expect bugs.
 
 ## Uninstall
 Delete `openxr_loader.dll` from the game root and the
