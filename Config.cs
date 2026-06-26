@@ -148,6 +148,15 @@ namespace IronNestVR
         // host-destroyed). Misses aren't replicated (client keeps its own fall-of-shot). See CoopImpact.
         public static bool CoopImpactSync = true;
 
+        // Phase 4 co-op: DETERMINISTIC FIRING. GunController.FireShell rolls RANDOM dispersion (gunHorizontal/
+        // VerticalDispersion + the chambered shell's horizontal/verticalDispersion + shellSpeedVariationPercent)
+        // with no shared seed, so two machines firing the SAME synced aim/powder/shell still land in DIFFERENT
+        // spots — input-syncing can never converge two independent random rolls. While co-op is active we zero
+        // those dispersion coefficients for the duration of each FireShell call (restored immediately after) so
+        // the impact point is a deterministic function of the already-synced aim+powder+shell → both machines
+        // land identically. Cost: no scatter while in a co-op mission (solo/flatscreen untouched). See CoopBallistics.
+        public static bool CoopDeterministicFire = true;
+
         // Phase 4 co-op: host-authoritative REQUISITION PUNCHCARDS (the loadout/ability cards in the RequisitionSlot —
         // NOT the FireMissionCard slip, see CoopCardSync). The host broadcasts its deck (card ids + remaining uses) so
         // the client's deck matches instead of being built from its own save; a client redemption sends an intent

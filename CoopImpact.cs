@@ -51,13 +51,23 @@ namespace IronNestVR
         {
             try
             {
-                if (!Config.CoopImpactSync || !CoopP2P.IsHost) return;
+                if (!Config.CoopImpactSync) return;
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer || !InMission()) return;
-                if (__result == null) return;
-                int count; try { count = __result.Count; } catch { return; }
-                if (count <= 0) return;   // only replicate HITS — the client shows its own fall-of-shot for misses
 
+                int count = 0; try { if (__result != null) count = __result.Count; } catch { }
                 string shellId = ""; try { if (shell != null) shellId = shell.ShellId ?? ""; } catch { }
+
+                // DIAGNOSTIC: this postfix runs when the shell LANDS (after its arc), so impactLocation is the
+                // MAP-space hit point. CoopBallistics shipped the BOARD-space ShellVisual target at fire time. Log both
+                // for the same shot to confirm whether the two coordinate spaces differ (they should). Adjudication is
+                // NOT overridden from the shooter - the host stays authoritative for hits via the MSG_IMPACT broadcast
+                // below; only the VISIBLE landing (ShellVisual) is copied (see CoopBallistics).
+                string tgtStr = "";
+                try { if (CoopBallistics.TryGetLastLocalTarget(out var t)) tgtStr = $" | shot tgt=({t.x:0.0},{t.y:0.0})"; } catch { }
+                Log.LogInfo($"[imp] {(CoopP2P.IsHost ? "HOST" : "client")} impact at ({impactLocation.x:0.0},{impactLocation.y:0.0}) shell='{shellId}' hits={count}{tgtStr}");
+
+                if (!CoopP2P.IsHost) return;          // only the host broadcasts the authoritative hit set
+                if (__result == null || count <= 0) return;   // replicate HITS only — client keeps its own fall-of-shot for misses
                 Broadcast(impactLocation, shellId, __result, count);
             }
             catch (Exception e) { Log.LogWarning("[imp] capture: " + e.Message); }

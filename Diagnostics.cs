@@ -64,6 +64,7 @@ namespace IronNestVR
                 Log.LogInfo("[coop] " + CoopCards.Status());
                 Log.LogInfo("[coop] " + CoopScore.Status());
                 Log.LogInfo("[coop] " + CoopImpact.Status());
+                Log.LogInfo("[coop] " + CoopBallistics.Status());
                 Log.LogInfo("[coop] " + CoopPunchcards.Status());
                 Log.LogInfo("[coop] " + CoopNetDiag.Status());
                 if (Config.CoopNetSim) Log.LogInfo("[coop] " + CoopNetSim.Status());

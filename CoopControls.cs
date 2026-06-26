@@ -52,7 +52,7 @@ namespace IronNestVR
         private const byte MSG_VALUE = 4;    // [t][netId i32][value f32]    unreliable drag-control value
         private const byte MSG_GROUP = 5;    // [t][group u8][f32 ...]       unreliable turret/gun state
         private const byte MSG_CLICK = 6;    // [t][netId i32]               reliable   LookAtTarget click
-        private const byte MSG_FIRE = 7;     // [t][side u8]                 reliable   gun discharge (0=L,1=R)
+        private const byte MSG_FIRE = 7;     // [t][side u8][tgtX f32][tgtY f32]  reliable  gun discharge (0=L,1=R) + the SHOOTER's board-local ShellVisual landing target; the peer forces it onto its own shell's visual so the crater lands identically regardless of pre-shot desync (see CoopBallistics)
         private const byte MSG_SNAP = 13;    // [t][9×f32]                   reliable   join-in-progress turret/gun state
         private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
         private const byte MSG_POWDER = 39;  // [t][side u8][charges i32]    reliable   per-gun powder/charge state, EITHER→peer (symmetric, last-writer-wins)
@@ -100,12 +100,11 @@ namespace IronNestVR
         private static readonly Dictionary<int, (ulong Origin, float V)> _pendingVal = new Dictionary<int, (ulong, float)>();
         private static readonly Dictionary<int, ulong> _pendingGrab = new Dictionary<int, ulong>();   // netId -> grab origin
 
-        // Echo guard: when we REPLAY a peer's click/fire, the game flips isClicked/hasFired on our side too,
-        // which our own poll would re-detect and bounce back. Suppress local detection for a control (keyed by
-        // netId; fire uses synthetic keys) for a short window after a replay.
+        // Echo guard: when we REPLAY a peer's click, the game flips isClicked on our side too, which our own poll
+        // would re-detect and bounce back. Suppress local detection for a control (keyed by netId) for a short
+        // window after a replay. (Fire no longer needs this: a shot is announced from the impact postfix, and a
+        // replayed shell is a "remote" shot the postfix skips - so it can never bounce. See CoopBallistics.)
         private static readonly Dictionary<int, float> _echoUntil = new Dictionary<int, float>();
-        private static readonly int FireKeyL = Fnv("__coop_fire_L"), FireKeyR = Fnv("__coop_fire_R");
-        private static bool _firedPrevL, _firedPrevR;
         // Per-gun powder/charge edge-detect: the reload sequence runs locally (the "rammer theatre"), so a button
         // click alone never reproduces the loaded charge on the peer. We watch each gun's PowderCharges and push the
         // VALUE itself, either direction, whenever it changes. int.MinValue = "no baseline yet" (seed silently on the
@@ -139,6 +138,7 @@ namespace IronNestVR
         private static TurretController _turret;
         private static GunController _gunL, _gunR;
         private static int _turretIid = -1;
+
         private static float _nextScan;
         private static float _nextSend;
         private static float _nextRecon;   // host: next current-state reconcile broadcast (REVIEW-fix P3)
@@ -239,7 +239,6 @@ namespace IronNestVR
                 for (int g = 0; g < _grp.Length; g++)
                     if (_grp[g].RemoteOwned && now >= _grp[g].Until) _grp[g].RemoteOwned = false;
 
-                DetectFire(now);
                 DetectPowder(now);
                 DetectAim(now);
 
@@ -287,24 +286,21 @@ namespace IronNestVR
 
         // ---------------- fire events ----------------
 
-        // Replicate a gun discharge so the peer sees the recoil (and, in Phase 4, so it can drive the shared
-        // shell sim). The trigger is a slider on one machine, so the value stream alone wouldn't fire the peer's
-        // gun — we detect the discharge from GunController.hasFired and replay RequestFire on the other side.
-        private static void DetectFire(float now)
+        // A gun discharge is announced to the peer from the SHELLVISUAL hook (CoopBallistics.OnShellVisualPost ->
+        // SendLocalShot), NOT from the GunController.hasFired edge. hasFired flips at RequestFire, BEFORE the fireDelay
+        // coroutine runs FireShell (the old edge shipped NaN). And the map-space hit point isn't resolved until the
+        // shell LANDS seconds later - too late to fire the peer. ShellVisual.Initialize runs at fire time, inside
+        // FireShell, and carries the board-local landing target = exactly what makes the visible shell land where the
+        // shooter's did. So we ship THAT. See [[ironnest-aim-desync]].
+        //
+        // Called by CoopBallistics for a LOCAL shot only (a replayed/remote shot is skipped there, which also breaks
+        // the fire loop - no echo guard needed).
+        internal static void SendLocalShot(GunController gun, Vector2 tgt)
         {
-            if (!Config.CoopClickSync) return;
-            _firedPrevL = DetectFireGun(_gunL, _firedPrevL, 0, FireKeyL, now);
-            _firedPrevR = DetectFireGun(_gunR, _firedPrevR, 1, FireKeyR, now);
-        }
-
-        private static bool DetectFireGun(GunController gun, bool prev, byte side, int echoKey, float now)
-        {
-            if (gun == null) return false;
-            bool fired = false;
-            try { fired = gun.hasFired; } catch { }
-            bool suppressed = _echoUntil.TryGetValue(echoKey, out var u) && now < u;
-            if (fired && !prev && !suppressed) { SendFire(side); Log.LogInfo($"[ctrl] fire gun {side} -> peer"); }
-            return fired;
+            if (!Config.CoopClickSync || !SteamNet.InLobby || !CoopP2P.HasPeer) return;
+            byte side = ((object)gun == (object)_gunR) ? (byte)1 : (byte)0;
+            SendFire(side, tgt);
+            Log.LogInfo($"[ctrl] fire gun {side} -> peer  tgt=({tgt.x:0.0},{tgt.y:0.0})");
         }
 
         // ---------------- powder / charge state (symmetric) ----------------
@@ -842,9 +838,15 @@ namespace IronNestVR
                 {
                     if (len < 2) return;
                     byte side = r.Byte();
+                    float tx = float.NaN, ty = float.NaN;
+                    if (len >= 10) { tx = r.Float(); ty = r.Float(); }   // board-local visible target
+                    // Set the shooter's board target BEFORE RequestFire so our replayed FireShell's ShellVisual hooks
+                    // (CoopBallistics) force the visible arc + crater onto it -> identical landing, regardless of our
+                    // own angle/elevation/powder. No echo guard needed: our replayed shell is a "remote" shot, which
+                    // CoopBallistics skips announcing, so it can't bounce back as a second shot.
+                    if (CoopWire.Finite(tx) && CoopWire.Finite(ty)) CoopBallistics.SetPending(new Vector2(tx, ty));
                     var gun = side == 0 ? _gunL : _gunR;
-                    if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
-                    _echoUntil[side == 0 ? FireKeyL : FireKeyR] = now + 0.3f;
+                    if (gun != null) { try { gun.RequestFire(); Log.LogInfo($"[ctrl] applied remote fire gun {side} <- peer  tgt=({tx:0.0},{ty:0.0})"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
                     break;
                 }
                 case MSG_POWDER:
@@ -1059,10 +1061,13 @@ namespace IronNestVR
             CoopP2P.Send(_buf, w.Length, true);
         }
 
-        private static void SendFire(byte side)
+        private static void SendFire(byte side, Vector2 tgt)
         {
             if (!EnsureBuf()) return;
-            var w = new CoopWire.Writer(_buf); w.Byte(MSG_FIRE); w.Byte(side);
+            // Ship the SHOOTER's board-local landing target (ShellVisual). The peer forces it onto its own shell's
+            // visual so both craters land identically — no pre-shot sync needed.
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_FIRE); w.Byte(side); w.Float(tgt.x); w.Float(tgt.y);
             CoopP2P.Send(_buf, w.Length, true);
         }
 
@@ -1316,7 +1321,7 @@ namespace IronNestVR
             foreach (var c in _byId.Values) { c.LocalOwned = false; c.RemoteOwner = 0; c.PrevDragging = false; c.PrevClicked = false; c.HasRemoteVal = false; }
             for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].RemoteOwner = 0; _grp[i].Has = false; }
             _pendingGrab.Clear(); _pendingVal.Clear(); _echoUntil.Clear();
-            _firedPrevL = false; _firedPrevR = false; _pendingSnap = null;
+            _pendingSnap = null;
             _powderPrevL = int.MinValue; _powderPrevR = int.MinValue;   // re-seed powder baseline on next connect
             _powderAuthoredL = false; _powderAuthoredR = false; _nextPowderBeat = 0f;
             _aimPrevRot = float.NaN; _aimPrevElev = float.NaN; _aimPrevElevL = float.NaN; _aimPrevElevR = float.NaN;

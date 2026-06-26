@@ -144,10 +144,39 @@ namespace IronNestVR
             try
             {
                 var mi = AccessTools.Method(typeof(SleepyNodes.State_ImpactStart), "StartImpact");
+                // POSTFIX (CoopImpact): runs when the shell LANDS - broadcasts the host's authoritative hit set and
+                // logs the map point (diagnostic vs the board target). No prefix: the visible landing is copied at fire
+                // time via the ShellVisual hooks, not here (the map point doesn't exist until the shell lands).
                 if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopImpact), nameof(CoopImpact.OnImpactAdjudicated))); Log.LogInfo("[sim] impact-result capture patched (State_ImpactStart.StartImpact)"); }
                 else Log.LogWarning("[sim] State_ImpactStart.StartImpact not found — map hit-markers won't sync");
             }
             catch (Exception e) { Log.LogWarning("[sim] impact patch: " + e.Message); }
+
+            // DETERMINISTIC FIRING: GunController.FireShell applies RANDOM dispersion with no shared seed, so two
+            // machines firing the SAME synced aim/powder/shell land in DIFFERENT spots. The prefix zeros the gun +
+            // chambered-shell dispersion coefficients for the duration of the native call (postfix restores them),
+            // on BOTH machines, only during a co-op mission — so the impact becomes a deterministic function of the
+            // already-synced inputs and host + client land identically. Solo/flatscreen untouched. See CoopBallistics.
+            try
+            {
+                var mi = AccessTools.Method(typeof(GunController), "FireShell");
+                if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopBallistics), nameof(CoopBallistics.OnFireShellPre)), postfix: new HarmonyMethod(typeof(CoopBallistics), nameof(CoopBallistics.OnFireShellPost))); Log.LogInfo("[sim] deterministic-fire patched (GunController.FireShell — co-op zeros random dispersion)"); }
+                else Log.LogWarning("[sim] GunController.FireShell not found — co-op shots will scatter independently");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] deterministic-fire patch: " + e.Message); }
+
+            // SHELL VISUAL COPY: on a REMOTE shot the prefix replaces ShellVisual's board-local TARGET (the visible
+            // arc + fall-of-shot crater) with the shooter's; the postfix re-writes the stored targetLocalPos field as a
+            // belt-and-suspenders against ref-arg no-op and logs the read-back. On a LOCAL shot the postfix captures
+            // the shooter's real board target to ship (the adjudication map point is copied separately, StartImpact
+            // above). Host + solo + local shots' visuals are otherwise untouched.
+            try
+            {
+                var mi = AccessTools.Method(typeof(ShellVisual), "Initialize");
+                if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopBallistics), nameof(CoopBallistics.OnShellVisualPre)), postfix: new HarmonyMethod(typeof(CoopBallistics), nameof(CoopBallistics.OnShellVisualPost))); Log.LogInfo("[sim] shell-visual copy patched (ShellVisual.Initialize -> shooter board target)"); }
+                else Log.LogWarning("[sim] ShellVisual.Initialize not found — co-op fall-of-shot visual won't copy");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] shell-visual patch: " + e.Message); }
 
             // SCORE / OUTCOME: the host replays mission complete/fail onto the client so the result screens match.
             // CoopScore broadcasts (host-only); the client's replay re-hits these postfixes but bails on !IsHost.
