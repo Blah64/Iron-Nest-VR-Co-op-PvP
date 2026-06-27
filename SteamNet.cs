@@ -312,7 +312,7 @@ namespace IronNestVR
         {
             if (Key(UnityEngine.InputSystem.Key.F7)) LobbyGui.Shown = !LobbyGui.Shown; // show/hide flatscreen lobby panel
             if (!_inited) return;
-            if (Key(UnityEngine.InputSystem.Key.F9)) CreateLobby(ShiftHeld());   // F9 = co-op lobby · Shift+F9 = PvP lobby
+            if (Key(UnityEngine.InputSystem.Key.F9)) CreateLobby(false);   // F9 = co-op lobby (PvE/PvP choice is in the F7 panel)
             if (Key(UnityEngine.InputSystem.Key.F10)) RefreshLobbyList();
             if (Key(UnityEngine.InputSystem.Key.F11)) JoinLobbyByIndex(0);
             if (Key(UnityEngine.InputSystem.Key.F12)) Leave();

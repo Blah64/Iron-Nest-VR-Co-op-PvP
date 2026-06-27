@@ -940,6 +940,7 @@ namespace IronNestVR
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
                     else if (type == PvpPlayers.MSG_PVP_POS) PvpPlayers.OnPacket(type, origin, a, len);
                     else if (type == PvpCombat.MSG_PVP_HIT) PvpCombat.OnPacket(type, origin, a, len);
+                    else if (type == PvpTeams.MSG_PVP_TEAM) PvpTeams.OnPacket(type, origin, a, len);
                     else CoopMap.OnPacket(type, origin, a, len);
                     break;
             }

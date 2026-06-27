@@ -61,6 +61,9 @@ namespace IronNestVR
             try { LobbyGui.Draw(); } catch { }
             try { Notify.DrawFlat(); } catch { }   // non-focus-pulling "X joined" toast (flatscreen)
             try { PvpHud.DrawFlat(); } catch { }   // dev PvP duel readout (non-public builds, in a PvP mission)
+#if !PUBLIC_BUILD
+            try { PvpTeams.DrawPanel(); } catch { }  // dev flatscreen team roster / slot picker (PvP lobby; VR panel TBD)
+#endif
         }
 
         // The game is an FPS that locks the OS cursor to centre for mouselook, so the flatscreen lobby
@@ -419,6 +422,9 @@ namespace IronNestVR
             PvpProbe.Tick();       // PvP plan Phase 0 probes (Ctrl+Shift+1/2/3/4/0/9; inert unless Config.PvpProbe)
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
+#if !PUBLIC_BUILD
+            try { PvpTeams.HandleInput(); } catch { }   // flatscreen team-slot clicks (while the F7 panel frees the cursor)
+#endif
 
             // Phase 2 co-op: P2P pose channel + remote avatar. Tick (peer discovery + receive) and the
             // avatar update run in BOTH modes; the VR head+hand send happens in the frame loop below, the
@@ -447,6 +453,7 @@ namespace IronNestVR
             CoopScore.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate score/requisition (host-authoritative, applied out-of-mission)
             CoopPunchcards.Tick(Time.unscaledDeltaTime); // Phase 4: host-authoritative punchcard deck + redemption
             CoopNetDiag.Tick(Time.unscaledDeltaTime);    // REVIEW-fix: cross-machine desync detector (diagnostic only)
+            PvpTeams.Tick(Time.unscaledDeltaTime);       // PvP teams: host-authoritative roster (inert unless Config.PvpActive)
             PvpMatch.Tick(Time.unscaledDeltaTime);       // PvP Phase 1: match-mode coordinator (inert unless Config.PvpActive)
             PvpPlayers.Tick(Time.unscaledDeltaTime);     // PvP Phase 1: player-as-entity presence + position sync
             if (!_xrReady)

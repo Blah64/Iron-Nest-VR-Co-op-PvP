@@ -40,17 +40,20 @@ namespace IronNestVR
             const float x = 12f, w = 380f, rh = 26f, pad = 8f, gap = 4f;
             int count = SteamNet.Lobbies.Count;
             float listH = (count == 0 ? rh : count * (rh + gap));
-            float h = 28f + rh + pad + rh + pad + rh + listH + pad;
+            float h = 28f + rh + pad + rh + gap + rh + pad + rh + listH + pad;   // +1 button row (PvE/PvP)
             box = new Rect(x, 12f, w, h);
 
             float cy = 12f + 28f;
             labels.Add((new Rect(x + 10f, cy, w - 20f, rh), SteamNet.StatusLine()));
             cy += rh + pad;
 
-            float bw = (w - 20f - 2f * 6f) / 3f;
-            buttons.Add(new Btn { R = new Rect(x + 10f, cy, bw, rh), Label = "Create", Act = SteamNet.CreateLobby, JoinIdx = -1 });
-            buttons.Add(new Btn { R = new Rect(x + 10f + (bw + 6f), cy, bw, rh), Label = "Refresh", Act = SteamNet.RefreshLobbyList, JoinIdx = -1 });
-            buttons.Add(new Btn { R = new Rect(x + 10f + 2f * (bw + 6f), cy, bw, rh), Label = "Leave", Act = SteamNet.Leave, JoinIdx = -1 });
+            // Row 1: choose the lobby mode at creation. Row 2: refresh / leave.
+            float bw = (w - 20f - 6f) / 2f;
+            buttons.Add(new Btn { R = new Rect(x + 10f, cy, bw, rh), Label = "Create PvE", Act = () => SteamNet.CreateLobby(false), JoinIdx = -1 });
+            buttons.Add(new Btn { R = new Rect(x + 10f + (bw + 6f), cy, bw, rh), Label = "Create PvP", Act = () => SteamNet.CreateLobby(true), JoinIdx = -1 });
+            cy += rh + gap;
+            buttons.Add(new Btn { R = new Rect(x + 10f, cy, bw, rh), Label = "Refresh", Act = SteamNet.RefreshLobbyList, JoinIdx = -1 });
+            buttons.Add(new Btn { R = new Rect(x + 10f + (bw + 6f), cy, bw, rh), Label = "Leave", Act = SteamNet.Leave, JoinIdx = -1 });
             cy += rh + pad;
 
             labels.Add((new Rect(x + 10f, cy, w - 20f, rh), "Public lobbies:"));
@@ -76,7 +79,7 @@ namespace IronNestVR
             if (FlatInteractive) { try { Cursor.lockState = CursorLockMode.None; Cursor.visible = true; } catch { } }
 
             Layout(out var box, out var labels, out var buttons);
-            GUI.Box(box, "IRON NEST  —  Co-op Lobbies   (F7 to hide)");
+            GUI.Box(box, "IRON NEST  —  Lobbies  (PvE / PvP)   (F7 to hide)");
             for (int i = 0; i < labels.Count; i++) GUI.Label(labels[i].r, labels[i].s);
             for (int i = 0; i < buttons.Count; i++) GUI.Button(buttons[i].R, buttons[i].Label); // drawn; click handled below
         }

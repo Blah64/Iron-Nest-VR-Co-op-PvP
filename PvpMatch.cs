@@ -35,6 +35,7 @@ namespace IronNestVR
         // rig initializes (a direct MainMenu->Mission start leaves the host's CharacterController inactive = "can't
         // move"; the client already worked because it reaches the mission VIA the map through replicated phases).
         private static bool _launchPending;
+        public static bool LaunchPending => _launchPending;   // for the team-panel Launch button feedback
         private static SleepyNodes.OperationGraph _launchOp;
         private static SleepyNodes.MissionGraph _launchMission;
         private static string _launchScene;

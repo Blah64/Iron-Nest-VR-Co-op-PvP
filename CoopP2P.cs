@@ -100,6 +100,17 @@ namespace IronNestVR
         // The peer's Steam persona name (for the join toast + the avatar name tag); "" when no peer.
         public static string PeerName = "";
 
+        // All OTHER players' SteamIDs (the live peer set; excludes me). Used by PvpTeams so the host can build the
+        // full roster (me + peers). Copies into the caller's list to avoid exposing the internal list.
+        public static void CopyPeerIds(System.Collections.Generic.List<ulong> dst)
+        {
+            dst.Clear();
+            for (int i = 0; i < _peers.Count; i++) dst.Add(_peers[i].m_SteamID);
+        }
+
+        // A peer's Steam persona name (or "" if unknown). For self, callers use SteamFriends.GetPersonaName().
+        public static string NameFor(ulong id) => _peerNames.TryGetValue(id, out var n) ? n : "";
+
         public static bool SelfTest;   // F6: mirror local pose as a fake remote, to verify avatar rendering solo
 
         private static int _sent, _recvd;
