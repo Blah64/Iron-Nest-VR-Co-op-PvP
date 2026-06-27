@@ -169,7 +169,11 @@ namespace IronNestVR
 
         public static void Tick(float dt)
         {
-            if (Config.PvpActive) return;   // PvP: each player owns their OWN turret — no co-op control/turret replication
+            // PvP (Phase B): control sync now runs for TEAMMATES too — a team SHARES one turret. We still broadcast
+            // (the host relay fans out), but the receive-side team gate (OnPacket) drops an opponent's control
+            // packets and they drop ours, so only teammates converge on the shared aim. (Was a hard return here,
+            // which left a 2v2 team's two crew desynced.) Firing stays per-player (CoopBallistics still gated) so a
+            // shot is adjudicated once by its shooter — sharing the gun is Phase C.
             if (!Config.CoopControlSync) return;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer) { if (_byId.Count > 0) ClearOwnership(); return; }
             try
@@ -401,7 +405,9 @@ namespace IronNestVR
 
         public static void LateApply()
         {
-            if (Config.PvpActive) return;   // PvP: no co-op control state to apply
+            // PvP (Phase B): apply TEAMMATE control state too. Remote ownership/state is only ever set by packets
+            // that passed the OnPacket team gate, so this is already teammate-scoped — an opponent's state never
+            // reaches here.
             if (!Config.CoopControlSync) return;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer || _turret == null) return;
             try
@@ -720,11 +726,31 @@ namespace IronNestVR
             return type == CoopMap.MSG_PIECE_MOVE || type == CoopPunchcards.MSG_PUNCH_DIAL;
         }
 
+        // PvP TEAM ISOLATION (Phase B): in a PvP lobby co-op replication is TEAM-SCOPED — a packet from a
+        // NON-teammate is dropped at LOCAL APPLY (the host still relayed it in Deliver; every machine filters
+        // independently, so two teams never share a turret/map/clipboard). A small allowlist stays GLOBAL because
+        // it MUST cross teams: the match lifecycle (everyone enters/leaves the arena together), the PvP combat +
+        // roster channel (shells / HP / team assignments are cross-team by nature), and the host-consumed desync
+        // digest. Everything else (controls, map, clipboard, entities, punchcards, cards, orders, score, impact) is
+        // crew-internal and isolated per team. Pose isn't routed here (CoopP2P handles it; RemoteAvatar hides
+        // opponents). Only consulted when PvpActive, so co-op/solo pay nothing.
+        public static bool IsGlobalType(byte type)
+        {
+            return type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY
+                || type == PvpPlayers.MSG_PVP_POS || type == PvpCombat.MSG_PVP_HIT || type == PvpTeams.MSG_PVP_TEAM
+                || type == CoopNetDiag.MSG_DIGEST;
+        }
+
         // origin = the SteamID that authored this packet (derived by CoopP2P from the Steam `from`, or the
         // host-stamped trailer on a relayed packet). Unused by the control handlers at the 2-player cap; Phase C
         // keys per-control ownership on it so a release from player B doesn't clear player C's lock.
         public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
+            // PvP team gate (Phase B): drop a non-teammate's co-op packet at LOCAL APPLY. The host already relayed
+            // it (Deliver runs RelayInner before this), and every machine filters the same way, so opponents never
+            // share our turret/map/clipboard while teammates still converge. Global types always pass (IsGlobalType).
+            if (Config.PvpActive && !IsGlobalType(type) && !PvpTeams.IsTeammate(origin)) return;
+
             float now = Time.unscaledTime;
             var r = new CoopWire.Reader(a, len, 1);
             switch (type)

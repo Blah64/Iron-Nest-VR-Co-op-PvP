@@ -88,18 +88,24 @@ namespace IronNestVR
             {
                 var poses = CoopP2P.RemotePoses;
 
-                // Drive (or spawn) an avatar for every present peer.
+                // Drive (or spawn) an avatar for every present peer. In PvP, render ONLY teammates — opponents are
+                // isolated (Phase B) and appear solely as a map mirror, never as an in-world body. (IsTeammate is
+                // false until the roster is known, so opponents — and, briefly, teammates — stay hidden until then.)
+                bool pvp = Config.PvpActive;
                 foreach (var kv in poses)
                 {
+                    if (pvp && !PvpTeams.IsTeammate(kv.Key)) continue;
                     Avatar a = GetOrCreate(kv.Key);
                     if (a == null) continue;
                     DriveAvatar(a, kv.Value);
                 }
 
-                // Hide any pooled avatar whose peer dropped out of the dictionary (kept for reuse, not destroyed).
+                // Hide any pooled avatar whose peer dropped out of the dictionary (kept for reuse, not destroyed) —
+                // or, in PvP, is no longer a teammate (so an opponent we briefly rendered before the roster resolved
+                // gets hidden the moment teams are known).
                 _scratchKeys.Clear();
                 foreach (var kv in _avatars)
-                    if (!poses.ContainsKey(kv.Key)) _scratchKeys.Add(kv.Key);
+                    if (!poses.ContainsKey(kv.Key) || (pvp && !PvpTeams.IsTeammate(kv.Key))) _scratchKeys.Add(kv.Key);
                 for (int i = 0; i < _scratchKeys.Count; i++)
                 {
                     var a = _avatars[_scratchKeys[i]];

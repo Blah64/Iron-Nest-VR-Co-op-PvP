@@ -42,10 +42,11 @@ namespace IronNestVR
         private static float _nextSend;
         private const float SendIntervalSec = 0.5f;   // position is static in Phase 1 — a slow reliable keyframe is plenty
 
-        // Placeholder per-side spawn grids (within the coord range Phase 0 observed on the demo maps). Phase 2 will
-        // derive these from each player's actual turret map position / a match-start placement.
-        private static readonly Vector2 HostSpawn = new Vector2(4f, 2f);
-        private static readonly Vector2 ClientSpawn = new Vector2(6f, 8f);
+        // Per-TEAM spawn grids (within the coord range Phase 0 observed on the demo maps). Both teammates pin their
+        // local turret to the SAME team grid so a team reads as ONE vehicle. Phase C derives these from a match-start
+        // placement; the values match the old host/client placeholders so a 1v1 is unchanged (host=team0, client=team1).
+        private static readonly Vector2 Team0Spawn = new Vector2(4f, 2f);
+        private static readonly Vector2 Team1Spawn = new Vector2(6f, 8f);
 
         private static int _sent, _spawned, _moved;
         private static bool _turretPlaced;   // pinned my turret to MyGrid this match?
@@ -103,6 +104,11 @@ namespace IronNestVR
             if (type != MSG_PVP_POS) return;
             if (!Active()) return;                 // only mirror while we're in a PvP mission ourselves
             if (origin == CoopP2P.MyId) return;    // never mirror ourselves
+            // Never mirror a TEAMMATE as an enemy target — they share my vehicle and show as a co-op avatar, not a
+            // map marker to shell. (POS is a GLOBAL type so it still reaches us from teammates; we filter here.) The
+            // roster is known by the time we're in-mission, so this is reliable. Reap a stale teammate mirror if a
+            // late roster flips someone from opponent to ally mid-flight.
+            if (PvpTeams.IsTeammate(origin)) { OnPeerLeft(origin); return; }
             var r = new CoopWire.Reader(a, len, 1);
             float x = r.Float(), y = r.Float();
             int role = r.Int();
@@ -302,9 +308,16 @@ namespace IronNestVR
 
         // ---------------- helpers ----------------
 
-        // My own map grid. PHASE 1: a fixed per-side placeholder (host vs client). Phase 2 derives it from the
-        // player's real turret position / match-start placement.
-        private static Vector2 MyGrid() => CoopP2P.IsHost ? HostSpawn : ClientSpawn;
+        // My own map grid = MY TEAM's spawn (teammates coincide → one shared vehicle position). Falls back to
+        // host/client role until the roster is known (the first frames after join), which keeps a 1v1 identical to
+        // the old per-side placeholders. Phase C derives this from a real match-start placement.
+        private static Vector2 MyGrid()
+        {
+            int team = -1; try { team = PvpTeams.MyTeam; } catch { }
+            if (team == 0) return Team0Spawn;
+            if (team == 1) return Team1Spawn;
+            return CoopP2P.IsHost ? Team0Spawn : Team1Spawn;   // roster not resolved yet — fall back to role
+        }
 
         // Pin THIS player's turret to their deterministic grid (MyGrid) so the firing origin — and therefore the
         // azimuth/range/elevation solution to the fixed enemy marker — is identical every match. The turret moves in
