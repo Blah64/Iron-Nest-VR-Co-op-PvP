@@ -187,6 +187,23 @@ namespace IronNestVR
             return c;
         }
 
+        // ---------------- team CAPTAIN (Phase C: one vehicle per team) ----------------
+        // A team is ONE vehicle, so it needs ONE authoritative representative: the LOWEST SteamID on the team. Every
+        // machine computes the same captain from the shared roster (no election protocol). The captain owns the team's
+        // shared health and is the only member that broadcasts the team's map position — so opponents see exactly one
+        // mirror per enemy team, not one per enemy player. If the captain drops, the next-lowest takes over seamlessly
+        // (non-captains already track the shared health from the captain's keyframes). Returns 0 if the team is empty.
+        public static ulong TeamCaptain(int team)
+        {
+            ulong cap = 0; bool has = false;
+            foreach (var e in _roster.Values)
+                if (e.Team == team && (!has || e.Id < cap)) { cap = e.Id; has = true; }
+            return has ? cap : 0;
+        }
+
+        public static bool IsCaptain(ulong id) { int t = GetTeam(id); return t >= 0 && TeamCaptain(t) == id; }
+        public static bool AmICaptain => IsCaptain(CoopP2P.MyId);
+
         // Fill ordered (id,name) for a team — for the roster GUI. Stable-ish ordering by lowest SteamID.
         public static void FillTeam(int team, List<ulong> ids, List<string> names)
         {

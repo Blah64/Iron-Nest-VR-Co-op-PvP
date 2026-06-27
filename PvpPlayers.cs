@@ -31,8 +31,16 @@ namespace IronNestVR
         public const byte MSG_PVP_POS = 42;   // [t][gridX f][gridY f][role i32][health i32]  — author's map position + HP; either player authors it
         public const int MaxHealth = 100;
 
-        private static int _myHealth = MaxHealth;   // MY authoritative health (victim-authoritative model); broadcast on POS
-        private static bool _eliminated;
+        private static int _teamHealth = MaxHealth;   // MY TEAM's shared health. The team CAPTAIN owns it authoritatively
+                                                       // and broadcasts it on POS; teammates adopt it from the captain's
+                                                       // keyframe. Victim-authoritative, one pool per team (vehicle).
+        private static bool _eliminated;              // my team is at 0 hp
+
+        // Match result, decided LOCALLY from the health state of a 2-team duel: Won = every enemy mirror destroyed,
+        // Lost = my team eliminated. Latched so it's announced once; reset on leaving the mission. (Auto reset / return-
+        // to-lobby is a follow-up; for now the result is declared and players leave the mission to reset.)
+        private enum Result { None, Won, Lost }
+        private static Result _result = Result.None;
 
         private sealed class Mirror { public ulong Origin; public string ID; public GameObject Go; public EntityLocation Loc; public MapEntity Entity; public Vector2 Grid; public int Health; public CanvasGroup Vis; }
         private static readonly Dictionary<ulong, Mirror> _mirrors = new Dictionary<ulong, Mirror>();
@@ -58,8 +66,9 @@ namespace IronNestVR
         {
             if (!Active())
             {
-                // Leaving a PvP mission ends the match: clear mirrors and reset MY health for the next one.
-                if (_mirrors.Count > 0) { ClearMirrors(); _myHealth = MaxHealth; _eliminated = false; Log.LogInfo("[pvp] left PvP mission — cleared player mirrors"); }
+                // Leaving a PvP mission ends the match: clear mirrors and reset team health/result for the next one.
+                if (_mirrors.Count > 0) { ClearMirrors(); Log.LogInfo("[pvp] left PvP mission — cleared player mirrors"); }
+                _teamHealth = MaxHealth; _eliminated = false; _result = Result.None;
                 _turretPlaced = false; _placeTurretAt = 0f;   // re-pin the turret next match
                 return;
             }
@@ -76,7 +85,17 @@ namespace IronNestVR
                     else if (now >= _placeTurretAt && PlaceMyTurret()) _turretPlaced = true;
                 }
 
-                if (now >= _nextSend) { _nextSend = now + SendIntervalSec; BroadcastMyPosition(); }
+                // Only the TEAM CAPTAIN broadcasts the team's keyframe → opponents see ONE mirror per enemy team
+                // (the vehicle), not one per player. Fall back to broadcasting if the roster isn't resolved yet so a
+                // 1v1 still works before the first roster packet lands.
+                if (now >= _nextSend)
+                {
+                    _nextSend = now + SendIntervalSec;
+                    bool roster = false; try { roster = PvpTeams.RosterKnown; } catch { }
+                    if (SafeAmICaptain() || !roster) BroadcastMyPosition();
+                }
+                PruneNonCaptainMirrors();   // reap a non-captain's stale mirror once the roster is known
+                CheckMatchEnd();            // declare win/lose from the team-health state
 #if !PUBLIC_BUILD
                 RevealMirrors();   // TESTING: keep opponents visible through fog (real recon/teleprinter acquisition TBD)
 #endif
@@ -91,7 +110,7 @@ namespace IronNestVR
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_PVP_POS);
             w.Float(g.x); w.Float(g.y); w.Int((int)EntityRoles.Enemy);
-            w.Int(_myHealth);
+            w.Int(_teamHealth);
             if (w.Overflow) { Log.LogWarning("[pvp] pos packet overflow"); return; }
             CoopP2P.Send(_buf, w.Length, true);
             _sent++;
@@ -104,16 +123,26 @@ namespace IronNestVR
             if (type != MSG_PVP_POS) return;
             if (!Active()) return;                 // only mirror while we're in a PvP mission ourselves
             if (origin == CoopP2P.MyId) return;    // never mirror ourselves
-            // Never mirror a TEAMMATE as an enemy target — they share my vehicle and show as a co-op avatar, not a
-            // map marker to shell. (POS is a GLOBAL type so it still reaches us from teammates; we filter here.) The
-            // roster is known by the time we're in-mission, so this is reliable. Reap a stale teammate mirror if a
-            // late roster flips someone from opponent to ally mid-flight.
-            if (PvpTeams.IsTeammate(origin)) { OnPeerLeft(origin); return; }
             var r = new CoopWire.Reader(a, len, 1);
             float x = r.Float(), y = r.Float();
             int role = r.Int();
             int health = r.Int();
             if (r.Bad) return;
+
+            // A TEAMMATE's keyframe is my CAPTAIN announcing the shared team health (allies are co-op avatars, never a
+            // map target). Adopt the team health if I'm not the captain; never spawn an ally mirror. (POS is a GLOBAL
+            // type so it still reaches us from teammates — we filter here.)
+            if (PvpTeams.IsTeammate(origin))
+            {
+                if (!SafeAmICaptain()) AdoptTeamHealth(health);
+                OnPeerLeft(origin);
+                return;
+            }
+
+            // An ENEMY: mirror ONLY the enemy team's CAPTAIN (one vehicle per team). Reap a non-captain's stale mirror
+            // once the roster is known; before it resolves, mirror anyone (1v1 pre-roster fallback).
+            bool roster = false; try { roster = PvpTeams.RosterKnown; } catch { }
+            if (roster && !PvpTeams.IsCaptain(origin)) { OnPeerLeft(origin); return; }
             UpsertRemote(origin, new Vector2(x, y), role, health);
         }
 
@@ -213,16 +242,50 @@ namespace IronNestVR
 
         // ---------------- damage (Phase 2 shot lane, victim-authoritative) ----------------
 
-        // Called by PvpCombat when a peer reports their shell hit MY player. I own my own health: decrement it and
-        // push an immediate keyframe so the attacker's mirror of me updates without waiting for the next tick.
-        public static void ApplyDamageToSelf(int dmg, ulong from)
+        // Called by PvpCombat when a peer reports their shell hit MY team. The hit is addressed to the team CAPTAIN (the
+        // only member with a mirror), so this runs on the captain, who owns the shared team health: decrement it and
+        // push an immediate keyframe so the attacker's mirror AND my teammates update without waiting for the next tick.
+        public static void ApplyTeamDamage(int dmg, ulong from)
         {
             if (dmg <= 0 || _eliminated) return;
-            int before = _myHealth;
-            _myHealth = Clamp(_myHealth - dmg);
-            Log.LogInfo($"[pvp] took {dmg} damage from peer {from} ({before} -> {_myHealth})");
-            if (_myHealth <= 0) { _eliminated = true; Log.LogWarning("[pvp] === YOU WERE ELIMINATED ==="); }
-            try { BroadcastMyPosition(); } catch { }   // immediate health keyframe to the attacker
+            int before = _teamHealth;
+            _teamHealth = Clamp(_teamHealth - dmg);
+            Log.LogInfo($"[pvp] team took {dmg} damage from peer {from} ({before} -> {_teamHealth})");
+            if (_teamHealth <= 0) { _eliminated = true; Log.LogWarning("[pvp] === YOUR TEAM WAS ELIMINATED ==="); }
+            try { BroadcastMyPosition(); } catch { }   // immediate health keyframe (captain) → attacker + teammates
+        }
+
+        // Non-captain: adopt the shared team health announced by my captain's keyframe (HUD + elimination). The captain
+        // is authoritative — I never broadcast it myself.
+        private static void AdoptTeamHealth(int health)
+        {
+            health = Clamp(health);
+            _teamHealth = health;
+            _eliminated = health <= 0;
+        }
+
+        private static bool SafeAmICaptain() { try { return PvpTeams.AmICaptain; } catch { return false; } }
+
+        // Reap any mirror whose origin is no longer the enemy team's captain — a non-captain's mirror lingering from the
+        // pre-roster fallback, or one left after a captain hand-off. One vehicle per enemy team. No-op until roster known.
+        private static void PruneNonCaptainMirrors()
+        {
+            bool roster = false; try { roster = PvpTeams.RosterKnown; } catch { }
+            if (!roster || _mirrors.Count == 0) return;
+            _toRemove.Clear();
+            foreach (var kv in _mirrors) { try { if (!PvpTeams.IsCaptain(kv.Key)) _toRemove.Add(kv.Key); } catch { } }
+            for (int i = 0; i < _toRemove.Count; i++) OnPeerLeft(_toRemove[i]);
+        }
+
+        // Declare the match result locally from the team-health state (2-team duel): my team at 0 = Lost; every enemy
+        // mirror destroyed = Won. Latched + logged once; the HUD reads MatchOver/Won.
+        private static void CheckMatchEnd()
+        {
+            if (_result != Result.None) return;
+            if (_eliminated) { _result = Result.Lost; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM LOST ==="); return; }
+            if (_mirrors.Count == 0) return;
+            foreach (var kv in _mirrors) { var m = kv.Value; if (m != null && m.Health > 0) return; }   // an enemy still alive
+            _result = Result.Won; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM WON ===");
         }
 
         // True if the given MapEntity ID is one of our opponent mirrors; returns that opponent's SteamID.
@@ -368,8 +431,10 @@ namespace IronNestVR
 
         // ---------------- HUD accessors ----------------
 
-        public static int MyHealth => _myHealth;
+        public static int MyHealth => _teamHealth;   // my TEAM's shared health (named for HUD compat)
         public static bool Eliminated => _eliminated;
+        public static bool MatchOver => _result != Result.None;
+        public static bool Won => _result == Result.Won;
         public static Vector2 MyGridPublic => MyGrid();
         public static int MirrorCount => _mirrors.Count;
 
@@ -445,6 +510,6 @@ namespace IronNestVR
 
         // ---------------- diagnostics ----------------
 
-        public static string Status() => $"pvpPlayers: active={Active()} hp={_myHealth}{(_eliminated ? " ELIM" : "")} mirrors={_mirrors.Count} sent={_sent} spawned={_spawned} moved={_moved}";
+        public static string Status() => $"pvpPlayers: active={Active()} teamHp={_teamHealth}{(_eliminated ? " ELIM" : "")}{(_result != Result.None ? " " + _result : "")} cap={SafeAmICaptain()} mirrors={_mirrors.Count} sent={_sent} spawned={_spawned} moved={_moved}";
     }
 }

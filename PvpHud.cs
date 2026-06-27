@@ -21,19 +21,29 @@ namespace IronNestVR
                 var mm = MissionManager.Instance;
                 if (mm == null || mm.CurrentPhase != MissionManager.GamePhase.MissionActive) return;
 
-                const float w = 340f, h = 150f, rh = 20f;
+                const float w = 340f, h = 172f, rh = 20f;
                 float x = 12f, y = Screen.height - h - 12f;
                 GUI.Box(new Rect(x, y, w, h), "PvP DUEL  (dev readout)");
                 float lx = x + 10f, lw = w - 20f, cy = y + 26f;
 
-                GUI.Label(new Rect(lx, cy, lw, rh), $"You: hp {PvpPlayers.MyHealth}/{PvpPlayers.MaxHealth}{(PvpPlayers.Eliminated ? "   *ELIMINATED*" : "")}"); cy += rh;
+                // Match result banner (Phase C) — one vehicle per team, declared from the team-health state.
+                if (PvpPlayers.MatchOver)
+                {
+                    var prev = GUI.contentColor; GUI.contentColor = PvpPlayers.Won ? Color.green : Color.red;
+                    GUI.Label(new Rect(lx, cy, lw, rh), PvpPlayers.Won ? ">> YOUR TEAM WON <<" : ">> YOUR TEAM LOST <<");
+                    GUI.contentColor = prev; cy += rh;
+                }
+
+                int myTeam = -1; try { myTeam = PvpTeams.MyTeam; } catch { }
+                string capTag = PvpTeams.AmICaptain ? " [captain]" : "";
+                GUI.Label(new Rect(lx, cy, lw, rh), $"Your team {(myTeam >= 0 ? (myTeam + 1).ToString() : "?")}{capTag}: hp {PvpPlayers.MyHealth}/{PvpPlayers.MaxHealth}{(PvpPlayers.Eliminated ? "   *ELIMINATED*" : "")}"); cy += rh;
 
                 Vector2 myg = PvpPlayers.MyGridPublic;
-                GUI.Label(new Rect(lx, cy, lw, rh), $"Your grid (placeholder): ({myg.x:0.0}, {myg.y:0.0})"); cy += rh;
+                GUI.Label(new Rect(lx, cy, lw, rh), $"Your grid: ({myg.x:0.0}, {myg.y:0.0})"); cy += rh;
 
                 if (PvpPlayers.TryGetFirstEnemy(out var eg, out var ehp))
                 {
-                    GUI.Label(new Rect(lx, cy, lw, rh), $"ENEMY: grid ({eg.x:0.0}, {eg.y:0.0})   hp {ehp}"); cy += rh;
+                    GUI.Label(new Rect(lx, cy, lw, rh), $"ENEMY TEAM: grid ({eg.x:0.0}, {eg.y:0.0})   hp {ehp}"); cy += rh;
                     if (PvpCombat.LastImpactTime > 0f)
                     {
                         Vector2 li = PvpCombat.LastImpact;

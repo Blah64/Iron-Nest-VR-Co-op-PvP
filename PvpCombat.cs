@@ -15,9 +15,10 @@ namespace IronNestVR
     /// <see cref="PvpPlayers"/> Enemy MapEntity, ID "PVPPLAYER_&lt;origin&gt;"), this player's shell hit that
     /// opponent → broadcast <c>MSG_PVP_HIT</c> addressed to that peer's SteamID.
     ///
-    /// DAMAGE (victim-authoritative, symmetric — no privileged host): the addressed victim applies the damage to
-    /// THEIR OWN health (<see cref="PvpPlayers.ApplyDamageToSelf"/>); their reduced health rides the next
-    /// <c>MSG_PVP_POS</c> keyframe so the attacker's mirror reflects it. The hit packet is BROADCAST (the transport
+    /// DAMAGE (victim-authoritative, symmetric — no privileged host): the addressed victim is the enemy team's
+    /// CAPTAIN (the only member with a mirror), who applies the damage to the shared TEAM health
+    /// (<see cref="PvpPlayers.ApplyTeamDamage"/>); the reduced health rides the next <c>MSG_PVP_POS</c> keyframe so
+    /// both the attacker's mirror and the victim's teammates reflect it. The hit packet is BROADCAST (the transport
     /// is a host-relayed star — a client can't direct-send another client) with the victim's id embedded, so only
     /// the addressed peer applies it (correct for N&gt;2 too; everyone else ignores).
     ///
@@ -110,7 +111,7 @@ namespace IronNestVR
             if (r.Bad) return;
             if (victim != CoopP2P.MyId) return;            // addressed to a different peer (N>2) — ignore
             _taken++;
-            PvpPlayers.ApplyDamageToSelf(dmg, origin);
+            PvpPlayers.ApplyTeamDamage(dmg, origin);       // I'm the addressed team captain → apply to shared team hp
         }
 
         // ---------------- diagnostics ----------------
