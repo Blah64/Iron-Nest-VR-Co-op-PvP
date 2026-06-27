@@ -59,6 +59,7 @@ namespace IronNestVR
         private void OnGUI()
         {
             try { LobbyGui.Draw(); } catch { }
+            try { PvpEffects.DrawFlat(); } catch { }  // PvP damage red-flash (under the HUD/toast; shipping game-feel)
             try { Notify.DrawFlat(); } catch { }   // non-focus-pulling "X joined" toast (flatscreen)
             try { PvpHud.DrawFlat(); } catch { }   // dev PvP duel readout (non-public builds, in a PvP mission)
 #if !PUBLIC_BUILD

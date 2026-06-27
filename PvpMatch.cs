@@ -31,6 +31,20 @@ namespace IronNestVR
         private static bool _cbDisabled;       // counter-battery suppressed for the current arena
         private static float _nextCbSweep;
 
+        // Match-end flow: after a result is declared, hold the banner briefly, then the HOST returns everyone to the
+        // operations map (CoopScene replicates the phase change) so teams unlock and players can re-launch.
+        private static float _matchEndReturnAt;   // when to fire the return (0 = not armed)
+        private const float MatchEndReturnSec = 6f;
+
+        // The base game's counter-battery CINEMATIC IMPACT (explosion VFX + sound) reused as the PvP "an opponent's
+        // round landed on us" hit effect. We disable the scripted barrage (timer + auto-fail) but keep this prefab;
+        // cached from the spawner in DisableCounterBattery, instantiated on each team hit. The spawner's transform is
+        // where the base game lands incoming fire = near the player, so it's the natural anchor. Cleared per match.
+        private static GameObject _impactPrefab;
+        private static Transform _impactAnchor;
+        private static float _impactYOffset;
+        private static int _fxSeq;
+
         // Deferred host launch — route through the operations map (BrowsingMap) before StartOperation so the player
         // rig initializes (a direct MainMenu->Mission start leaves the host's CharacterController inactive = "can't
         // move"; the client already worked because it reaches the mission VIA the map through replicated phases).
@@ -72,7 +86,7 @@ namespace IronNestVR
                 {
                     _wasActive = active;
                     if (active) Log.LogInfo($"[pvp] === PvP MATCH ACTIVE === (role={(CoopP2P.IsHost ? "host" : "client")} peers={CoopP2P.PeerCount}) — each player owns their own turret; opponents appear as enemy map entities");
-                    else { Log.LogInfo("[pvp] === PvP match inactive ==="); _cbDisabled = false; }
+                    else { Log.LogInfo("[pvp] === PvP match inactive ==="); _cbDisabled = false; _impactPrefab = null; _impactAnchor = null; }   // drop the scene-specific impact cache
                 }
 
                 // While in a PvP arena, keep the counter-battery system suppressed (scripted incoming + timer auto-fail).
@@ -81,8 +95,65 @@ namespace IronNestVR
                     _nextCbSweep = Time.unscaledTime + 1f;
                     if (DisableCounterBattery()) _cbDisabled = true;
                 }
+
+                TickMatchEnd();
             }
             catch (Exception e) { Log.LogWarning("[pvp] match tick: " + e.Message); }
+        }
+
+        // ---------------- hit FX (reuse the counter-battery cinematic impact) ----------------
+
+        // Spawn ONE counter-battery cinematic impact (the game's own explosion VFX + sound) near where it lands
+        // incoming fire — the PvP "an opponent's round just landed on us" effect. World-space, so it shows in BOTH
+        // the VR eyes and the flat camera. Called per-machine on a team hit (PvpEffects), so every crew member sees
+        // + hears the round on their vehicle. A golden-angle scatter spreads repeated impacts; a safety Destroy
+        // backstops any prefab that doesn't self-clean. No-op if the arena had no counter-battery spawner (the
+        // Notify card + flatscreen flash still fire), so it degrades gracefully.
+        public static void SpawnIncomingImpact()
+        {
+            try
+            {
+                if (!Config.PvpActive) return;
+                var prefab = _impactPrefab; var anchor = _impactAnchor;
+                if (prefab == null || anchor == null) return;
+                Vector3 b;
+                try { b = anchor.position; } catch { return; }   // anchor destroyed (scene change) — skip
+                float a = (++_fxSeq) * 2.39996323f;              // golden angle — decorrelated scatter, no UnityEngine.Random
+                const float r = 3f;
+                Vector3 pos = new Vector3(b.x + Mathf.Cos(a) * r, b.y + _impactYOffset, b.z + Mathf.Sin(a) * r);
+                var go = UnityEngine.Object.Instantiate(prefab).TryCast<GameObject>();
+                if (go == null) return;
+                try { go.transform.position = pos; } catch { }
+                try { go.SetActive(true); } catch { }
+                try { UnityEngine.Object.Destroy(go, 6f); } catch { }   // backstop cleanup
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] incoming fx: " + e.Message); }
+        }
+
+        // ---------------- match end → back to the lobby ----------------
+
+        // Once PvpPlayers declares a result, hold the banner MatchEndReturnSec, then (HOST only) return to the
+        // operations map. CoopScene edge-detects the host's phase change and replicates GO_TO_PHASE to the clients, so
+        // everyone leaves the arena together → PvpPlayers resets, teams unlock (LockedForMatch false), and the team
+        // panel's LAUNCH is available again. Clients arm the same timer but never drive the phase (they follow).
+        private static void TickMatchEnd()
+        {
+            bool over = false;
+            try { over = Config.PvpActive && InMission() && PvpPlayers.MatchOver; } catch { }
+            if (!over) { _matchEndReturnAt = 0f; return; }
+
+            float now = Time.unscaledTime;
+            if (_matchEndReturnAt <= 0f) { _matchEndReturnAt = now + MatchEndReturnSec; return; }
+            if (now < _matchEndReturnAt) return;
+            _matchEndReturnAt = 0f;
+
+            if (!CoopP2P.IsHost) return;   // host drives the lifecycle; clients follow via CoopScene
+            try
+            {
+                var mm = MissionManager.Instance;
+                if (mm != null) { mm.ReturnToMap(); Log.LogInfo("[pvp] match over — returning to operations map (teams unlock for re-launch)"); }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] match-end return: " + e.Message); }
         }
 
         // ---------------- host launch ----------------
@@ -259,6 +330,12 @@ namespace IronNestVR
                 if (spawners != null) for (int i = 0; i < spawners.Length; i++)
                 {
                     var s = spawners[i].TryCast<CounterBatteryCinematicImpactSpawner>(); if (s == null) continue;
+                    // Keep the cinematic impact prefab (explosion VFX + sound) + its anchor for the PvP hit FX before
+                    // we disable the scripted barrage.
+                    if (_impactPrefab == null)
+                    {
+                        try { var pf = s.impactPrefab; if (pf != null) { _impactPrefab = pf; _impactAnchor = s.transform; _impactYOffset = s.spawnYOffset; Log.LogInfo("[pvp] cached counter-battery impact prefab for hit FX"); } } catch { }
+                    }
                     try { s.enabled = false; any = true; } catch { }
                 }
             }

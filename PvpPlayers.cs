@@ -251,6 +251,7 @@ namespace IronNestVR
             int before = _teamHealth;
             _teamHealth = Clamp(_teamHealth - dmg);
             Log.LogInfo($"[pvp] team took {dmg} damage from peer {from} ({before} -> {_teamHealth})");
+            try { PvpEffects.OnTeamHit(before - _teamHealth, _teamHealth); } catch { }   // captain's own hit cue
             if (_teamHealth <= 0) { _eliminated = true; Log.LogWarning("[pvp] === YOUR TEAM WAS ELIMINATED ==="); }
             try { BroadcastMyPosition(); } catch { }   // immediate health keyframe (captain) → attacker + teammates
         }
@@ -260,8 +261,10 @@ namespace IronNestVR
         private static void AdoptTeamHealth(int health)
         {
             health = Clamp(health);
+            int drop = _teamHealth - health;
             _teamHealth = health;
             _eliminated = health <= 0;
+            if (drop > 0) { try { PvpEffects.OnTeamHit(drop, health); } catch { } }   // teammate feels the captain's hit
         }
 
         private static bool SafeAmICaptain() { try { return PvpTeams.AmICaptain; } catch { return false; } }
@@ -282,10 +285,10 @@ namespace IronNestVR
         private static void CheckMatchEnd()
         {
             if (_result != Result.None) return;
-            if (_eliminated) { _result = Result.Lost; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM LOST ==="); return; }
+            if (_eliminated) { _result = Result.Lost; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM LOST ==="); try { PvpEffects.OnMatchResult(false); } catch { } return; }
             if (_mirrors.Count == 0) return;
             foreach (var kv in _mirrors) { var m = kv.Value; if (m != null && m.Health > 0) return; }   // an enemy still alive
-            _result = Result.Won; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM WON ===");
+            _result = Result.Won; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM WON ==="); try { PvpEffects.OnMatchResult(true); } catch { }
         }
 
         // True if the given MapEntity ID is one of our opponent mirrors; returns that opponent's SteamID.
