@@ -84,7 +84,12 @@ namespace IronNestVR
             // turret — PvpPlayers.PlaceMyTurret pins each turret to a deterministic grid at match start (these gate the
             // mission NODES, not TurretController.SetTurretLocation the METHOD, so our own placement + the player's
             // manual map-move still work).
-            foreach (var nodeName in new[] { "State_SpawnScoutPlane", "State_DamageEntity", "State_SetEntityState", "State_MoveMapEntity", "State_MoveTurret", "State_SetTurretLocation" })
+            // State_StartTimer / State_UnpauseTimer are the SCRIPTED counter-battery arming on the FDC "Challenging"
+            // mission: the graph runs State_StartTimer (gated behind "player fired") → CounterBatteryTimer starts →
+            // the scene's wired klaxon/lights fire (onTimerStarted) on whoever fired (the host). Gating the NODE kills
+            // the scripted counter-battery on BOTH machines at the source; PvpMatch then drives the timer DIRECTLY
+            // (TurretController-independent) as the VICTIM's hit effect. We skip the node's action; the graph advances.
+            foreach (var nodeName in new[] { "State_SpawnScoutPlane", "State_DamageEntity", "State_SetEntityState", "State_MoveMapEntity", "State_MoveTurret", "State_SetTurretLocation", "State_StartTimer", "State_UnpauseTimer" })
             {
                 try
                 {

@@ -82,6 +82,9 @@ namespace IronNestVR
             // look so the camera doesn't spin. Gated to CoopLoopback + an Active link → shipped play is untouched.
             bool testLink = !_xrReady && Config.CoopLoopback && LoopbackTransport.Active;
             bool freeCursor = lobbyFlat || (testLink && (LoopbackTransport.FreeCursor || AltHeld()));
+#if !PUBLIC_BUILD
+            PvpTeams.FlatInteractive = freeCursor;   // team-panel clicks work whenever the cursor is actually free (F7 OR loopback Alt/Ctrl+F5)
+#endif
             if (freeCursor)
             {
                 try { UnityEngine.Cursor.lockState = UnityEngine.CursorLockMode.None; UnityEngine.Cursor.visible = true; } catch { }

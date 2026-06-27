@@ -24,12 +24,35 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        // Candidate arena scenes (demo combat maps). The first that resolves to a MissionGraph is launched.
-        private static readonly string[] ArenaSceneHints = { "chill", "challenging" };
+        // Candidate arena scenes (demo combat maps), in PREFERENCE order (earliest wins). 'Challenging' (ChallangeFDC)
+        // is preferred because it ships the COUNTER-BATTERY system — we disable its scripted barrage but reuse its
+        // impact prefab for the PvP hit FX (Chill has no counter-battery, so the explosion couldn't play there). Chill
+        // stays as a fallback if Challenging doesn't resolve.
+        private static readonly string[] ArenaSceneHints = { "challenging", "chill" };
 
         private static bool _wasActive;
-        private static bool _cbDisabled;       // counter-battery suppressed for the current arena
-        private static float _nextCbSweep;
+
+        // PvP "you got hit" effect = the base game's OWN counter-battery-impact FEEL, driven directly on the VICTIM
+        // (what the user described seeing in the real game: massive screenshake + the screen darkening + a hit sound):
+        //   • SCREEN SHAKE — the bunker physically SWINGS. SwingController.TriggerExternalImpulse(worldXZ, twist) is the
+        //     one-shot external impulse the game exposes (the same swing system the gun-fire bridge drives, just bigger).
+        //     Always present (the cockpit's SwingController), so it does NOT depend on the gated counter-battery objects.
+        //   • DARKEN — the bunker lights cut. SwingLightFlickerController.SetMasterPower(false) kills them; we restore
+        //     (true, withSequence) a beat later → the "power disruption" flicker.
+        //   • EXPLOSIONS — a barrage of the cinematic impact prefab around the player (VFX; carries the boom if the
+        //     prefab emits on enable). The native CounterBatteryTimer is NOT used: with the scripted sequence sim-gated,
+        //     the timer GameObject stays inactive and can't be found (client log: no timer ⇒ the old klaxon drive no-op'd).
+        private static CounterBatteryTimer _cbTimer;                       // cached (suppression backstop only)
+        private static CounterBatteryCinematicImpactSpawner _cbSpawner;    // cached (impact-prefab source)
+        private static SwingController _swing;                             // the bunker swing driver = SCREEN SHAKE
+        private static SwingLightFlickerController _flicker;               // the bunker light power/flicker = DARKEN
+        private static float _swingStrength;     // resolved from a scene SwingImpulseOnEnable (the game's authored scale); 0 ⇒ use default
+        private static float _flickerRestoreAt;  // when to restore the lights after a darken (0 = not armed)
+        private static bool _cbFound;            // located the arena FX systems at least once this arena
+        private static float _nextCbScan;        // periodic full re-scan (re-acquire refs, suppress any leaked timer start)
+        private const float HitSwingMultiplier = 3f;     // a counter-battery hit ≈ 3× a gun-fire swing ("massive")
+        private const float DefaultSwingStrength = 9f;   // fallback impulse magnitude if no SwingImpulseOnEnable is found
+        private const float FlickerDarkSec = 1.1f;       // how long the lights stay cut before the restore flicker
 
         // Match-end flow: after a result is declared, hold the banner briefly, then the HOST returns everyone to the
         // operations map (CoopScene replicates the phase change) so teams unlock and players can re-launch.
@@ -44,6 +67,11 @@ namespace IronNestVR
         private static Transform _impactAnchor;
         private static float _impactYOffset;
         private static int _fxSeq;
+        private static int _pendingImpacts;        // remaining impacts in the current salvo
+        private static float _nextImpactAt;
+        private static bool _warnedNoImpactPrefab;
+        private const int BurstCount = 8;          // a sustained barrage (not a single pop), spread across the burst
+        private const float BurstIntervalSec = 0.7f;   // 8 × 0.7s ≈ 5.6s of walking impacts — reads as a counter-battery salvo
 
         // Deferred host launch — route through the operations map (BrowsingMap) before StartOperation so the player
         // rig initializes (a direct MainMenu->Mission start leaves the host's CharacterController inactive = "can't
@@ -86,48 +114,140 @@ namespace IronNestVR
                 {
                     _wasActive = active;
                     if (active) Log.LogInfo($"[pvp] === PvP MATCH ACTIVE === (role={(CoopP2P.IsHost ? "host" : "client")} peers={CoopP2P.PeerCount}) — each player owns their own turret; opponents appear as enemy map entities");
-                    else { Log.LogInfo("[pvp] === PvP match inactive ==="); _cbDisabled = false; _impactPrefab = null; _impactAnchor = null; }   // drop the scene-specific impact cache
+                    else { Log.LogInfo("[pvp] === PvP match inactive ==="); _cbFound = false; _cbTimer = null; _cbSpawner = null; _swing = null; _flicker = null; _swingStrength = 0f; _flickerRestoreAt = 0f; _impactPrefab = null; _impactAnchor = null; _pendingImpacts = 0; _warnedNoImpactPrefab = false; }   // drop the scene-specific caches
                 }
 
-                // While in a PvP arena, keep the counter-battery system suppressed (scripted incoming + timer auto-fail).
-                if (active && InMission() && !_cbDisabled && Time.unscaledTime >= _nextCbSweep)
-                {
-                    _nextCbSweep = Time.unscaledTime + 1f;
-                    if (DisableCounterBattery()) _cbDisabled = true;
-                }
+                // While in a PvP arena: locate the swing/light/impact FX, keep the scripted counter-battery idle, and
+                // restore the lights after a hit's darken. The hit effect itself is driven from PvpEffects.OnTeamHit.
+                if (active && InMission()) TickCounterBattery();
 
                 TickMatchEnd();
+                TickHitFx();
             }
             catch (Exception e) { Log.LogWarning("[pvp] match tick: " + e.Message); }
         }
 
         // ---------------- hit FX (reuse the counter-battery cinematic impact) ----------------
 
-        // Spawn ONE counter-battery cinematic impact (the game's own explosion VFX + sound) near where it lands
-        // incoming fire — the PvP "an opponent's round just landed on us" effect. World-space, so it shows in BOTH
-        // the VR eyes and the flat camera. Called per-machine on a team hit (PvpEffects), so every crew member sees
-        // + hears the round on their vehicle. A golden-angle scatter spreads repeated impacts; a safety Destroy
-        // backstops any prefab that doesn't self-clean. No-op if the arena had no counter-battery spawner (the
-        // Notify card + flatscreen flash still fire), so it degrades gracefully.
+        // A team hit just landed on US (the victim). Deliver the counter-battery "an opponent's round hit us" effect.
+        // PRIMARY: drive the base game's OWN counter-battery sequence on the victim (scene-wired lights + klaxon +
+        // the spawner's walking cinematic impacts) via a brief, non-expiring timer burst — the real thing the user
+        // wants. GUARANTEED FALLBACK: also instantiate the cinematic impact prefab directly (world-space, so it shows
+        // in BOTH the VR eyes and the flat camera) so there's visible feedback even if the native trigger no-ops or the
+        // arena has no live timer. Called per-machine on a team hit (PvpEffects) ⇒ every crew member feels it.
         public static void SpawnIncomingImpact()
         {
+            if (!Config.PvpActive) return;
+
+            // DARKEN: cut the bunker lights now; TickFlickerRestore brings them back (with the restore flicker) a beat later.
+            TriggerLightFlicker();
+
+            // SHAKE + EXPLOSIONS: a sustained barrage — each impact SWINGS the bunker (screen shake) and drops an
+            // explosion around us. Drains over ~5.6s in TickHitFx (≫ 1s, so it reads as a counter-battery pounding).
+            _pendingImpacts = BurstCount;
+            SpawnOneImpactNow();                 // first impact immediately (instant feedback)
+            _pendingImpacts--;
+            _nextImpactAt = Time.unscaledTime + BurstIntervalSec;
+        }
+
+        // Drain the queued salvo, one impact per BurstIntervalSec. Driven from Tick.
+        private static void TickHitFx()
+        {
+            if (_pendingImpacts <= 0) return;
+            if (Time.unscaledTime < _nextImpactAt) return;
+            SpawnOneImpactNow();
+            _pendingImpacts--;
+            _nextImpactAt = Time.unscaledTime + BurstIntervalSec;
+        }
+
+        // ONE beat of the barrage: SWING the bunker (screen shake) + drop one explosion around the player.
+        private static void SpawnOneImpactNow()
+        {
+            TriggerSwingHit();      // bunker swing = screen shake (each beat re-shakes, so it's sustained)
+            SpawnExplosionNow();    // explosion VFX around the player (+ boom if the prefab emits on enable)
+        }
+
+        // SCREEN SHAKE: a one-shot external swing impulse on the bunker — the same swing system the gun-fire bridge
+        // drives, scaled up so a counter-battery hit reads as "massive." Magnitude is grounded in the game's authored
+        // SwingImpulseOnEnable.strength (resolved in ScanCounterBattery) × HitSwingMultiplier; the SwingReceiver clamps
+        // to its maxTilt, so a generous value can't fling the view past the rig's own limits. Golden-angle direction so
+        // the barrage shoves the view around rather than one-axis.
+        private static void TriggerSwingHit()
+        {
+            var sc = _swing; if (sc == null) return;
             try
             {
-                if (!Config.PvpActive) return;
-                var prefab = _impactPrefab; var anchor = _impactAnchor;
-                if (prefab == null || anchor == null) return;
-                Vector3 b;
-                try { b = anchor.position; } catch { return; }   // anchor destroyed (scene change) — skip
-                float a = (++_fxSeq) * 2.39996323f;              // golden angle — decorrelated scatter, no UnityEngine.Random
-                const float r = 3f;
-                Vector3 pos = new Vector3(b.x + Mathf.Cos(a) * r, b.y + _impactYOffset, b.z + Mathf.Sin(a) * r);
+                try { sc.allowExternalOneShot = true; } catch { }   // the gate TriggerExternalImpulse checks
+                float mag = (_swingStrength > 0.01f ? _swingStrength : DefaultSwingStrength) * HitSwingMultiplier;
+                float a = (++_fxSeq) * 2.39996323f;                 // golden angle — decorrelated, no UnityEngine.Random
+                Vector2 impulse = new Vector2(Mathf.Cos(a), Mathf.Sin(a)) * mag;
+                float twist = ((_fxSeq & 1) == 0 ? 1f : -1f) * mag * 0.4f;
+                sc.TriggerExternalImpulse(impulse, twist);
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] swing hit: " + e.Message); }
+        }
+
+        // DARKEN: cut the bunker lights (power disruption). TickFlickerRestore brings them back with the restore flicker.
+        private static void TriggerLightFlicker()
+        {
+            var fc = _flicker; if (fc == null) return;
+            try
+            {
+                fc.SetMasterPower(false, false);   // lights out now
+                _flickerRestoreAt = Time.unscaledTime + FlickerDarkSec;
+                Log.LogInfo("[pvp] hit: bunker lights cut (darken) + swing shake");
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] light flicker: " + e.Message); }
+        }
+
+        // Restore the lights a beat after a darken (true, withSequence = the flicker-back-on power-restore animation).
+        private static void TickFlickerRestore(float now)
+        {
+            if (_flickerRestoreAt <= 0f || now < _flickerRestoreAt) return;
+            _flickerRestoreAt = 0f;
+            var fc = _flicker; if (fc == null) return;
+            try { fc.SetMasterPower(true, true); } catch { }
+        }
+
+        // EXPLOSIONS: instantiate ONE cinematic impact on the ground around the PLAYER (camera-anchored so it's reliably
+        // near + visible; falls back to the spawner anchor, then origin). Golden-angle scatter + a safety Destroy.
+        private static void SpawnExplosionNow()
+        {
+            if (_impactPrefab == null)
+            {
+                if (!_warnedNoImpactPrefab) { _warnedNoImpactPrefab = true; Log.LogWarning("[pvp] hit FX: no impact prefab cached — shake + darken only"); }
+                return;
+            }
+            try
+            {
+                var prefab = _impactPrefab;
+
+                Vector3 center; string src;
+                var cam = Camera.main;
+                if (cam != null) { center = cam.transform.position; center.y -= 1.4f; src = "camera"; }   // ~ground at the player's feet
+                else { center = AnchorPos(out bool ok); src = ok ? "spawner" : "origin"; }
+
+                float a = (++_fxSeq) * 2.39996323f;          // golden angle — decorrelated scatter, no UnityEngine.Random
+                float r = 3.5f + (_fxSeq % 3);               // 3.5..5.5 m out, so the salvo walks around the player
+                Vector3 pos = new Vector3(center.x + Mathf.Cos(a) * r, center.y + _impactYOffset, center.z + Mathf.Sin(a) * r);
+
                 var go = UnityEngine.Object.Instantiate(prefab).TryCast<GameObject>();
                 if (go == null) return;
                 try { go.transform.position = pos; } catch { }
                 try { go.SetActive(true); } catch { }
                 try { UnityEngine.Object.Destroy(go, 6f); } catch { }   // backstop cleanup
+#if !PUBLIC_BUILD
+                Log.LogInfo($"[pvp] hit FX impact at {pos.ToString("0.0")} (anchor={src})");
+#endif
             }
-            catch (Exception e) { Log.LogWarning("[pvp] incoming fx: " + e.Message); }
+            catch (Exception e) { Log.LogWarning("[pvp] hit FX spawn: " + e.Message); }
+        }
+
+        private static Vector3 AnchorPos(out bool ok)
+        {
+            ok = false;
+            try { if (_impactAnchor != null) { ok = true; return _impactAnchor.position; } } catch { }
+            return Vector3.zero;
         }
 
         // ---------------- match end → back to the lobby ----------------
@@ -307,20 +427,45 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[pvp] catalog: " + e.Message); }
         }
 
-        // ---------------- bare arena: counter-battery ----------------
+        // ---------------- bare arena: arena FX (locate swing/lights + suppress the scripted counter-battery) ----------------
 
-        // Pause the scripted counter-battery timer + disable its cinematic impact spawner (scripted incoming fire AND
-        // the timer-expiry auto-fail that would end a duel). Returns true once it found+suppressed at least one.
-        private static bool DisableCounterBattery()
+        // Per-frame while in a PvP arena: (re)scan for the swing/flicker/impact systems, restore the lights after a
+        // darken, and keep the scripted counter-battery timer idle as a backstop (the node gate is the primary off).
+        private static void TickCounterBattery()
         {
-            bool any = false;
+            float now = Time.unscaledTime;
+            if (now >= _nextCbScan) { _nextCbScan = now + 1f; ScanCounterBattery(); }
+            SuppressNativeCached();      // backstop: pause any leaked scripted timer start; keep the native spawner off
+            TickFlickerRestore(now);     // bring the bunker lights back after a darken
+        }
+
+        // Full scan: locate the SwingController (shake) + SwingLightFlickerController (darken) + a SwingImpulseOnEnable
+        // (for the authored impulse magnitude), cache the counter-battery impact prefab for the explosion barrage, and
+        // keep any scripted counter-battery timer/spawner idle (the node gate already suppresses the scripted start).
+        private static void ScanCounterBattery()
+        {
+            bool foundNow = false;
+            // Swing systems (always present in the cockpit) — the shake + darken drivers.
+            if (_swing == null)
+            {
+                try { var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<SwingController>(), FindObjectsSortMode.None); if (arr != null && arr.Length > 0) _swing = arr[0].TryCast<SwingController>(); } catch { }
+            }
+            if (_flicker == null)
+            {
+                try { var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<SwingLightFlickerController>(), FindObjectsSortMode.None); if (arr != null && arr.Length > 0) _flicker = arr[0].TryCast<SwingLightFlickerController>(); } catch { }
+            }
+            if (_swingStrength <= 0f) ResolveSwingStrength();
+            if (_swing != null) foundNow = true;
+
+            // Counter-battery impact prefab (explosion VFX) + idle the scripted timer/spawner (backstop to the node gate).
             try
             {
                 var timers = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<CounterBatteryTimer>(), FindObjectsSortMode.None);
                 if (timers != null) for (int i = 0; i < timers.Length; i++)
                 {
                     var t = timers[i].TryCast<CounterBatteryTimer>(); if (t == null) continue;
-                    try { t.PauseTimer(); any = true; } catch { }
+                    if (_cbTimer == null) _cbTimer = t;
+                    try { if (t.IsRunning) t.PauseTimer(); } catch { }   // backstop a leaked scripted start (reversible)
                 }
             }
             catch { }
@@ -330,18 +475,64 @@ namespace IronNestVR
                 if (spawners != null) for (int i = 0; i < spawners.Length; i++)
                 {
                     var s = spawners[i].TryCast<CounterBatteryCinematicImpactSpawner>(); if (s == null) continue;
-                    // Keep the cinematic impact prefab (explosion VFX + sound) + its anchor for the PvP hit FX before
-                    // we disable the scripted barrage.
-                    if (_impactPrefab == null)
-                    {
-                        try { var pf = s.impactPrefab; if (pf != null) { _impactPrefab = pf; _impactAnchor = s.transform; _impactYOffset = s.spawnYOffset; Log.LogInfo("[pvp] cached counter-battery impact prefab for hit FX"); } } catch { }
-                    }
-                    try { s.enabled = false; any = true; } catch { }
+                    if (_cbSpawner == null) _cbSpawner = s;
+                    foundNow = true;
+                    if (_impactPrefab == null) { try { var pf = s.impactPrefab; if (pf != null) { _impactPrefab = pf; _impactAnchor = s.transform; _impactYOffset = s.spawnYOffset; } } catch { } }
+                    try { if (s.enabled) s.enabled = false; } catch { }   // we provide explosions manually — keep the native walker off
                 }
             }
             catch { }
-            if (any) Log.LogInfo("[pvp] counter-battery suppressed (no scripted incoming fire / timer auto-fail in the duel arena)");
-            return any;
+            // If no live spawner exposed an impact prefab, search ALL loaded objects (incl. inactive + asset prefabs).
+            if (_impactPrefab == null) TryResolveImpactPrefabFromResources();
+            if (foundNow && !_cbFound)
+            {
+                _cbFound = true;
+                Log.LogInfo($"[pvp] arena FX located — swing={(_swing != null)} flicker={(_flicker != null)} swingStrength={_swingStrength:0.0} impactPrefab={(_impactPrefab != null)}");
+            }
+        }
+
+        // The game's authored swing scale: the largest SwingImpulseOnEnable.strength in the scene (e.g. the gun-fire
+        // swing). We multiply this by HitSwingMultiplier for a "massive" counter-battery hit. Default if none found.
+        private static void ResolveSwingStrength()
+        {
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<SwingImpulseOnEnable>(), FindObjectsSortMode.None);
+                if (arr == null) return;
+                float best = 0f;
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    var s = arr[i].TryCast<SwingImpulseOnEnable>(); if (s == null) continue;
+                    try { float st = s.strength; if (st > best) best = st; } catch { }
+                }
+                if (best > 0f) _swingStrength = best;
+            }
+            catch { }
+        }
+
+        // Per-frame cheap backstop: if a scripted counter-battery start leaked past the node gate, PAUSE it (reversible)
+        // and keep the native impact walker off (we own the explosions). The node gate is the primary suppression.
+        private static void SuppressNativeCached()
+        {
+            try { if (_cbTimer != null && _cbTimer.IsRunning) _cbTimer.PauseTimer(); } catch { }
+            try { if (_cbSpawner != null && _cbSpawner.enabled) _cbSpawner.enabled = false; } catch { }
+        }
+
+        // Last-resort impact-prefab resolve: scan every loaded CounterBatteryCinematicImpactSpawner (active, inactive,
+        // or asset) for a non-null impactPrefab, so the manual fallback salvo can play even where no live spawner runs.
+        private static void TryResolveImpactPrefabFromResources()
+        {
+            try
+            {
+                var arr = Resources.FindObjectsOfTypeAll(Il2CppType.Of<CounterBatteryCinematicImpactSpawner>());
+                if (arr == null) return;
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    var s = arr[i].TryCast<CounterBatteryCinematicImpactSpawner>(); if (s == null) continue;
+                    try { var pf = s.impactPrefab; if (pf != null) { _impactPrefab = pf; _impactYOffset = s.spawnYOffset; return; } } catch { }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] resolve impact prefab: " + e.Message); }
         }
 
         // ---------------- helpers ----------------
@@ -352,6 +543,6 @@ namespace IronNestVR
             catch { return false; }
         }
 
-        public static string Status() => $"pvpMatch: mode={(Config.PvpActive ? "PvP" : "coop")} active={Active} cbDisabled={_cbDisabled}";
+        public static string Status() => $"pvpMatch: mode={(Config.PvpActive ? "PvP" : "coop")} active={Active} fx={(_cbFound ? "found" : "-")} swing={(_swing != null)} flicker={(_flicker != null)}";
     }
 }

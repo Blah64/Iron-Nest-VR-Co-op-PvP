@@ -276,6 +276,10 @@ namespace IronNestVR
         private static Rect _launchRect;
         private static bool _launchShown;
         private static bool _launchEnabled;
+        // Set by VrManager = the cursor is actually FREE on flatscreen (F7 open OR the loopback Alt/Ctrl+F5 free). The
+        // team panel clicks gate on THIS, not LobbyGui.FlatInteractive — otherwise a loopback tester who freed the
+        // cursor with Alt/Ctrl+F5 (not F7) saw the panel but its Launch/slot clicks were silently ignored.
+        public static bool FlatInteractive;
 
         public static void DrawPanel() { try { BuildPanel(true); } catch { } }
 
@@ -284,15 +288,19 @@ namespace IronNestVR
         {
             try
             {
-                if (!LobbyGui.FlatInteractive || !Config.PvpActive || !SteamNet.InLobby) return;
+                if (!FlatInteractive || !Config.PvpActive || !SteamNet.InLobby) return;
                 var m = UnityEngine.InputSystem.Mouse.current;
                 if (m == null || !m.leftButton.wasPressedThisFrame) return;
                 float mx = m.position.x.ReadValue(), my = m.position.y.ReadValue();
                 var gui = new Vector2(mx, Screen.height - my);   // mouse is Y-up; GUI is Y-down
                 BuildPanel(false);                                // refresh _openSlots/_launchRect without drawing
                 for (int i = 0; i < _openSlots.Count; i++)
-                    if (_openSlots[i].r.Contains(gui)) { RequestSwitch(_openSlots[i].team); return; }
-                if (_launchShown && _launchEnabled && _launchRect.Contains(gui)) { try { PvpMatch.LaunchArena(); } catch { } }
+                    if (_openSlots[i].r.Contains(gui)) { Log.LogInfo($"[pvp] team-switch slot clicked -> team {_openSlots[i].team + 1}"); RequestSwitch(_openSlots[i].team); return; }
+                if (_launchShown && _launchRect.Contains(gui))
+                {
+                    if (_launchEnabled) { Log.LogInfo("[pvp] LAUNCH button clicked -> launching arena"); try { PvpMatch.LaunchArena(); } catch { } }
+                    else Log.LogInfo($"[pvp] LAUNCH clicked but disabled (teams {CountTeam(0)} vs {CountTeam(1)} — need 1+ on each)");
+                }
             }
             catch { }
         }
