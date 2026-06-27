@@ -30,6 +30,8 @@ namespace IronNestVR
         private const string ModKey = "invr_coop";   // lobby-data marker so the browser lists only our lobbies
         private const string ModVal = "1";
         private const string NameKey = "name";
+        private const string ModeKey = "invr_mode";   // "coop" | "pvp" — host tags the lobby; members derive Config.PvpActive (PLAN-pvp.md §1a)
+        private static bool _pendingPvp;              // mode of the lobby we're about to create (consumed in OnLobbyCreated)
         private static int MaxMembers => Config.CoopMaxPlayers;   // lobby member cap (Config-driven; see CoopMaxPlayers)
 
         // Shared IL2CPP dispatcher, so pumping ourselves is safe. Flip off only if it ever proves otherwise.
@@ -54,7 +56,8 @@ namespace IronNestVR
         public static bool InLobby
         {
             get => _inLobby || LoopbackTransport.Connected;
-            set => _inLobby = value;
+            // Leaving any lobby clears the derived PvP mode (covers leave / join-fail / auto-leave in one place).
+            set { _inLobby = value; if (!value) Config.PvpActive = false; }
         }
 
         public struct LobbyEntry { public CSteamID Id; public string Name; public int Members; public int Max; }
@@ -124,16 +127,28 @@ namespace IronNestVR
             }
         }
 
-        public static void CreateLobby()
+        public static void CreateLobby() => CreateLobby(false);
+
+        // pvp=true tags the new lobby invr_mode=pvp; every member then derives Config.PvpActive on enter.
+        public static void CreateLobby(bool pvp)
         {
             try
             {
                 if (_crCreate == null) { Log.LogWarning("[net] create: not ready"); return; }
+                _pendingPvp = pvp;
                 LeaveCurrentIfAny();   // one lobby at a time — don't accumulate orphan lobbies
-                Log.LogInfo($"[net] creating PUBLIC lobby (max {MaxMembers})…");
+                Log.LogInfo($"[net] creating PUBLIC {(pvp ? "PvP" : "co-op")} lobby (max {MaxMembers})…");
                 _crCreate.Set(SteamMatchmaking.CreateLobby(ELobbyType.k_ELobbyTypePublic, MaxMembers));
             }
             catch (Exception e) { Log.LogError("[net] CreateLobby: " + e); }
+        }
+
+        // Derive Config.PvpActive from a lobby's invr_mode tag (called by both host on-create and every member on-enter).
+        private static void ApplyMode(string mode)
+        {
+            bool pvp = string.Equals(mode, "pvp", StringComparison.OrdinalIgnoreCase);
+            if (Config.PvpActive != pvp) Log.LogInfo($"[net] lobby mode = {(pvp ? "PvP" : "co-op")} → Config.PvpActive={pvp}");
+            Config.PvpActive = pvp;
         }
 
         // Leave whatever lobby we're in (no-op if none). Steam lets one user join many lobbies at once, so
@@ -226,7 +241,10 @@ namespace IronNestVR
             string name = SteamFriends.GetPersonaName() + "'s turret #" + (id.m_SteamID % 1000UL);
             SteamMatchmaking.SetLobbyData(id, ModKey, ModVal);   // marker so it appears in our filtered browser
             SteamMatchmaking.SetLobbyData(id, NameKey, name);
-            Log.LogInfo($"[net] LOBBY CREATED  id={id.m_SteamID}  name='{name}'  (public, max {MaxMembers}). Other instances see it via F10.");
+            string mode = _pendingPvp ? "pvp" : "coop";
+            SteamMatchmaking.SetLobbyData(id, ModeKey, mode);    // co-op | pvp — members derive Config.PvpActive on enter
+            ApplyMode(mode);                                     // host adopts its own chosen mode immediately
+            Log.LogInfo($"[net] LOBBY CREATED  id={id.m_SteamID}  name='{name}'  mode={mode}  (public, max {MaxMembers}). Other instances see it via F10.");
         }
 
         private static void OnLobbyList(LobbyMatchList_t r, bool ioFail)
@@ -268,8 +286,9 @@ namespace IronNestVR
                 return;
             }
             CurrentLobby = id; InLobby = true;
+            ApplyMode(SteamMatchmaking.GetLobbyData(id, ModeKey));   // derive PvP/co-op from the host's tag (default coop)
             int members = SteamMatchmaking.GetNumLobbyMembers(id);
-            Log.LogInfo($"[net] ENTERED lobby {id.m_SteamID} — {members} member(s)  (enterResponse={e.m_EChatRoomEnterResponse})");
+            Log.LogInfo($"[net] ENTERED lobby {id.m_SteamID} — {members} member(s)  mode={(Config.PvpActive ? "pvp" : "coop")}  (enterResponse={e.m_EChatRoomEnterResponse})");
             for (int i = 0; i < members; i++)
             {
                 var m = SteamMatchmaking.GetLobbyMemberByIndex(id, i);
@@ -283,11 +302,17 @@ namespace IronNestVR
             catch { return false; }
         }
 
+        private static bool ShiftHeld()
+        {
+            try { var kb = UnityEngine.InputSystem.Keyboard.current; return kb != null && (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed); }
+            catch { return false; }
+        }
+
         private static void PollKeys()
         {
             if (Key(UnityEngine.InputSystem.Key.F7)) LobbyGui.Shown = !LobbyGui.Shown; // show/hide flatscreen lobby panel
             if (!_inited) return;
-            if (Key(UnityEngine.InputSystem.Key.F9)) CreateLobby();
+            if (Key(UnityEngine.InputSystem.Key.F9)) CreateLobby(ShiftHeld());   // F9 = co-op lobby · Shift+F9 = PvP lobby
             if (Key(UnityEngine.InputSystem.Key.F10)) RefreshLobbyList();
             if (Key(UnityEngine.InputSystem.Key.F11)) JoinLobbyByIndex(0);
             if (Key(UnityEngine.InputSystem.Key.F12)) Leave();

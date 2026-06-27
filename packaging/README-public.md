@@ -1,9 +1,9 @@
 # IRON NEST VR & CO-OP
-> This package contains **only the mod**. You install BepInEx yourself first
-> (step 1) — it's a one-time setup.
-
 This mod lets players play in VR and to play cooperative multiplayer with up to 3 other players in the same Iron Nest.
 Crossplay is supported with flatscreen players.
+
+> This package contains **only the mod**. You install BepInEx yourself first
+> (step 1) — it's a one-time setup.
 
 ## 1. Install BepInEx 6 (IL2CPP, x64)
 This is an IL2CPP Unity game, so it needs **BepInEx 6 (IL2CPP)** — *not*

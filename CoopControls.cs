@@ -169,6 +169,7 @@ namespace IronNestVR
 
         public static void Tick(float dt)
         {
+            if (Config.PvpActive) return;   // PvP: each player owns their OWN turret — no co-op control/turret replication
             if (!Config.CoopControlSync) return;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer) { if (_byId.Count > 0) ClearOwnership(); return; }
             try
@@ -400,6 +401,7 @@ namespace IronNestVR
 
         public static void LateApply()
         {
+            if (Config.PvpActive) return;   // PvP: no co-op control state to apply
             if (!Config.CoopControlSync) return;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer || _turret == null) return;
             try
@@ -692,7 +694,8 @@ namespace IronNestVR
                 // client's punchcard action reached the host but never the other clients at N>2). Host-only types
                 // (MSG_PUNCH_DECK/CONSUME/GRAPH) stay off this list.
                 || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
-                || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_DIAL;
+                || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_DIAL
+                || type == PvpPlayers.MSG_PVP_POS;   // PvP player position — either player authors it; host relays to other clients (N>2)
         }
 
         // Streaming packet types the host relays UNRELIABLE (high-rate, loss-tolerant). MSG_POSE is handled by
@@ -934,6 +937,7 @@ namespace IronNestVR
                              || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_CONSUME
                              || type == CoopPunchcards.MSG_PUNCH_GRAPH || type == CoopPunchcards.MSG_PUNCH_DIAL) CoopPunchcards.OnPacket(type, origin, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
+                    else if (type == PvpPlayers.MSG_PVP_POS) PvpPlayers.OnPacket(type, origin, a, len);
                     else CoopMap.OnPacket(type, origin, a, len);
                     break;
             }

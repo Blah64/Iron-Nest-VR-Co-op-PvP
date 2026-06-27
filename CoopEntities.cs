@@ -104,6 +104,7 @@ namespace IronNestVR
 
         public static void Tick(float dt)
         {
+            if (Config.PvpActive) return;   // PvP manages its own player-entities (PvpPlayers) — not the co-op host→client mirror
             if (!Config.CoopEntitySync) return;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer) { if (_sent.Count > 0 || _mirrors.Count > 0) ClearAll(); return; }
             try

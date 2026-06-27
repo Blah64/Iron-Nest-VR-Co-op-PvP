@@ -70,6 +70,30 @@ namespace IronNestVR
             Log.LogInfo($"[sim] host-authoritative SPAWN gate (narrow): {_patched}/1 spawn-node method patched " +
                         "(client runs its own mission machinery; only spawns are host-authoritative; host + solo run normally)");
 
+            // PvP BARE ARENA (PLAN-pvp.md Appendix A): suppress scripted PvE content on BOTH machines while PvpActive,
+            // so a duel scene is just map + artillery + the two players. These prefixes are inert unless PvpActive, so
+            // co-op + solo are untouched. State_SpawnMapEntity is already covered (GatePrefix gained a PvpActive branch).
+            try
+            {
+                var sp = AccessTools.Method(typeof(SleepyNodes.State_SpawnScoutPlane), "OnEnter");
+                if (sp != null) { _harmony.Patch(sp, prefix: new HarmonyMethod(typeof(CoopSim), nameof(PvpSuppressPrefix))); Log.LogInfo("[sim] PvP scout-plane suppressor patched (State_SpawnScoutPlane.OnEnter — inert unless PvpActive)"); }
+                else Log.LogWarning("[sim] State_SpawnScoutPlane.OnEnter not found — PvP scout suppression off");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] scout patch: " + e.Message); }
+
+            // PvP DIAGNOSTIC: log every FirstPersonController.SetFrozen call while PvpActive (postfix, no behaviour
+            // change) so we can see the mission intro's freeze/unfreeze pattern. Inert in co-op/solo. (A prefix that
+            // BLOCKED freeze was wrong — it left the game's FPC.Update calling Move on a controller the mission had
+            // deactivated, spamming "inactive controller" + tanking fps. The fix mechanism is TBD from this diag.)
+            try
+            {
+                var fr = AccessTools.Method(typeof(FirstPersonController), "SetFrozen", new[] { typeof(bool) })
+                         ?? AccessTools.Method(typeof(FirstPersonController), "SetFrozen");
+                if (fr != null) { _harmony.Patch(fr, postfix: new HarmonyMethod(typeof(PvpMatch), nameof(PvpMatch.LogSetFrozen))); Log.LogInfo("[sim] PvP player-freeze diagnostic patched (FirstPersonController.SetFrozen — logs only, inert unless PvpActive)"); }
+                else Log.LogWarning("[sim] FirstPersonController.SetFrozen not found — can't trace PvP player freeze");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] freeze-diag patch: " + e.Message); }
+
             // TELEPRINTER ORDERS are the ONE thing the client can't resolve locally: the gated spawn node is what
             // stashes the target in a graph context variable, so a client that skips it prints a BLANK order (the
             // 2026-06-20 "empty text prompt"). So the HOST captures every resolved Teleprinter.SubmitLines via a
@@ -210,6 +234,9 @@ namespace IronNestVR
             // CRITICAL: this prefix runs on EVERY spawn-node entry for host AND client. It must NEVER throw — a
             // throw here would propagate into the game's mission state machine and break the mission for everyone.
             // Any error → behave as "don't gate" (run the original), the safe default.
+            // PvP: a duel arena spawns NO scripted enemies/targets on EITHER machine (PvpPlayers spawns the players).
+            try { if (Config.PvpActive) { float tp = Time.unscaledTime; if (tp >= _nextGateLog) { _nextGateLog = tp + 1f; Log.LogInfo("[sim] PvP SPAWN-gate ACTIVE — bare arena, no scripted spawns on either machine"); } return false; } }
+            catch { }
             try { if (!ShouldGate()) return true; }   // run original (solo or host, or on any error)
             catch { return true; }
             float t = Time.unscaledTime;
@@ -217,10 +244,16 @@ namespace IronNestVR
             return false;                     // skip original (client) — no local spawn
         }
 
+        // PvP-only node suppressor: skip the patched node ONLY in a PvP arena (returns false). Otherwise run the
+        // original (returns true), so co-op + solo are unaffected. Never throws into the graph. Used for content
+        // nodes co-op deliberately leaves running (scout plane, etc.) but a bare PvP arena must not.
+        public static bool PvpSuppressPrefix() { try { return !Config.PvpActive; } catch { return true; } }
+
         // Gate only for a co-op CLIENT actually connected to a peer. Solo play and the host are never gated.
         // (No mission-phase check needed: the spawn node only runs during a mission anyway.)
         public static bool ShouldGate()
         {
+            if (Config.PvpActive) return false;   // co-op's client spawn-gate doesn't apply in PvP (PvP sim-gating is separate, later phase)
             if (!Config.CoopSimAuthority) return false;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer) return false;
             return !CoopP2P.IsHost;

@@ -422,6 +422,20 @@ namespace IronNestVR
 #endif
         public static bool CrashHeartbeat = DefaultCrashHeartbeat;
 
+        // PvP PLAN — Phase 0 feasibility probes (PvpProbe). DEV-ONLY: spawns marker entities, nudges the turret,
+        // and logs the engine's shell adjudication so the PvP plan's runtime assumptions can be proven before any
+        // feature code. OFF by default on every build flavor (it mutates the live scene on chorded keypresses) —
+        // set "PvpProbe=true" in IronNestVR.cfg to arm it; the keys + impact-logger patch are inert otherwise, so a
+        // normal co-op/flatscreen session is untouched. See PvpProbe.cs and PLAN-pvp.md §5.
+        public static bool PvpProbe = false;
+
+        // PvP MODE master switch (PLAN-pvp.md §1a, Appendix B). DERIVED at runtime, never a cfg toggle: the host's
+        // lobby is tagged invr_mode=coop|pvp (SteamNet), and every member reads it on lobby-enter → PvpActive. While
+        // true, the conflicting co-op replication (control/fire/impact sync, client spawn-gate, entity mirror) is
+        // disabled and the PvP modules (PvpMatch/PvpPlayers) drive instead. Reset to false on leaving a lobby. A dev
+        // build can also toggle it manually (PvpMatch, loopback testing). Default false ⇒ co-op/solo untouched.
+        public static bool PvpActive = false;
+
         // --- Diagnostics / quick toggles for live tuning ---
         // Phase 2.5 isolation: render each eye as a flat clear color (no scene) to prove the
         // swapchain copy + projection-layer submission path independent of scene rendering.
@@ -1012,6 +1026,7 @@ namespace IronNestVR
                 case "LowSpecForceQualityLevel": LowSpecForceQualityLevel = PB(v, LowSpecForceQualityLevel); break;
                 case "LowSpecQualityLevel": LowSpecQualityLevel = PI(v, LowSpecQualityLevel); break;
                 case "CrashHeartbeat": CrashHeartbeat = PB(v, CrashHeartbeat); break;
+                case "PvpProbe": PvpProbe = PB(v, PvpProbe); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;

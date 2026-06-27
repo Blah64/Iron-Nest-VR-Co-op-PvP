@@ -187,6 +187,7 @@ namespace IronNestVR
         // Only act for an in-mission co-op session with a peer. Solo/host-without-peer = stock.
         private static bool Active()
         {
+            if (Config.PvpActive) return false;   // PvP owns its own shot lane — never replay/zero co-op fire here
             if (!Config.CoopDeterministicFire) return false;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer) return false;
             try { var mm = MissionManager.Instance; return mm != null && mm.CurrentPhase == MissionManager.GamePhase.MissionActive; }

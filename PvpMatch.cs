@@ -1,0 +1,382 @@
+using System;
+using BepInEx.Logging;
+using Il2CppInterop.Runtime;
+using UnityEngine;
+
+namespace IronNestVR
+{
+    /// <summary>
+    /// PvP Phase 1/2 — MATCH COORDINATOR + LAUNCH. Owns the PvP-mode lifecycle:
+    ///   • MODE is derived in SteamNet from the lobby's invr_mode tag into Config.PvpActive (PLAN-pvp.md §1a).
+    ///   • LAUNCH: the HOST starts the duel arena from the lobby (it's not on the demo board, so we resolve the
+    ///     combat MissionGraph/OperationGraph by scene name and call MissionManager.StartOperation directly). The
+    ///     existing CoopScene host→client replication then carries every member into the SAME scene together — so
+    ///     nobody loads the arena alone and runs its clock ahead of the others.
+    ///   • BARE ARENA: the scripted PvE content is suppressed so a duel scene is just map + artillery + the two
+    ///     players — spawn/scout nodes via CoopSim's PvP prefixes (installed at load, before any scene boots, so no
+    ///     script fires early), and the counter-battery system (scripted incoming fire + its timer-expiry auto-fail)
+    ///     disabled here once the arena scene is live.
+    ///
+    /// Co-op is fully isolated: when PvpActive the conflicting co-op replication self-disables (Appendix B guards).
+    /// Match state (rounds, win/lose) and the shot/damage lane grow here + in PvpCombat in later phases.
+    /// </summary>
+    internal static class PvpMatch
+    {
+        private static ManualLogSource Log => Plugin.Logger;
+
+        // Candidate arena scenes (demo combat maps). The first that resolves to a MissionGraph is launched.
+        private static readonly string[] ArenaSceneHints = { "chill", "challenging" };
+
+        private static bool _wasActive;
+        private static bool _cbDisabled;       // counter-battery suppressed for the current arena
+        private static float _nextCbSweep;
+
+        private static float _nextPlayerDump;   // throttle the per-mission player-state diagnostic
+
+        // Deferred host launch — route through the operations map (BrowsingMap) before StartOperation so the player
+        // rig initializes (a direct MainMenu->Mission start leaves the host's CharacterController inactive = "can't
+        // move"; the client already worked because it reaches the mission VIA the map through replicated phases).
+        private static bool _launchPending;
+        private static SleepyNodes.OperationGraph _launchOp;
+        private static SleepyNodes.MissionGraph _launchMission;
+        private static string _launchScene;
+        private static float _launchStartAt;     // when to fire StartOperation once in BrowsingMap (0 = not armed yet)
+        private static float _launchDeadline;    // give up if BrowsingMap never comes up
+        private static float _nextEnterTry;      // throttle EnterBrowsingMap re-issue while stuck at MainMenu
+
+        public static bool Active => Config.PvpActive && SteamNet.InLobby && CoopP2P.HasPeer;
+
+        public static void Tick(float dt)
+        {
+            try
+            {
+#if !PUBLIC_BUILD
+                var kb = UnityEngine.InputSystem.Keyboard.current;
+                if (kb != null && (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed)
+                               && (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed))
+                {
+                    // DEV: loopback has no Steam lobby data — force the mode for testing. Ctrl+Shift+M.
+                    if (kb[UnityEngine.InputSystem.Key.M].wasPressedThisFrame)
+                    {
+                        Config.PvpActive = !Config.PvpActive;
+                        Log.LogInfo($"[pvp] DEV toggle → Config.PvpActive={Config.PvpActive} (co-op replication {(Config.PvpActive ? "DISABLED" : "restored")})");
+                    }
+                    // DEV: host launches the arena. Ctrl+Shift+L. (Eventual UI: a lobby "Launch Match" button.)
+                    if (kb[UnityEngine.InputSystem.Key.L].wasPressedThisFrame) LaunchArena();
+                    // DEV: force-unfreeze the player (diagnostic probe for the "can't move after mission start" bug).
+                    if (kb[UnityEngine.InputSystem.Key.U].wasPressedThisFrame) ForceUnfreezeProbe();
+                }
+#endif
+
+                TickLaunch();   // drive a deferred host launch (MainMenu -> operations map -> StartOperation)
+
+                bool active = Active;
+                if (active != _wasActive)
+                {
+                    _wasActive = active;
+                    if (active) Log.LogInfo($"[pvp] === PvP MATCH ACTIVE === (role={(CoopP2P.IsHost ? "host" : "client")} peers={CoopP2P.PeerCount}) — each player owns their own turret; opponents appear as enemy map entities");
+                    else { Log.LogInfo("[pvp] === PvP match inactive ==="); _cbDisabled = false; }
+                }
+
+                // While in a PvP arena, keep the counter-battery system suppressed (scripted incoming + timer auto-fail).
+                if (active && InMission() && !_cbDisabled && Time.unscaledTime >= _nextCbSweep)
+                {
+                    _nextCbSweep = Time.unscaledTime + 1f;
+                    if (DisableCounterBattery()) _cbDisabled = true;
+                }
+
+                // DIAGNOSTIC: while in a PvP arena, log the player controller state once/sec so we can see exactly
+                // how the mission intro is locking movement (playerCanMove flag vs disabled CharacterController vs
+                // deactivated player GameObject). The earlier playerCanMove watchdog never fired → the freeze is NOT
+                // that flag; this dump + the Ctrl+Shift+U force-unfreeze probe pin the real mechanism.
+                if (active && InMission()) DumpPlayerState();
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] match tick: " + e.Message); }
+        }
+
+        // ---------------- host launch ----------------
+
+        // Host resolves the combat arena (MissionGraph by scene-name hint + its owning OperationGraph) and starts it.
+        // CRITICAL: it does NOT call StartOperation directly from the MainMenu — that jumps MainMenu->Mission and
+        // skips the operations map (BrowsingMap) where the player rig initializes, leaving the host's
+        // CharacterController inactive ("can't move" + Move-on-inactive-controller spam). The client never hit this
+        // because it reaches the mission VIA the map (the host's replicated GO_TO_PHASE then MISSION_START). So the
+        // host launch ROUTES THROUGH the operations map first (EnterBrowsingMap, settle, then StartOperation) —
+        // the deferred steps run in TickLaunch. CoopScene replicates each phase so clients still follow.
+        public static void LaunchArena()
+        {
+            if (!CoopP2P.IsHost) { Log.LogWarning("[pvp] launch: only the HOST launches the match"); return; }
+            if (!Config.PvpActive) { Log.LogWarning("[pvp] launch: not a PvP lobby (host with Shift+F9, or DEV Ctrl+Shift+M first) — aborting so the arena isn't started un-gated"); return; }
+
+            var mm = MissionManager.Instance;
+            if (mm == null) { Log.LogWarning("[pvp] launch: no MissionManager"); return; }
+
+            // Always log the full catalog on a launch so the right scene/mission is visible in the log even on a hit.
+            DumpMissionCatalog();
+
+            SleepyNodes.OperationGraph foundOp = null; SleepyNodes.MissionGraph foundMission = null; string foundScene = null;
+            int bestHint = int.MaxValue;   // prefer the EARLIEST hint in ArenaSceneHints (chill before challenging)
+            try
+            {
+                var ops = Resources.FindObjectsOfTypeAll(Il2CppType.Of<SleepyNodes.OperationGraph>());
+                if (ops != null) for (int i = 0; i < ops.Length && bestHint > 0; i++)
+                {
+                    var op = ops[i].TryCast<SleepyNodes.OperationGraph>(); if (op == null) continue;
+                    var missions = op.Missions; if (missions == null) continue;
+                    for (int j = 0; j < missions.Count && bestHint > 0; j++)
+                    {
+                        var node = missions[j]; if (node == null) continue;
+                        MissionGraphPair(node, out var mg, out var scene);
+                        if (mg == null) continue;
+                        int h = ArenaHintIndex(scene);
+                        if (h >= 0 && h < bestHint) { foundOp = op; foundMission = mg; foundScene = scene; bestHint = h; }
+                    }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] launch scan: " + e.Message); }
+
+            if (foundOp == null || foundMission == null)
+            {
+                Log.LogWarning("[pvp] launch: no arena scene matched " + string.Join("/", ArenaSceneHints) + " — see the mission catalog above to correct the hint.");
+                return;
+            }
+
+            int phase = -1; try { phase = (int)mm.CurrentPhase; } catch { }
+            if (phase == (int)MissionManager.GamePhase.MissionActive) { Log.LogWarning("[pvp] launch: already in a mission — return to the menu/map first"); return; }
+
+            string mid = "?", oid = "?";
+            try { mid = foundMission.MissionID; } catch { } try { oid = foundOp.OperationID; } catch { }
+
+            // Queue the launch; TickLaunch fires StartOperation once the operations map is up (and settled).
+            _launchOp = foundOp; _launchMission = foundMission; _launchScene = foundScene;
+            _launchPending = true; _launchDeadline = Time.unscaledTime + 30f; _nextEnterTry = 0f;
+
+            if (phase == (int)MissionManager.GamePhase.BrowsingMap)
+            {
+                _launchStartAt = Time.unscaledTime + 0.5f;   // already in the map — brief settle, then start
+                Log.LogInfo($"[pvp] launch QUEUED (in operations map): scene='{foundScene}' mission='{mid}' op='{oid}' — starting shortly");
+            }
+            else
+            {
+                _launchStartAt = 0f;   // from MainMenu: TickLaunch will EnterBrowsingMap, then arm the start
+                Log.LogInfo($"[pvp] launch QUEUED (routing through operations map first for player init): scene='{foundScene}' mission='{mid}' op='{oid}'");
+            }
+        }
+
+        // Drives a queued launch: MainMenu -> EnterBrowsingMap -> (settle) -> StartOperation. Each phase change is
+        // picked up by CoopScene and replicated, so clients follow through the same map->mission path.
+        private static void TickLaunch()
+        {
+            if (!_launchPending) return;
+            try
+            {
+                var mm = MissionManager.Instance; if (mm == null) return;
+                int phase = (int)mm.CurrentPhase;
+                float now = Time.unscaledTime;
+
+                if (phase == (int)MissionManager.GamePhase.MissionActive) { _launchPending = false; return; }   // started (or someone else did)
+                if (now >= _launchDeadline) { _launchPending = false; Log.LogWarning("[pvp] launch: timed out routing through the operations map — aborted"); return; }
+
+                if (phase == (int)MissionManager.GamePhase.BrowsingMap)
+                {
+                    if (_launchStartAt <= 0f) { _launchStartAt = now + 2f; Log.LogInfo("[pvp] launch: operations map up — settling player rig before starting the arena"); return; }
+                    if (now < _launchStartAt) return;
+                    _launchPending = false;
+                    string mid = "?", oid = "?"; try { mid = _launchMission.MissionID; } catch { } try { oid = _launchOp.OperationID; } catch { }
+                    Log.LogInfo($"[pvp] LAUNCHING arena scene='{_launchScene}' mission='{mid}' op='{oid}' — CoopScene carries the client(s) in");
+                    try { mm.StartOperation(_launchOp, _launchMission); }
+                    catch (Exception e) { Log.LogError("[pvp] StartOperation failed: " + e); }
+                }
+                else   // MainMenu (or unknown) — get into the operations map first
+                {
+                    if (now >= _nextEnterTry)
+                    {
+                        _nextEnterTry = now + 3f;   // throttle so we don't restart the map load every frame
+                        try { mm.EnterBrowsingMap(); Log.LogInfo("[pvp] launch: entering operations map…"); }
+                        catch (Exception e) { Log.LogWarning("[pvp] EnterBrowsingMap: " + e.Message); }
+                    }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] launch tick: " + e.Message); }
+        }
+
+        private static void MissionGraphPair(SleepyNodes.MissionNode node, out SleepyNodes.MissionGraph mg, out string scene)
+        {
+            mg = null; scene = null;
+            try { mg = node.Mission; } catch { }
+            if (mg == null) return;
+            try { var sr = mg.SceneReference; scene = sr.sceneName; } catch { }
+        }
+
+        // Index in ArenaSceneHints of the first hint contained in the scene name (lower = preferred), or -1 if none.
+        private static int ArenaHintIndex(string scene)
+        {
+            if (string.IsNullOrEmpty(scene)) return -1;
+            string s = scene.ToLowerInvariant();
+            for (int i = 0; i < ArenaSceneHints.Length; i++) if (s.Contains(ArenaSceneHints[i])) return i;
+            return -1;
+        }
+
+        // Diagnostic: list every OperationGraph → its missions → scene, so we can confirm/correct the arena hint.
+        public static void DumpMissionCatalog()
+        {
+            try
+            {
+                var ops = Resources.FindObjectsOfTypeAll(Il2CppType.Of<SleepyNodes.OperationGraph>());
+                int n = ops != null ? ops.Length : 0;
+                Log.LogInfo($"[pvp] === MISSION CATALOG ({n} operation graph(s)) ===");
+                for (int i = 0; i < n; i++)
+                {
+                    var op = ops[i].TryCast<SleepyNodes.OperationGraph>(); if (op == null) continue;
+                    string oid = "?", disp = "?"; try { oid = op.OperationID; } catch { } try { disp = op.displayName; } catch { }
+                    var missions = op.Missions; int mc = missions != null ? missions.Count : 0;
+                    Log.LogInfo($"[pvp]  op '{oid}' ('{disp}') — {mc} mission(s)");
+                    for (int j = 0; j < mc; j++)
+                    {
+                        var node = missions[j]; if (node == null) continue;
+                        MissionGraphPair(node, out var mg, out var scene);
+                        string mid = "?"; try { if (mg != null) mid = mg.MissionID; } catch { }
+                        string mtype = "?"; try { if (mg != null) mtype = mg.MissionType.ToString(); } catch { }
+                        Log.LogInfo($"[pvp]    mission '{mid}' scene='{scene}' type={mtype}");
+                    }
+                }
+                Log.LogInfo("[pvp] === end catalog ===");
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] catalog: " + e.Message); }
+        }
+
+        // ---------------- bare arena: counter-battery ----------------
+
+        // Pause the scripted counter-battery timer + disable its cinematic impact spawner (scripted incoming fire AND
+        // the timer-expiry auto-fail that would end a duel). Returns true once it found+suppressed at least one.
+        private static bool DisableCounterBattery()
+        {
+            bool any = false;
+            try
+            {
+                var timers = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<CounterBatteryTimer>(), FindObjectsSortMode.None);
+                if (timers != null) for (int i = 0; i < timers.Length; i++)
+                {
+                    var t = timers[i].TryCast<CounterBatteryTimer>(); if (t == null) continue;
+                    try { t.PauseTimer(); any = true; } catch { }
+                }
+            }
+            catch { }
+            try
+            {
+                var spawners = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<CounterBatteryCinematicImpactSpawner>(), FindObjectsSortMode.None);
+                if (spawners != null) for (int i = 0; i < spawners.Length; i++)
+                {
+                    var s = spawners[i].TryCast<CounterBatteryCinematicImpactSpawner>(); if (s == null) continue;
+                    try { s.enabled = false; any = true; } catch { }
+                }
+            }
+            catch { }
+            if (any) Log.LogInfo("[pvp] counter-battery suppressed (no scripted incoming fire / timer auto-fail in the duel arena)");
+            return any;
+        }
+
+        // ---------------- player-freeze diagnostics ----------------
+
+        // Harmony POSTFIX on FirstPersonController.SetFrozen(bool) (registered by CoopSim.ApplyPatches). DIAGNOSTIC
+        // ONLY — logs every freeze/unfreeze call while PvpActive so we can see the mission intro's freeze pattern
+        // (is SetFrozen(true) called and never followed by SetFrozen(false)?). No behaviour change. __0 = first arg.
+        public static void LogSetFrozen(bool __0)
+        {
+            try { if (Config.PvpActive) Log.LogInfo($"[pvp-diag] FirstPersonController.SetFrozen({__0})"); } catch { }
+        }
+
+        // Periodic dump of EVERY CharacterController in the scene (by name + enabled/active) plus each FPC's
+        // playerCanMove. The "inactive controller" the game keeps Move-ing is NOT the FPC's (that one reads
+        // active), so enumerate them all to find the disabled one by its owner GameObject name. Throttled (2s) to
+        // limit log volume while the inactive-controller error is already spamming.
+        private static void DumpPlayerState()
+        {
+            try
+            {
+                if (Time.unscaledTime < _nextPlayerDump) return;
+                _nextPlayerDump = Time.unscaledTime + 2f;
+
+                var ccs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<CharacterController>());
+                int n = ccs != null ? ccs.Length : 0;
+                Log.LogInfo($"[pvp-diag] === CharacterControllers: {n} (incl prefabs) ===");
+                for (int i = 0; i < n; i++)
+                {
+                    var cc = ccs[i].TryCast<CharacterController>(); if (cc == null) continue;
+                    string nm = "?", scn = "?"; bool en = false, act = false;
+                    try { nm = cc.gameObject.name; } catch { }
+                    try { var s = cc.gameObject.scene; scn = s.IsValid() ? s.name : "<prefab>"; } catch { }
+                    try { en = cc.enabled; } catch { }
+                    try { act = cc.gameObject.activeInHierarchy; } catch { }
+                    Log.LogInfo($"[pvp-diag]  CC '{nm}' scene='{scn}' enabled={en} active={act}");
+                }
+
+                var fpcs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<FirstPersonController>());
+                int fn = fpcs != null ? fpcs.Length : 0;
+                for (int i = 0; i < fn; i++)
+                {
+                    var f = fpcs[i].TryCast<FirstPersonController>(); if (f == null) continue;
+                    bool prefab = false; try { prefab = !f.gameObject.scene.IsValid(); } catch { }
+                    if (prefab) continue;
+                    string nm = "?"; bool cm = false; try { nm = f.gameObject.name; } catch { } try { cm = f.playerCanMove; } catch { }
+                    Log.LogInfo($"[pvp-diag]  FPC '{nm}' playerCanMove={cm}");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp-diag] player dump: " + e.Message); }
+        }
+
+        // DEV probe (Ctrl+Shift+U): re-enable EVERY in-scene CharacterController (and unfreeze every FPC) and log
+        // the before-state. The previous probe only touched FPC.controller (already active) — the walk-blocking
+        // controller is a different one, so enable them all and see if walk returns. Whatever flips fixes it = the
+        // lever to automate.
+        public static void ForceUnfreezeProbe()
+        {
+            try
+            {
+                Log.LogInfo("[pvp-diag] === FORCE-UNFREEZE probe ===");
+                var fpcs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<FirstPersonController>());
+                int fn = fpcs != null ? fpcs.Length : 0;
+                for (int i = 0; i < fn; i++)
+                {
+                    var f = fpcs[i].TryCast<FirstPersonController>(); if (f == null) continue;
+                    bool prefab = false; try { prefab = !f.gameObject.scene.IsValid(); } catch { }
+                    if (prefab) continue;
+                    try { f.gameObject.SetActive(true); } catch { }
+                    try { f.enabled = true; } catch { }
+                    try { f.SetFrozen(false); } catch { }
+                    try { f.playerCanMove = true; } catch { }
+                }
+
+                var ccs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<CharacterController>());
+                int n = ccs != null ? ccs.Length : 0;
+                int acted = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    var cc = ccs[i].TryCast<CharacterController>(); if (cc == null) continue;
+                    bool prefab = false; try { prefab = !cc.gameObject.scene.IsValid(); } catch { }
+                    if (prefab) continue;
+                    string nm = "?"; bool en = false, act = false;
+                    try { nm = cc.gameObject.name; } catch { }
+                    try { en = cc.enabled; } catch { }
+                    try { act = cc.gameObject.activeInHierarchy; } catch { }
+                    Log.LogInfo($"[pvp-diag]  before CC '{nm}' enabled={en} active={act}");
+                    try { cc.gameObject.SetActive(true); } catch (Exception e) { Log.LogWarning("[pvp-diag]   SetActive: " + e.Message); }
+                    try { cc.enabled = true; } catch (Exception e) { Log.LogWarning("[pvp-diag]   cc.enabled: " + e.Message); }
+                    acted++;
+                }
+                Log.LogInfo($"[pvp-diag] === force-unfreeze applied ({acted} CC, {fn} FPC) — try moving now ===");
+            }
+            catch (Exception e) { Log.LogWarning("[pvp-diag] force-unfreeze: " + e.Message); }
+        }
+
+        // ---------------- helpers ----------------
+
+        private static bool InMission()
+        {
+            try { var mm = MissionManager.Instance; if (mm == null) return false; return mm.CurrentPhase == MissionManager.GamePhase.MissionActive; }
+            catch { return false; }
+        }
+
+        public static string Status() => $"pvpMatch: mode={(Config.PvpActive ? "PvP" : "coop")} active={Active} cbDisabled={_cbDisabled}";
+    }
+}

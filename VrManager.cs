@@ -415,6 +415,7 @@ namespace IronNestVR
             ScanSceneOnce();
             Diagnostics.Tick();
             MapToolsProbe.Tick();  // F1 dump / Shift+F1 live-test: decouple map-tools palette from the focus camera
+            PvpProbe.Tick();       // PvP plan Phase 0 probes (Ctrl+Shift+1/2/3/4/0/9; inert unless Config.PvpProbe)
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
 
@@ -445,6 +446,8 @@ namespace IronNestVR
             CoopScore.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate score/requisition (host-authoritative, applied out-of-mission)
             CoopPunchcards.Tick(Time.unscaledDeltaTime); // Phase 4: host-authoritative punchcard deck + redemption
             CoopNetDiag.Tick(Time.unscaledDeltaTime);    // REVIEW-fix: cross-machine desync detector (diagnostic only)
+            PvpMatch.Tick(Time.unscaledDeltaTime);       // PvP Phase 1: match-mode coordinator (inert unless Config.PvpActive)
+            PvpPlayers.Tick(Time.unscaledDeltaTime);     // PvP Phase 1: player-as-entity presence + position sync
             if (!_xrReady)
             {
                 var fcam = Camera.main;

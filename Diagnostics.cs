@@ -74,6 +74,7 @@ namespace IronNestVR
                 Log.LogInfo("[coop] " + CoopPunchcards.Status());
                 Log.LogInfo("[coop] " + CoopNetDiag.Status());
                 if (Config.CoopNetSim) Log.LogInfo("[coop] " + CoopNetSim.Status());
+                if (Config.PvpActive) { Log.LogInfo("[coop] " + PvpMatch.Status()); Log.LogInfo("[coop] " + PvpPlayers.Status()); }
             }
             catch (Exception e) { Log.LogWarning("[coop-diag] " + e.Message); }
         }

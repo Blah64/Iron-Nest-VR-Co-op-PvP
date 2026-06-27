@@ -51,6 +51,7 @@ namespace IronNestVR
         {
             try
             {
+                if (Config.PvpActive) return;   // PvP adjudicates impacts vs player-entities itself — not host-auth co-op replication
                 if (!Config.CoopImpactSync) return;
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer || !InMission()) return;
 
