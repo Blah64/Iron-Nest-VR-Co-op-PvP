@@ -31,8 +31,6 @@ namespace IronNestVR
         private static bool _cbDisabled;       // counter-battery suppressed for the current arena
         private static float _nextCbSweep;
 
-        private static float _nextPlayerDump;   // throttle the per-mission player-state diagnostic
-
         // Deferred host launch — route through the operations map (BrowsingMap) before StartOperation so the player
         // rig initializes (a direct MainMenu->Mission start leaves the host's CharacterController inactive = "can't
         // move"; the client already worked because it reaches the mission VIA the map through replicated phases).
@@ -63,8 +61,6 @@ namespace IronNestVR
                     }
                     // DEV: host launches the arena. Ctrl+Shift+L. (Eventual UI: a lobby "Launch Match" button.)
                     if (kb[UnityEngine.InputSystem.Key.L].wasPressedThisFrame) LaunchArena();
-                    // DEV: force-unfreeze the player (diagnostic probe for the "can't move after mission start" bug).
-                    if (kb[UnityEngine.InputSystem.Key.U].wasPressedThisFrame) ForceUnfreezeProbe();
                 }
 #endif
 
@@ -84,12 +80,6 @@ namespace IronNestVR
                     _nextCbSweep = Time.unscaledTime + 1f;
                     if (DisableCounterBattery()) _cbDisabled = true;
                 }
-
-                // DIAGNOSTIC: while in a PvP arena, log the player controller state once/sec so we can see exactly
-                // how the mission intro is locking movement (playerCanMove flag vs disabled CharacterController vs
-                // deactivated player GameObject). The earlier playerCanMove watchdog never fired → the freeze is NOT
-                // that flag; this dump + the Ctrl+Shift+U force-unfreeze probe pin the real mechanism.
-                if (active && InMission()) DumpPlayerState();
             }
             catch (Exception e) { Log.LogWarning("[pvp] match tick: " + e.Message); }
         }
@@ -274,99 +264,6 @@ namespace IronNestVR
             catch { }
             if (any) Log.LogInfo("[pvp] counter-battery suppressed (no scripted incoming fire / timer auto-fail in the duel arena)");
             return any;
-        }
-
-        // ---------------- player-freeze diagnostics ----------------
-
-        // Harmony POSTFIX on FirstPersonController.SetFrozen(bool) (registered by CoopSim.ApplyPatches). DIAGNOSTIC
-        // ONLY — logs every freeze/unfreeze call while PvpActive so we can see the mission intro's freeze pattern
-        // (is SetFrozen(true) called and never followed by SetFrozen(false)?). No behaviour change. __0 = first arg.
-        public static void LogSetFrozen(bool __0)
-        {
-            try { if (Config.PvpActive) Log.LogInfo($"[pvp-diag] FirstPersonController.SetFrozen({__0})"); } catch { }
-        }
-
-        // Periodic dump of EVERY CharacterController in the scene (by name + enabled/active) plus each FPC's
-        // playerCanMove. The "inactive controller" the game keeps Move-ing is NOT the FPC's (that one reads
-        // active), so enumerate them all to find the disabled one by its owner GameObject name. Throttled (2s) to
-        // limit log volume while the inactive-controller error is already spamming.
-        private static void DumpPlayerState()
-        {
-            try
-            {
-                if (Time.unscaledTime < _nextPlayerDump) return;
-                _nextPlayerDump = Time.unscaledTime + 2f;
-
-                var ccs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<CharacterController>());
-                int n = ccs != null ? ccs.Length : 0;
-                Log.LogInfo($"[pvp-diag] === CharacterControllers: {n} (incl prefabs) ===");
-                for (int i = 0; i < n; i++)
-                {
-                    var cc = ccs[i].TryCast<CharacterController>(); if (cc == null) continue;
-                    string nm = "?", scn = "?"; bool en = false, act = false;
-                    try { nm = cc.gameObject.name; } catch { }
-                    try { var s = cc.gameObject.scene; scn = s.IsValid() ? s.name : "<prefab>"; } catch { }
-                    try { en = cc.enabled; } catch { }
-                    try { act = cc.gameObject.activeInHierarchy; } catch { }
-                    Log.LogInfo($"[pvp-diag]  CC '{nm}' scene='{scn}' enabled={en} active={act}");
-                }
-
-                var fpcs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<FirstPersonController>());
-                int fn = fpcs != null ? fpcs.Length : 0;
-                for (int i = 0; i < fn; i++)
-                {
-                    var f = fpcs[i].TryCast<FirstPersonController>(); if (f == null) continue;
-                    bool prefab = false; try { prefab = !f.gameObject.scene.IsValid(); } catch { }
-                    if (prefab) continue;
-                    string nm = "?"; bool cm = false; try { nm = f.gameObject.name; } catch { } try { cm = f.playerCanMove; } catch { }
-                    Log.LogInfo($"[pvp-diag]  FPC '{nm}' playerCanMove={cm}");
-                }
-            }
-            catch (Exception e) { Log.LogWarning("[pvp-diag] player dump: " + e.Message); }
-        }
-
-        // DEV probe (Ctrl+Shift+U): re-enable EVERY in-scene CharacterController (and unfreeze every FPC) and log
-        // the before-state. The previous probe only touched FPC.controller (already active) — the walk-blocking
-        // controller is a different one, so enable them all and see if walk returns. Whatever flips fixes it = the
-        // lever to automate.
-        public static void ForceUnfreezeProbe()
-        {
-            try
-            {
-                Log.LogInfo("[pvp-diag] === FORCE-UNFREEZE probe ===");
-                var fpcs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<FirstPersonController>());
-                int fn = fpcs != null ? fpcs.Length : 0;
-                for (int i = 0; i < fn; i++)
-                {
-                    var f = fpcs[i].TryCast<FirstPersonController>(); if (f == null) continue;
-                    bool prefab = false; try { prefab = !f.gameObject.scene.IsValid(); } catch { }
-                    if (prefab) continue;
-                    try { f.gameObject.SetActive(true); } catch { }
-                    try { f.enabled = true; } catch { }
-                    try { f.SetFrozen(false); } catch { }
-                    try { f.playerCanMove = true; } catch { }
-                }
-
-                var ccs = Resources.FindObjectsOfTypeAll(Il2CppType.Of<CharacterController>());
-                int n = ccs != null ? ccs.Length : 0;
-                int acted = 0;
-                for (int i = 0; i < n; i++)
-                {
-                    var cc = ccs[i].TryCast<CharacterController>(); if (cc == null) continue;
-                    bool prefab = false; try { prefab = !cc.gameObject.scene.IsValid(); } catch { }
-                    if (prefab) continue;
-                    string nm = "?"; bool en = false, act = false;
-                    try { nm = cc.gameObject.name; } catch { }
-                    try { en = cc.enabled; } catch { }
-                    try { act = cc.gameObject.activeInHierarchy; } catch { }
-                    Log.LogInfo($"[pvp-diag]  before CC '{nm}' enabled={en} active={act}");
-                    try { cc.gameObject.SetActive(true); } catch (Exception e) { Log.LogWarning("[pvp-diag]   SetActive: " + e.Message); }
-                    try { cc.enabled = true; } catch (Exception e) { Log.LogWarning("[pvp-diag]   cc.enabled: " + e.Message); }
-                    acted++;
-                }
-                Log.LogInfo($"[pvp-diag] === force-unfreeze applied ({acted} CC, {fn} FPC) — try moving now ===");
-            }
-            catch (Exception e) { Log.LogWarning("[pvp-diag] force-unfreeze: " + e.Message); }
         }
 
         // ---------------- helpers ----------------

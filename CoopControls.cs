@@ -695,7 +695,8 @@ namespace IronNestVR
                 // (MSG_PUNCH_DECK/CONSUME/GRAPH) stay off this list.
                 || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
                 || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_DIAL
-                || type == PvpPlayers.MSG_PVP_POS;   // PvP player position — either player authors it; host relays to other clients (N>2)
+                || type == PvpPlayers.MSG_PVP_POS    // PvP player position — either player authors it; host relays to other clients (N>2)
+                || type == PvpCombat.MSG_PVP_HIT;    // PvP hit report — attacker authors it, host relays; addressed to the victim's id in-payload
         }
 
         // Streaming packet types the host relays UNRELIABLE (high-rate, loss-tolerant). MSG_POSE is handled by
@@ -938,6 +939,7 @@ namespace IronNestVR
                              || type == CoopPunchcards.MSG_PUNCH_GRAPH || type == CoopPunchcards.MSG_PUNCH_DIAL) CoopPunchcards.OnPacket(type, origin, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
                     else if (type == PvpPlayers.MSG_PVP_POS) PvpPlayers.OnPacket(type, origin, a, len);
+                    else if (type == PvpCombat.MSG_PVP_HIT) PvpCombat.OnPacket(type, origin, a, len);
                     else CoopMap.OnPacket(type, origin, a, len);
                     break;
             }

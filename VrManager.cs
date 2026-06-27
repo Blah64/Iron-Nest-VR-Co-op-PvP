@@ -60,6 +60,7 @@ namespace IronNestVR
         {
             try { LobbyGui.Draw(); } catch { }
             try { Notify.DrawFlat(); } catch { }   // non-focus-pulling "X joined" toast (flatscreen)
+            try { PvpHud.DrawFlat(); } catch { }   // dev PvP duel readout (non-public builds, in a PvP mission)
         }
 
         // The game is an FPS that locks the OS cursor to centre for mouselook, so the flatscreen lobby

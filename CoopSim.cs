@@ -73,26 +73,28 @@ namespace IronNestVR
             // PvP BARE ARENA (PLAN-pvp.md Appendix A): suppress scripted PvE content on BOTH machines while PvpActive,
             // so a duel scene is just map + artillery + the two players. These prefixes are inert unless PvpActive, so
             // co-op + solo are untouched. State_SpawnMapEntity is already covered (GatePrefix gained a PvpActive branch).
-            try
+            // Content/entity nodes to neutralize in a PvP bare arena. State_DamageEntity is CRITICAL: the engine's
+            // own State_ImpactStart.StartImpact INVOKES State_DamageEntity.OnEnter when a shell lands on a registered
+            // entity (our player mirror), and it NREs on a programmatically-spawned mirror (no mission-graph damage
+            // wiring). That thrown exception aborts StartImpact, so our PvP impact POSTFIX never runs — every close/
+            // on-target shot silently failed to adjudicate. We do victim-authoritative damage ourselves, so skipping
+            // the engine's damage node is exactly right. SetEntityState/MoveMapEntity are the sibling entity-mutators
+            // that would NRE the same way. All inert unless PvpActive (PvpSuppressPrefix returns true to run original).
+            // State_MoveTurret/State_SetTurretLocation are suppressed too so the mission can't relocate the player's
+            // turret — PvpPlayers.PlaceMyTurret pins each turret to a deterministic grid at match start (these gate the
+            // mission NODES, not TurretController.SetTurretLocation the METHOD, so our own placement + the player's
+            // manual map-move still work).
+            foreach (var nodeName in new[] { "State_SpawnScoutPlane", "State_DamageEntity", "State_SetEntityState", "State_MoveMapEntity", "State_MoveTurret", "State_SetTurretLocation" })
             {
-                var sp = AccessTools.Method(typeof(SleepyNodes.State_SpawnScoutPlane), "OnEnter");
-                if (sp != null) { _harmony.Patch(sp, prefix: new HarmonyMethod(typeof(CoopSim), nameof(PvpSuppressPrefix))); Log.LogInfo("[sim] PvP scout-plane suppressor patched (State_SpawnScoutPlane.OnEnter — inert unless PvpActive)"); }
-                else Log.LogWarning("[sim] State_SpawnScoutPlane.OnEnter not found — PvP scout suppression off");
+                try
+                {
+                    var t = AccessTools.TypeByName("SleepyNodes." + nodeName);
+                    var mi = t != null ? AccessTools.Method(t, "OnEnter") : null;
+                    if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopSim), nameof(PvpSuppressPrefix))); Log.LogInfo($"[sim] PvP content suppressor patched ({nodeName}.OnEnter — inert unless PvpActive)"); }
+                    else Log.LogWarning($"[sim] SleepyNodes.{nodeName}.OnEnter not found — PvP suppression for it off");
+                }
+                catch (Exception e) { Log.LogWarning($"[sim] {nodeName} patch: " + e.Message); }
             }
-            catch (Exception e) { Log.LogWarning("[sim] scout patch: " + e.Message); }
-
-            // PvP DIAGNOSTIC: log every FirstPersonController.SetFrozen call while PvpActive (postfix, no behaviour
-            // change) so we can see the mission intro's freeze/unfreeze pattern. Inert in co-op/solo. (A prefix that
-            // BLOCKED freeze was wrong — it left the game's FPC.Update calling Move on a controller the mission had
-            // deactivated, spamming "inactive controller" + tanking fps. The fix mechanism is TBD from this diag.)
-            try
-            {
-                var fr = AccessTools.Method(typeof(FirstPersonController), "SetFrozen", new[] { typeof(bool) })
-                         ?? AccessTools.Method(typeof(FirstPersonController), "SetFrozen");
-                if (fr != null) { _harmony.Patch(fr, postfix: new HarmonyMethod(typeof(PvpMatch), nameof(PvpMatch.LogSetFrozen))); Log.LogInfo("[sim] PvP player-freeze diagnostic patched (FirstPersonController.SetFrozen — logs only, inert unless PvpActive)"); }
-                else Log.LogWarning("[sim] FirstPersonController.SetFrozen not found — can't trace PvP player freeze");
-            }
-            catch (Exception e) { Log.LogWarning("[sim] freeze-diag patch: " + e.Message); }
 
             // TELEPRINTER ORDERS are the ONE thing the client can't resolve locally: the gated spawn node is what
             // stashes the target in a graph context variable, so a client that skips it prints a BLANK order (the
@@ -171,8 +173,15 @@ namespace IronNestVR
                 // POSTFIX (CoopImpact): runs when the shell LANDS - broadcasts the host's authoritative hit set and
                 // logs the map point (diagnostic vs the board target). No prefix: the visible landing is copied at fire
                 // time via the ShellVisual hooks, not here (the map point doesn't exist until the shell lands).
-                if (mi != null) { _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopImpact), nameof(CoopImpact.OnImpactAdjudicated))); Log.LogInfo("[sim] impact-result capture patched (State_ImpactStart.StartImpact)"); }
-                else Log.LogWarning("[sim] State_ImpactStart.StartImpact not found — map hit-markers won't sync");
+                if (mi != null)
+                {
+                    _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(CoopImpact), nameof(CoopImpact.OnImpactAdjudicated)));
+                    // PvP shot/damage lane shares the same adjudication surface: a 2nd postfix routes opponent-mirror
+                    // hits to the victim (PvpActive only; bails otherwise). Co-op's postfix bails when PvpActive — no overlap.
+                    _harmony.Patch(mi, postfix: new HarmonyMethod(typeof(PvpCombat), nameof(PvpCombat.OnImpactAdjudicated)));
+                    Log.LogInfo("[sim] impact-result capture patched (State_ImpactStart.StartImpact) + PvP hit lane");
+                }
+                else Log.LogWarning("[sim] State_ImpactStart.StartImpact not found — map hit-markers + PvP hits won't work");
             }
             catch (Exception e) { Log.LogWarning("[sim] impact patch: " + e.Message); }
 
