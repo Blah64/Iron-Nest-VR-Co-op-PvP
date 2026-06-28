@@ -72,6 +72,9 @@
     <Reference Include="com.rlabrecque.steamworks.net"><HintPath>$(InteropDir)\com.rlabrecque.steamworks.net.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Assembly-CSharp-firstpass"><HintPath>$(InteropDir)\Assembly-CSharp-firstpass.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.Cinemachine"><HintPath>$(InteropDir)\Unity.Cinemachine.dll</HintPath><Private>false</Private></Reference>
+    <!-- Counter-battery HIT FX: fire the impact prefab's own Cinemachine impulse (screen shake) + FMOD emitter (sound). -->
+    <Reference Include="FMODUnity"><HintPath>$(InteropDir)\FMODUnity.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AudioModule"><HintPath>$(InteropDir)\UnityEngine.AudioModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.InputSystem"><HintPath>$(InteropDir)\Unity.InputSystem.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.RenderPipelines.Universal.Runtime"><HintPath>$(InteropDir)\Unity.RenderPipelines.Universal.Runtime.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.RenderPipelines.Core.Runtime"><HintPath>$(InteropDir)\Unity.RenderPipelines.Core.Runtime.dll</HintPath><Private>false</Private></Reference>

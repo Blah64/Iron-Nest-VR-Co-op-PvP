@@ -45,8 +45,9 @@ namespace IronNestVR
         private static CounterBatteryTimer _cbTimer;                       // cached (suppression backstop only)
         private static CounterBatteryCinematicImpactSpawner _cbSpawner;    // cached (impact-prefab source)
         private static SwingController _swing;                             // the bunker swing driver = SCREEN SHAKE
+        private static GunFireToSwingImpulseBridge _gunSwing;              // gun-recoil swing bridge — HandleGunFired() = the proven-visible kick
         private static SwingLightFlickerController _flicker;               // the bunker light power/flicker = DARKEN
-        private static float _swingStrength;     // resolved from a scene SwingImpulseOnEnable (the game's authored scale); 0 ⇒ use default
+        private static float _swingStrength;     // resolved from the gun-recoil bridge's impulseStrength (a known-visible magnitude); 0 ⇒ use default
         private static float _flickerRestoreAt;  // when to restore the lights after a darken (0 = not armed)
         private static bool _cbFound;            // located the arena FX systems at least once this arena
         private static float _nextCbScan;        // periodic full re-scan (re-acquire refs, suppress any leaked timer start)
@@ -70,6 +71,8 @@ namespace IronNestVR
         private static int _pendingImpacts;        // remaining impacts in the current salvo
         private static float _nextImpactAt;
         private static bool _warnedNoImpactPrefab;
+        private static bool _loggedClone;          // one-time impact-prefab component inventory dumped?
+        private static bool _loggedSound;          // one-time impact emitter event-path logged?
         private const int BurstCount = 8;          // a sustained barrage (not a single pop), spread across the burst
         private const float BurstIntervalSec = 0.7f;   // 8 × 0.7s ≈ 5.6s of walking impacts — reads as a counter-battery salvo
 
@@ -114,7 +117,7 @@ namespace IronNestVR
                 {
                     _wasActive = active;
                     if (active) Log.LogInfo($"[pvp] === PvP MATCH ACTIVE === (role={(CoopP2P.IsHost ? "host" : "client")} peers={CoopP2P.PeerCount}) — each player owns their own turret; opponents appear as enemy map entities");
-                    else { Log.LogInfo("[pvp] === PvP match inactive ==="); _cbFound = false; _cbTimer = null; _cbSpawner = null; _swing = null; _flicker = null; _swingStrength = 0f; _flickerRestoreAt = 0f; _impactPrefab = null; _impactAnchor = null; _pendingImpacts = 0; _warnedNoImpactPrefab = false; }   // drop the scene-specific caches
+                    else { Log.LogInfo("[pvp] === PvP match inactive ==="); _cbFound = false; _cbTimer = null; _cbSpawner = null; _swing = null; _gunSwing = null; _flicker = null; _swingStrength = 0f; _flickerRestoreAt = 0f; _impactPrefab = null; _impactAnchor = null; _pendingImpacts = 0; _warnedNoImpactPrefab = false; _loggedClone = false; _loggedSound = false; }   // drop the scene-specific caches
                 }
 
                 // While in a PvP arena: locate the swing/light/impact FX, keep the scripted counter-battery idle, and
@@ -142,7 +145,12 @@ namespace IronNestVR
             // DARKEN: cut the bunker lights now; TickFlickerRestore brings them back (with the restore flicker) a beat later.
             TriggerLightFlicker();
 
-            // SHAKE + EXPLOSIONS: a sustained barrage — each impact SWINGS the bunker (screen shake) and drops an
+            // SOUND: fire the game's OWN cinematic impact once (it carries the authored hit sound + impulse). Forced to
+            // ignore the (idle) timer via onlyWhileTimerRunning=false so it actually spawns. Its visual lands at the
+            // scripted anchor (may be off-screen); we keep the manual barrage below for the near-player explosions.
+            TryPlayImpactSound();
+
+            // SHAKE + EXPLOSIONS: a sustained barrage — each beat SWINGS the bunker (screen shake) and drops an
             // explosion around us. Drains over ~5.6s in TickHitFx (≫ 1s, so it reads as a counter-battery pounding).
             _pendingImpacts = BurstCount;
             SpawnOneImpactNow();                 // first impact immediately (instant feedback)
@@ -167,24 +175,39 @@ namespace IronNestVR
             SpawnExplosionNow();    // explosion VFX around the player (+ boom if the prefab emits on enable)
         }
 
-        // SCREEN SHAKE: a one-shot external swing impulse on the bunker — the same swing system the gun-fire bridge
-        // drives, scaled up so a counter-battery hit reads as "massive." Magnitude is grounded in the game's authored
-        // SwingImpulseOnEnable.strength (resolved in ScanCounterBattery) × HitSwingMultiplier; the SwingReceiver clamps
-        // to its maxTilt, so a generous value can't fling the view past the rig's own limits. Golden-angle direction so
-        // the barrage shoves the view around rather than one-axis.
+        // SCREEN SHAKE. Two layers, because the bare external impulse alone wasn't visible (swingStrength resolved 0):
+        //   • PRIMARY — call the gun-recoil bridge's HandleGunFired(): reproduces the EXACT swing the player already
+        //     sees/feels when firing (proven to move the view), once per barrage beat ⇒ sustained.
+        //   • SECONDARY — a larger external one-shot impulse for a counter-battery "massive" kick, magnitude grounded
+        //     in the gun-recoil impulseStrength × HitSwingMultiplier (SwingReceiver clamps to its maxTilt).
         private static void TriggerSwingHit()
         {
-            var sc = _swing; if (sc == null) return;
-            try
+            var gb = _gunSwing;
+            if (gb != null) { try { gb.HandleGunFired(); } catch (Exception e) { Log.LogWarning("[pvp] swing recoil: " + e.Message); } }
+
+            var sc = _swing;
+            if (sc != null)
             {
-                try { sc.allowExternalOneShot = true; } catch { }   // the gate TriggerExternalImpulse checks
-                float mag = (_swingStrength > 0.01f ? _swingStrength : DefaultSwingStrength) * HitSwingMultiplier;
-                float a = (++_fxSeq) * 2.39996323f;                 // golden angle — decorrelated, no UnityEngine.Random
-                Vector2 impulse = new Vector2(Mathf.Cos(a), Mathf.Sin(a)) * mag;
-                float twist = ((_fxSeq & 1) == 0 ? 1f : -1f) * mag * 0.4f;
-                sc.TriggerExternalImpulse(impulse, twist);
+                try
+                {
+                    try { sc.allowExternalOneShot = true; } catch { }   // the gate TriggerExternalImpulse checks
+                    float mag = (_swingStrength > 0.01f ? _swingStrength : DefaultSwingStrength) * HitSwingMultiplier;
+                    float a = (++_fxSeq) * 2.39996323f;                 // golden angle — decorrelated, no UnityEngine.Random
+                    Vector2 impulse = new Vector2(Mathf.Cos(a), Mathf.Sin(a)) * mag;
+                    float twist = ((_fxSeq & 1) == 0 ? 1f : -1f) * mag * 0.5f;
+                    sc.TriggerExternalImpulse(impulse, twist);
+                }
+                catch (Exception e) { Log.LogWarning("[pvp] swing hit: " + e.Message); }
             }
-            catch (Exception e) { Log.LogWarning("[pvp] swing hit: " + e.Message); }
+        }
+
+        // HIT SOUND: spawn the base game's cinematic impact via its OWN SpawnOne (carries the authored impact audio).
+        // We force onlyWhileTimerRunning=false so it fires with our idle/inactive timer, and pass the resolved timer.
+        private static void TryPlayImpactSound()
+        {
+            var s = _cbSpawner; if (s == null || _cbTimer == null) return;
+            try { s.onlyWhileTimerRunning = false; } catch { }
+            try { s.SpawnOne(_cbTimer); } catch (Exception e) { Log.LogWarning("[pvp] impact sound: " + e.Message); }
         }
 
         // DARKEN: cut the bunker lights (power disruption). TickFlickerRestore brings them back with the restore flicker.
@@ -235,12 +258,98 @@ namespace IronNestVR
                 if (go == null) return;
                 try { go.transform.position = pos; } catch { }
                 try { go.SetActive(true); } catch { }
+                TriggerCloneFx(go);   // fire the prefab's OWN Cinemachine impulse (shake) + FMOD emitter (sound)
                 try { UnityEngine.Object.Destroy(go, 6f); } catch { }   // backstop cleanup
 #if !PUBLIC_BUILD
                 Log.LogInfo($"[pvp] hit FX impact at {pos.ToString("0.0")} (anchor={src})");
 #endif
             }
             catch (Exception e) { Log.LogWarning("[pvp] hit FX spawn: " + e.Message); }
+        }
+
+        // A bare Instantiate of the impact prefab leaves its OWN authored components dormant — the game's spawner fires
+        // them. So we fire them ourselves on the clone: the Cinemachine impulse = the counter-battery SCREEN SHAKE, and
+        // the FMOD StudioEventEmitter / AudioSource = the HIT SOUND. One-time, we also dump the clone's component list
+        // so the log shows exactly what the prefab carries (and whether the shake/sound sources are even present).
+        private static void TriggerCloneFx(GameObject go)
+        {
+            if (go == null) return;
+
+            // The prefab's SelfDestruct can cull the clone before its emitter is heard / VFX completes — strip it (by
+            // type-name so no extra ref). Our own Destroy(go, 6f) handles cleanup.
+            try
+            {
+                var all = go.GetComponentsInChildren(Il2CppType.Of<Component>(), true);
+                if (all != null) for (int i = 0; i < all.Count; i++)
+                {
+                    var c = all[i]; if (c == null) continue;
+                    string n = null; try { n = c.GetIl2CppType().Name; } catch { }
+                    if (n == "SelfDestruct") { try { UnityEngine.Object.Destroy(c); } catch { } }
+                }
+            }
+            catch { }
+
+            if (!_loggedClone)
+            {
+                _loggedClone = true;
+                try
+                {
+                    var comps = go.GetComponentsInChildren(Il2CppType.Of<Component>(), true);
+                    var sb = new System.Text.StringBuilder();
+                    if (comps != null) for (int i = 0; i < comps.Count; i++)
+                    {
+                        var c = comps[i]; if (c == null) continue;
+                        try { if (sb.Length > 0) sb.Append(", "); sb.Append(c.GetIl2CppType().Name); } catch { }
+                    }
+                    int brains = -1, listeners = -1;
+                    try { var b = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<Unity.Cinemachine.CinemachineBrain>(), FindObjectsSortMode.None); brains = b != null ? b.Length : 0; } catch { }
+                    try { var li = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<Unity.Cinemachine.CinemachineImpulseListener>(), FindObjectsSortMode.None); listeners = li != null ? li.Length : 0; } catch { }
+                    Log.LogInfo($"[pvp] impact prefab components: [{sb}] — cinemachine brains={brains} impulseListeners={listeners}");
+                }
+                catch (Exception e) { Log.LogWarning("[pvp] clone inventory: " + e.Message); }
+            }
+            // SCREEN SHAKE — fire the prefab's Cinemachine impulse with an EXPLICIT strong velocity. Force/parameterless
+            // generate can resolve to ~0 if the source has no default velocity (that was v6's silent no-op). An incoming
+            // round ⇒ a hard downward + lateral slam; the listener (census above) turns it into camera shake.
+            try
+            {
+                var src = go.GetComponentInChildren(Il2CppType.Of<Unity.Cinemachine.CinemachineImpulseSource>(), true);
+                if (src != null)
+                {
+                    var cis = src.TryCast<Unity.Cinemachine.CinemachineImpulseSource>();
+                    if (cis != null)
+                    {
+                        float a = _fxSeq * 2.39996323f;
+                        var vel = new Vector3(Mathf.Cos(a) * 18f, -30f, Mathf.Sin(a) * 18f);
+                        cis.GenerateImpulseWithVelocity(vel);
+                    }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] impulse: " + e.Message); }
+            // HIT SOUND — both GO-bound emitter.Play() (SelfDestruct now stripped, so the GO lives) AND GO-independent
+            // RuntimeManager.PlayOneShot. Log the event path once so we can confirm it isn't empty.
+            try
+            {
+                var emi = go.GetComponentInChildren(Il2CppType.Of<FMODUnity.StudioEventEmitter>(), true);
+                if (emi != null)
+                {
+                    var see = emi.TryCast<FMODUnity.StudioEventEmitter>();
+                    if (see != null)
+                    {
+                        try { see.enabled = true; } catch { }
+                        try { see.Play(); } catch { }
+                        var er = see.EventReference;
+                        try { FMODUnity.RuntimeManager.PlayOneShot(er, go.transform.position); } catch { }
+                        if (!_loggedSound) { _loggedSound = true; string p = "?"; bool nul = true; try { nul = er.IsNull; } catch { } try { p = er.ToString(); } catch { } Log.LogInfo($"[pvp] impact emitter event ref='{p}' isNull={nul}"); }
+                    }
+                }
+                else
+                {
+                    var aud = go.GetComponentInChildren(Il2CppType.Of<AudioSource>(), true);
+                    if (aud != null) { var a = aud.TryCast<AudioSource>(); if (a != null) a.Play(); }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] emitter: " + e.Message); }
         }
 
         private static Vector3 AnchorPos(out bool ok)
@@ -450,12 +559,16 @@ namespace IronNestVR
             {
                 try { var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<SwingController>(), FindObjectsSortMode.None); if (arr != null && arr.Length > 0) _swing = arr[0].TryCast<SwingController>(); } catch { }
             }
+            if (_gunSwing == null)
+            {
+                try { var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<GunFireToSwingImpulseBridge>(), FindObjectsSortMode.None); if (arr != null && arr.Length > 0) _gunSwing = arr[0].TryCast<GunFireToSwingImpulseBridge>(); } catch { }
+            }
             if (_flicker == null)
             {
                 try { var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<SwingLightFlickerController>(), FindObjectsSortMode.None); if (arr != null && arr.Length > 0) _flicker = arr[0].TryCast<SwingLightFlickerController>(); } catch { }
             }
             if (_swingStrength <= 0f) ResolveSwingStrength();
-            if (_swing != null) foundNow = true;
+            if (_swing != null || _gunSwing != null) foundNow = true;
 
             // Counter-battery impact prefab (explosion VFX) + idle the scripted timer/spawner (backstop to the node gate).
             try
@@ -466,6 +579,12 @@ namespace IronNestVR
                     var t = timers[i].TryCast<CounterBatteryTimer>(); if (t == null) continue;
                     if (_cbTimer == null) _cbTimer = t;
                     try { if (t.IsRunning) t.PauseTimer(); } catch { }   // backstop a leaked scripted start (reversible)
+                }
+                // The scripted timer is INACTIVE (its sequence is sim-gated), so the active scan above misses it. Resolve
+                // it from ALL loaded objects so SpawnOne (sound) has a non-null timer to pass.
+                if (_cbTimer == null)
+                {
+                    try { var all = Resources.FindObjectsOfTypeAll(Il2CppType.Of<CounterBatteryTimer>()); if (all != null) for (int i = 0; i < all.Length; i++) { var t = all[i].TryCast<CounterBatteryTimer>(); if (t != null) { _cbTimer = t; break; } } } catch { }
                 }
             }
             catch { }
@@ -487,14 +606,19 @@ namespace IronNestVR
             if (foundNow && !_cbFound)
             {
                 _cbFound = true;
-                Log.LogInfo($"[pvp] arena FX located — swing={(_swing != null)} flicker={(_flicker != null)} swingStrength={_swingStrength:0.0} impactPrefab={(_impactPrefab != null)}");
+                int recv = -1, lights = -1;
+                try { var r = SwingController.Receivers; if (r != null) recv = r.Count; } catch { }
+                try { var l = SwingLightFlickerController.Lights; if (l != null) lights = l.Count; } catch { }
+                Log.LogInfo($"[pvp] arena FX located — swing={(_swing != null)} gunSwing={(_gunSwing != null)} flicker={(_flicker != null)} receivers={recv} lights={lights} swingStrength={_swingStrength:0.00} spawner={(_cbSpawner != null)} cbTimer={(_cbTimer != null)} impactPrefab={(_impactPrefab != null)}");
             }
         }
 
-        // The game's authored swing scale: the largest SwingImpulseOnEnable.strength in the scene (e.g. the gun-fire
-        // swing). We multiply this by HitSwingMultiplier for a "massive" counter-battery hit. Default if none found.
+        // The game's authored swing scale, grounded in a KNOWN-VISIBLE magnitude: the gun-recoil bridge's
+        // impulseStrength (the kick you feel firing). We multiply it by HitSwingMultiplier for a "massive" hit.
+        // Fallback: largest SwingImpulseOnEnable.strength in the scene (usually only on prefabs → often none → 0).
         private static void ResolveSwingStrength()
         {
+            try { if (_gunSwing != null) { float s = _gunSwing.impulseStrength; if (s > 0f) { _swingStrength = s; return; } } } catch { }
             try
             {
                 var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<SwingImpulseOnEnable>(), FindObjectsSortMode.None);
