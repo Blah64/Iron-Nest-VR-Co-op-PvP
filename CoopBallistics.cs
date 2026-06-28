@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BepInEx.Logging;
 using UnityEngine;
 
@@ -50,13 +51,30 @@ namespace IronNestVR
         private static GunController _capGun;          // the firing gun (NOT nulled by Restore) -> side at send time
         private static bool _sentThisShot;
 
-        // ---- PEER pending (the shooter's flight to force onto our about-to-fire shell) ----
-        // Set when MSG_FIRE arrives, consumed at our ShellVisual.Initialize (fire time, same FireShell), cleared in
-        // OnFireShellPost. The expiry is a backstop if our replayed RequestFire is rejected; it must exceed fireDelay.
-        private static bool _pendingValid;
-        private static Vector2 _pendingTgt, _pendingStart;
-        private static float _pendingTime;
-        private static float _pendingExpiry;
+        // ---- PER-SIDE FIRE-INTENT QUEUE (Bug 2 fix — replaces the old single global _pendingValid flag) ----
+        // The old global flag (6 s, not per-gun) mis-tagged a LOCAL shot as a peer replay whenever the OTHER player
+        // was active, hijacking it onto the peer's target ("wild, not dispersion"). Instead every shot that WILL fire
+        // is tagged at RequestFire time and queued PER SIDE; OnShellVisualPost consumes FIFO, so each shell gets
+        // exactly its own author's decision. Probe-verified (PLAN-host §6.0, run 2026-06-28): RequestFire→FireShell is
+        // 1:1 ordered per gun (Q1) and a no-op RequestFire is synchronously detectable via CanFire (Q2), so we never
+        // enqueue a phantom. fireDelay is ~0.01 s (Q3) — useless as a deadline — so the orphan backstop is a fixed 2 s.
+        internal struct FireIntent
+        {
+            public bool Replay;        // true = peer's replayed shot (carries the shooter's flight); false = our local shot (announce)
+            public Vector2 Tgt, Start; // replay flight: board-local crater + launch point
+            public float Time;         // replay travelTime
+            public bool HaveStart;     // whether Start/Time are present (guard an old/short MSG_FIRE)
+            public float Deadline;     // sweep backstop: drop if no FireShell consumes it by here
+        }
+        private static readonly List<FireIntent>[] _intents = { new List<FireIntent>(), new List<FireIntent>() };
+        private static bool _replaying;            // true ONLY during our own replayed RequestFire (synchronous) — see ReplayShot
+        private const float IntentDeadlineSec = 2f;
+
+        // Per-FireShell consume state (FireShell is synchronous + non-reentrant, so a single set is safe). Reset in
+        // OnFireShellPre; the first ShellVisual.Initialize of the shot dequeues one intent, later visuals reuse it.
+        private static bool _shotIntentLoaded;
+        private static bool _shotHaveIntent;
+        private static FireIntent _shotIntent;
 
         // ================= FireShell prefix/postfix (dispersion + per-shot reset) =================
 
@@ -88,6 +106,7 @@ namespace IronNestVR
                 _stashed = true;
                 _shots++;
                 _sentThisShot = false;
+                _shotIntentLoaded = false; _shotHaveIntent = false;   // fresh per-shot intent dequeue
             }
             catch (Exception e) { try { Log.LogWarning("[ball] pre: " + e.Message); } catch { } }
         }
@@ -95,9 +114,9 @@ namespace IronNestVR
         public static void OnFireShellPost()
         {
             try { Restore(); } catch (Exception e) { try { Log.LogWarning("[ball] post: " + e.Message); } catch { } }
-            // The pending flight was consumed by our ShellVisual.Initialize during this FireShell; clear it so a later
-            // LOCAL shot can never inherit a stale remote target.
-            _pendingValid = false;
+            // The intent for this shot was consumed at ShellVisual.Initialize (FIFO dequeue). End the gun reference's
+            // lifetime here so a stray later shell can't resolve a stale side (OnShellVisualPost already ran + used it).
+            _capGun = null;
         }
 
         // Restore the zeroed coefficients to their authored values. Idempotent.
@@ -127,28 +146,52 @@ namespace IronNestVR
         {
             try
             {
-                if (__instance == null) return;
-                if (IsApplyingRemoteImpact)
+                if (__instance == null || !Active()) return;   // stock when not an in-mission co-op shot
+
+                int side = CoopControls.SideOfGun(_capGun);     // _capGun = the gun firing THIS shell (set in OnFireShellPre)
+                if (side < 0 || side > 1) return;
+
+                // Dequeue ONE intent for this FireShell (first ShellVisual only); later visuals of the same shot reuse it.
+                if (!_shotIntentLoaded)
                 {
-                    bool haveStart = CoopWire.Finite(_pendingStart.x) && CoopWire.Finite(_pendingStart.y);
+                    var q = _intents[side];
+                    if (q.Count > 0) { _shotIntent = q[0]; q.RemoveAt(0); _shotHaveIntent = true; }
+                    else
+                    {
+                        // No intent ⇒ we did NOT tag this shot at RequestFire. A REPLAY always carries its Replay intent
+                        // (enqueued in ReplayShot right before its own RequestFire, consumed ~fireDelay later by its own
+                        // FireShell — and no other shot can slip in because the gun goes CanFire=false the instant it
+                        // fires), so an untagged shell is NEVER a replay → announcing it can't echo. Treat it as a local
+                        // shot (announce). This also gracefully degrades to the pre-queue behavior if the RequestFire
+                        // intent hook ever fails to install (local shots still sync; replays still overwrite via intent).
+                        _shotHaveIntent = false;
+                        Diagnostics.V($"[ball] shell with NO queued intent side={side} — treating as local (announce)");
+                    }
+                    _shotIntentLoaded = true;
+                }
+
+                if (_shotHaveIntent && _shotIntent.Replay)
+                {
+                    // PEER replay: force the shooter's resolved flight onto our shell (every visual of this shot).
                     try
                     {
-                        __instance.targetLocalPos = _pendingTgt;          // the crater - always present
-                        if (haveStart)                                    // the launch point / arc - guard against an old/short packet
+                        __instance.targetLocalPos = _shotIntent.Tgt;                  // the crater — always present
+                        if (_shotIntent.HaveStart)                                    // the launch point / arc — guard an old/short packet
                         {
-                            __instance.startLocalPos = _pendingStart;
-                            if (_pendingTime > 0f) __instance.travelTime = _pendingTime;
-                            try { __instance.totalPathDistance = Vector2.Distance(_pendingStart, _pendingTgt); } catch { }
-                            try { __instance.previousPos = _pendingStart; } catch { }
+                            __instance.startLocalPos = _shotIntent.Start;
+                            if (_shotIntent.Time > 0f) __instance.travelTime = _shotIntent.Time;
+                            try { __instance.totalPathDistance = Vector2.Distance(_shotIntent.Start, _shotIntent.Tgt); } catch { }
+                            try { __instance.previousPos = _shotIntent.Start; } catch { }
                         }
                     }
                     catch { }
                     _copied++;
-                    Vector2 s, t; try { s = __instance.startLocalPos; t = __instance.targetLocalPos; } catch { return; }
-                    Diagnostics.V($"[ball] shell flight now start=({s.x:0.0},{s.y:0.0}) target=({t.x:0.0},{t.y:0.0})");
+                    Vector2 rs, rt; try { rs = __instance.startLocalPos; rt = __instance.targetLocalPos; } catch { return; }
+                    Diagnostics.V($"[ball] shell flight now start=({rs.x:0.0},{rs.y:0.0}) target=({rt.x:0.0},{rt.y:0.0})");
                 }
-                else if (!_sentThisShot && Active())
+                else if (!_sentThisShot)
                 {
+                    // LOCAL shot (tagged Local, or untagged per the safe default above): announce the resolved flight once.
                     Vector2 s, t; float time;
                     try { s = __instance.startLocalPos; t = __instance.targetLocalPos; time = __instance.travelTime; } catch { return; }
                     _sentThisShot = true;
@@ -159,16 +202,73 @@ namespace IronNestVR
             catch { }
         }
 
-        // ================= plumbing =================
+        // ================= plumbing: enqueue / sweep =================
 
-        // True while a remote shooter's flight is in force (peer side, during the replayed shell's FireShell).
-        internal static bool IsApplyingRemoteImpact => _pendingValid && Config.CoopDeterministicFire && Time.unscaledTime < _pendingExpiry;
+        // Q4 (dev probe only): true ONLY during our own synchronous replayed RequestFire, so CoopFireProbe can tag a
+        // RequestFire as "MSG_FIRE-replay" vs "local-trigger". (Replaces the old global pending flag of the same name.)
+        internal static bool IsApplyingRemoteImpact => _replaying;
 
-        // Peer MSG_FIRE handler: the shooter's flight to force onto our about-to-fire shell.
-        internal static void SetPending(Vector2 tgt, Vector2 start, float time)
+        // PEER MSG_FIRE handler (CoopControls): replay the shooter's shot on our matching gun. Tag a Replay intent with
+        // the shooter's flight BEFORE firing, then RequestFire — but ONLY if the gun will actually fire (Q2: CanFire
+        // predicts it perfectly). If it can't (reloading) the replay would no-op: we enqueue nothing (no orphan, no
+        // stale flag) and the shot is simply not shown on this peer (reload divergence — a separate issue), instead of
+        // poisoning the next local shot the way the old 6 s global flag did.
+        internal static void ReplayShot(GunController gun, int side, Vector2 tgt, Vector2 start, float time, bool haveStart)
         {
-            _pendingTgt = tgt; _pendingStart = start; _pendingTime = time; _pendingValid = true;
-            try { _pendingExpiry = Time.unscaledTime + 6f; } catch { _pendingExpiry = 0f; }
+            try
+            {
+                if (gun == null || side < 0 || side > 1) return;
+                bool willFire = false; try { willFire = gun.CanFire; } catch { }
+                if (!willFire) { Diagnostics.V($"[ball] replay gun {side} dropped — CanFire=false (gun reloading here)"); return; }
+
+                float now; try { now = Time.unscaledTime; } catch { now = 0f; }
+                _intents[side].Add(new FireIntent { Replay = true, Tgt = tgt, Start = start, Time = time, HaveStart = haveStart, Deadline = now + IntentDeadlineSec });
+
+                _replaying = true;
+                try { gun.RequestFire(); }
+                catch (Exception e) { try { Log.LogWarning("[ball] replay fire: " + e.Message); } catch { } }
+                finally { _replaying = false; }
+            }
+            catch { _replaying = false; }
+        }
+
+        // OBSERVE-ONLY hook (CoopSim, PREFIX on GunController.RequestFire): tag a LOCAL shot. Runs for EVERY RequestFire
+        // including our own replay — _replaying tells them apart (the replay was already tagged in ReplayShot). Enqueue
+        // only when the shot WILL fire (CanFire, read PRE-body before hasFired flips), so a no-op trigger adds no phantom.
+        internal static void NoteLocalRequestFire(GunController gun)
+        {
+            try
+            {
+                if (_replaying) return;                 // our own replay — already enqueued as Replay
+                if (!Active() || gun == null) return;   // inert in solo / PvP
+                bool willFire = false; try { willFire = gun.CanFire; } catch { }
+                if (!willFire) return;                  // no-op trigger (reloading) — produces no shell (Q2)
+                int side = CoopControls.SideOfGun(gun);
+                if (side < 0 || side > 1) return;
+                float now; try { now = Time.unscaledTime; } catch { now = 0f; }
+                _intents[side].Add(new FireIntent { Replay = false, Deadline = now + IntentDeadlineSec });
+            }
+            catch { }
+        }
+
+        // Backstop sweep (VrManager tick): drop a front intent that no FireShell ever consumed (a Q2 miss). The
+        // synchronous CanFire gate above prevents the common orphan; this only catches a pathological miss.
+        public static void SweepTick()
+        {
+            try
+            {
+                float now; try { now = Time.unscaledTime; } catch { return; }
+                for (int s = 0; s < 2; s++)
+                {
+                    var q = _intents[s];
+                    while (q.Count > 0 && now >= q[0].Deadline)
+                    {
+                        var dead = q[0]; q.RemoveAt(0);
+                        Diagnostics.V($"[ball] swept orphan intent side={s} replay={dead.Replay} (no shell consumed it)");
+                    }
+                }
+            }
+            catch { }
         }
 
         // ================= helpers =================
@@ -185,7 +285,7 @@ namespace IronNestVR
         }
 
         // Only act for an in-mission co-op session with a peer. Solo/host-without-peer = stock.
-        private static bool Active()
+        internal static bool Active()
         {
             if (Config.PvpActive) return false;   // PvP owns its own shot lane — never replay/zero co-op fire here
             if (!Config.CoopDeterministicFire) return false;

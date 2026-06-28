@@ -216,6 +216,19 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[sim] shell-visual patch: " + e.Message); }
 
+            // FIRE-INTENT TAGGING (Bug 2 fix): an OBSERVE-ONLY prefix on GunController.RequestFire tags every LOCAL shot
+            // at fire time so CoopBallistics' per-side intent queue can tell a real local shot from a peer's replay (the
+            // replay sets _replaying around its own RequestFire, so the hook skips it). PREFIX (not postfix) so CanFire
+            // is read BEFORE the call flips hasFired. Returns void — it can NEVER skip the original, so PvP/solo fire is
+            // untouched (NoteLocalRequestFire is inert unless CoopBallistics.Active()).
+            try
+            {
+                var mi = AccessTools.Method(typeof(GunController), "RequestFire");
+                if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopSim), nameof(OnLocalRequestFirePre))); Log.LogInfo("[sim] local-fire intent hook patched (GunController.RequestFire prefix, observe-only)"); }
+                else Log.LogWarning("[sim] GunController.RequestFire not found — local-fire intent tagging off (Bug 2 fix degraded)");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] requestfire hook: " + e.Message); }
+
             // SCORE / OUTCOME: the host replays mission complete/fail onto the client so the result screens match.
             // CoopScore broadcasts (host-only); the client's replay re-hits these postfixes but bails on !IsHost.
             try
@@ -262,6 +275,14 @@ namespace IronNestVR
         // original (returns true), so co-op + solo are unaffected. Never throws into the graph. Used for content
         // nodes co-op deliberately leaves running (scout plane, etc.) but a bare PvP arena must not.
         public static bool PvpSuppressPrefix() { try { return !Config.PvpActive; } catch { return true; } }
+
+        // OBSERVE-ONLY prefix on GunController.RequestFire (Bug 2 fix). Tags a local shot in CoopBallistics' per-side
+        // intent queue. Returns void -> never skips the original, so it cannot affect PvP/solo firing; inert unless
+        // co-op fire is Active. Must never throw into the gun state machine.
+        public static void OnLocalRequestFirePre(GunController __instance)
+        {
+            try { CoopBallistics.NoteLocalRequestFire(__instance); } catch { }
+        }
 
         // Gate only for a co-op CLIENT actually connected to a peer. Solo play and the host are never gated.
         // (No mission-phase check needed: the spawn node only runs during a mission anyway.)

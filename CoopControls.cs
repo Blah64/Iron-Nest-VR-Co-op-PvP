@@ -315,9 +315,21 @@ namespace IronNestVR
         // Called by CoopBallistics for a LOCAL shot only (a replayed/remote shot is skipped there, which also breaks
         // the fire loop - no echo guard needed). Ships the whole flight (start, target, travelTime) so the peer's arc
         // matches launch point + direction + speed, not just the crater.
+        // Side index of a gun (0 = Left, 1 = Right), matching _gunL/_gunR. The canonical mapping used by the fire path
+        // + CoopBallistics' per-side intent queue. Null -> -1 so callers' `side < 0` guard early-returns (never a
+        // silent wrong side); any non-_gunR gun -> 0 (Left).
+        public static int SideOfGun(GunController gun)
+        {
+            if (gun == null) return -1;
+            return ((object)gun == (object)_gunR) ? 1 : 0;
+        }
+
         internal static void SendLocalShot(GunController gun, Vector2 tgt, Vector2 start, float time)
         {
-            if (!Config.CoopClickSync || !SteamNet.InLobby || !CoopP2P.HasPeer) return;
+            // Gate on the FIRE feature (CoopBallistics.Active() = CoopDeterministicFire + lobby + peer + mission + !PvP),
+            // NOT CoopClickSync — fire is no longer a click event, so turning click sync off must not silently kill the
+            // shell-flight sync (REVIEW-host v4 P1). CoopClickSync still gates the OTHER cockpit clicks.
+            if (!CoopBallistics.Active()) return;
             byte side = ((object)gun == (object)_gunR) ? (byte)1 : (byte)0;
             SendFire(side, tgt, start, time);
             Diagnostics.V($"[ctrl] fire gun {side} -> peer  start=({start.x:0.0},{start.y:0.0}) tgt=({tgt.x:0.0},{tgt.y:0.0})");
@@ -931,14 +943,17 @@ namespace IronNestVR
                     float tx = float.NaN, ty = float.NaN, sx = float.NaN, sy = float.NaN, tt = 0f;
                     if (len >= 10) { tx = r.Float(); ty = r.Float(); }                 // board-local target (crater)
                     if (len >= 22) { sx = r.Float(); sy = r.Float(); tt = r.Float(); } // launch point + travelTime (arc)
-                    // Set the shooter's flight BEFORE RequestFire so our replayed FireShell's ShellVisual postfix
-                    // (CoopBallistics) overwrites our shell's start/target/travelTime onto it -> identical arc + crater,
-                    // regardless of our own angle/elevation/powder. No echo guard needed: our replayed shell is a
-                    // "remote" shot, which CoopBallistics skips announcing, so it can't bounce back as a second shot.
-                    if (CoopWire.Finite(tx) && CoopWire.Finite(ty))
-                        CoopBallistics.SetPending(new Vector2(tx, ty), new Vector2(sx, sy), tt);
+                    if (!CoopWire.Finite(tx) || !CoopWire.Finite(ty)) break;           // no crater -> nothing to replay
                     var gun = side == 0 ? _gunL : _gunR;
-                    if (gun != null) { try { gun.RequestFire(); Diagnostics.V($"[ctrl] applied remote fire gun {side} <- peer  start=({sx:0.0},{sy:0.0}) tgt=({tx:0.0},{ty:0.0})"); } catch (Exception e) { Log.LogWarning("[ctrl] replay fire: " + e.Message); } }
+                    if (gun == null) break;
+                    bool haveStart = CoopWire.Finite(sx) && CoopWire.Finite(sy);
+                    // Tag a PER-SIDE Replay intent with the shooter's flight, then replay RequestFire — but only if our
+                    // matching gun will actually fire (ReplayShot checks CanFire). Our replayed shell's ShellVisual
+                    // postfix dequeues that intent and overwrites start/target/travelTime -> identical arc + crater,
+                    // regardless of our own angle/elevation/powder. The per-side intent (not a global flag) is what
+                    // stops a concurrent LOCAL shot from being hijacked onto this target (Bug 2). See CoopBallistics.
+                    CoopBallistics.ReplayShot(gun, side, new Vector2(tx, ty), new Vector2(sx, sy), tt, haveStart);
+                    Diagnostics.V($"[ctrl] remote fire gun {side} <- peer  start=({sx:0.0},{sy:0.0}) tgt=({tx:0.0},{ty:0.0})");
                     break;
                 }
                 case MSG_POWDER:
@@ -1355,7 +1370,12 @@ namespace IronNestVR
         // Register click controls (LookAtTarget). Skips the "operating manual" props (PickUpZoomTarget — those
         // are local read-zoom, not shared state, same as HandManipulator) and menu/mission-select pages (whose
         // clicks shouldn't drive the peer's UI). Cockpit switches/levers/buttons (reload, powder, power,
-        // lighting, fire button) all pass.
+        // lighting) all pass. The EXCEPTION is each gun's fireButton: GunController.Awake wires it
+        // `fireButton.RegisterOnClickDown(RequestFire)`, so replicating its click would call the peer's
+        // RequestFire on the generic click lane — outside CoopBallistics.ReplayShot's _replaying guard — enqueuing
+        // a false LOCAL intent and echoing the shot back (REVIEW-host P1). Firing is owned by the dedicated
+        // MSG_FIRE lane, so the fire button is excluded here (closes the send AND the apply side at one point;
+        // local fire still works via its own RegisterOnClickDown).
         private static int ScanSwitches()
         {
             int added = 0;
@@ -1366,6 +1386,7 @@ namespace IronNestVR
                 LookAtTarget sw = null;
                 try { sw = arr[i].TryCast<LookAtTarget>(); } catch { }
                 if (sw == null) continue;
+                if (IsFireButton(sw)) continue;                                   // REVIEW-host P1: fire button fires via MSG_FIRE, never the click lane
                 Transform tr = sw.transform;
                 if (tr == null || HasInParent<PickUpZoomTarget>(tr)) continue;     // manual read-zoom — skip
                 string path = PathOf(tr);
@@ -1417,6 +1438,23 @@ namespace IronNestVR
                 }
             }
             catch (Exception e) { Log.LogWarning("[ctrl] guns: " + e.Message); }
+        }
+
+        // True if this LookAtTarget is a gun's fireButton (wired straight to RequestFire). ResolveGuns runs
+        // immediately before ScanSwitches in EnsureRegistry, and _byId is cleared on every new turret, so the
+        // gun refs are always current when this is consulted — a name/path fallback would be both fragile and
+        // unnecessary here (if guns fail to resolve at all, the whole co-op fire path is already dark). See
+        // ScanSwitches for why the fire button must not be a generic click control (REVIEW-host P1).
+        private static bool IsFireButton(LookAtTarget sw)
+        {
+            if (sw == null) return false;
+            try
+            {
+                if (_gunL != null && (object)_gunL.fireButton == (object)sw) return true;
+                if (_gunR != null && (object)_gunR.fireButton == (object)sw) return true;
+            }
+            catch { }
+            return false;
         }
 
         // ---------------- ownership bookkeeping ----------------
