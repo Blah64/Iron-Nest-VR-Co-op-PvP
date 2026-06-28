@@ -36,7 +36,8 @@ namespace IronNestVR
         private const float PAD = 0.03f;
         private const float TITLE_H = 0.06f;
         private const float Z_ROW = -0.004f, Z_TEXT = -0.008f;
-        private const float MENU_HALF = 0.31f;   // VrSettingsMenu half-width (PANEL_W+0.02)/2 — to clear it sideways
+        private const float MENU_HALF = 0.33f;   // VrSettingsMenu half-width (PANEL_W+0.02)/2, +margin — to clear it sideways
+        private const float SIDE_GAP = 0.22f;    // clear space between the menu's right edge and this window's left edge
 
         private static readonly Color C_BG = new Color(0.05f, 0.06f, 0.08f, 1f);
         private static readonly Color C_ROW = new Color(0.13f, 0.15f, 0.19f, 1f);
@@ -316,7 +317,7 @@ namespace IronNestVR
                     fwd = fwd.sqrMagnitude > 1e-4f ? fwd.normalized : Vector3.forward;
                     right = Vector3.Cross(Vector3.up, fwd).normalized;
                 }
-                float side = (MENU_HALF + 0.05f + W * 0.5f) * scale;   // clear the menu sideways with a fixed gap
+                float side = (MENU_HALF + SIDE_GAP + W * 0.5f) * scale;   // clear the menu sideways with a fixed gap
                 _anchorPos = hp + fwd * Config.MenuDistance + right * side + Vector3.up * Config.MenuHeightOffset;
                 _anchorRot = Quaternion.LookRotation((_anchorPos - hp).normalized, Vector3.up);
                 if (Config.MenuFlip) _anchorRot *= Quaternion.Euler(0f, 180f, 0f);
