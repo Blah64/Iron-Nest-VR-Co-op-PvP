@@ -70,6 +70,7 @@ namespace IronNestVR
         private Page _page = Page.Comfort;
         private int _scroll;                       // lobby-list scroll offset (windowed view)
         private const int LOBBY_VISIBLE = 6;       // join slots shown at once on the Lobbies tab
+        private const int PLAYER_VISIBLE = 4;      // roster slots shown on the Lobbies tab (= CoopMaxPlayers cap)
         private const float TAB_H = 0.05f;
         private readonly Dictionary<int, int> _idToTab = new Dictionary<int, int>(); // collider id -> page
 
@@ -317,9 +318,23 @@ namespace IronNestVR
         private void DefineLobbyRows()
         {
             AddToggle("Status", () => SteamNet.StatusLine(), () => { });
-            AddAction("Create Lobby", () => SteamNet.CreateLobby());
+            // Mode is a lobby property chosen at creation (matches the flatscreen "Create PvE / Create PvP").
+            AddAction("Create Co-op", () => SteamNet.CreateLobby(false));
+            AddAction("Create PvP", () => SteamNet.CreateLobby(true));
             AddAction("Refresh List", () => SteamNet.RefreshLobbyList());
             AddAction("Leave Lobby", () => SteamNet.Leave());
+            // Host: lock the lobby (blocks new joins + hides it from the browser). Value shows the live state.
+            AddToggle("Lock Lobby", () => SteamNet.LockLabel(), () => SteamNet.ToggleLock());
+
+            // Players in this lobby — the VR counterpart to the flatscreen top-center roster. For the host each slot
+            // is a kick button (tap to remove); for a non-host it's a read-only name. Value text auto-refreshes.
+            string kickLabel = CoopP2P.IsHost ? "Kick" : "Player";
+            for (int i = 0; i < PLAYER_VISIBLE; i++)
+            {
+                int slot = i;
+                AddToggle(kickLabel, () => SteamNet.MemberLabel(slot), () => SteamNet.KickMemberAt(slot));
+            }
+
             AddToggle("Showing", LobbyRangeLabel, () => { });
             AddAction("Prev Page", () => ScrollLobbies(-1));
             AddAction("Next Page", () => ScrollLobbies(+1));

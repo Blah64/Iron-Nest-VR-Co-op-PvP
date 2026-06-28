@@ -273,9 +273,12 @@ namespace IronNestVR
         private static readonly List<ulong> _gIds = new List<ulong>();
         private static readonly List<string> _gNames = new List<string>();
         private static readonly List<(Rect r, int team)> _openSlots = new List<(Rect, int)>();
+        private static readonly List<(Rect r, ulong id)> _kickRects = new List<(Rect, ulong)>();   // host: kick a named player
         private static Rect _launchRect;
         private static bool _launchShown;
         private static bool _launchEnabled;
+        private static Rect _lockRect;
+        private static bool _lockShown;
         // Set by VrManager = the cursor is actually FREE on flatscreen (F7 open OR the loopback Alt/Ctrl+F5 free). The
         // team panel clicks gate on THIS, not LobbyGui.FlatInteractive — otherwise a loopback tester who freed the
         // cursor with Alt/Ctrl+F5 (not F7) saw the panel but its Launch/slot clicks were silently ignored.
@@ -293,9 +296,12 @@ namespace IronNestVR
                 if (m == null || !m.leftButton.wasPressedThisFrame) return;
                 float mx = m.position.x.ReadValue(), my = m.position.y.ReadValue();
                 var gui = new Vector2(mx, Screen.height - my);   // mouse is Y-up; GUI is Y-down
-                BuildPanel(false);                                // refresh _openSlots/_launchRect without drawing
+                BuildPanel(false);                                // refresh _openSlots/_kickRects/_launchRect without drawing
                 for (int i = 0; i < _openSlots.Count; i++)
                     if (_openSlots[i].r.Contains(gui)) { Log.LogInfo($"[pvp] team-switch slot clicked -> team {_openSlots[i].team + 1}"); RequestSwitch(_openSlots[i].team); return; }
+                for (int i = 0; i < _kickRects.Count; i++)
+                    if (_kickRects[i].r.Contains(gui)) { SteamNet.Kick(_kickRects[i].id); return; }
+                if (_lockShown && _lockRect.Contains(gui)) { SteamNet.ToggleLock(); return; }
                 if (_launchShown && _launchRect.Contains(gui))
                 {
                     if (_launchEnabled) { Log.LogInfo("[pvp] LAUNCH button clicked -> launching arena"); try { PvpMatch.LaunchArena(); } catch { } }
@@ -311,6 +317,7 @@ namespace IronNestVR
         {
             if (!Config.PvpActive || !SteamNet.InLobby) return;
             _openSlots.Clear();
+            _kickRects.Clear();
             bool locked = LockedForMatch();
 
             const float colW = 170f, rowH = 24f, pad = 10f;
@@ -319,14 +326,31 @@ namespace IronNestVR
             float colHeaderY = y + 30f;
             float slotsEnd = colHeaderY + rowH + SlotsPerTeam * rowH;   // bottom of the slot rows
 
-            // The host launches the match from here (replaces the Ctrl+Shift+L dev key). Shown host-only, pre-match.
+            // Host controls below the columns: a Lock toggle (always, host-only) and the pre-match Launch button.
+            _lockShown = CoopP2P.IsHost;
+            float lockY = slotsEnd + 6f;
             _launchShown = CoopP2P.IsHost && !locked;
-            float launchY = slotsEnd + 6f;
-            float h = (_launchShown ? (launchY + rowH + 8f) : (slotsEnd + 10f)) - y;
+            float launchY = _lockShown ? lockY + rowH + 4f : slotsEnd + 6f;
+            float bottom = _launchShown ? launchY + rowH + 8f : (_lockShown ? lockY + rowH + 8f : slotsEnd + 10f);
+            float h = bottom - y;
 
             if (render) GUI.Box(new Rect(x, y, w, h), locked ? "PvP TEAMS  (locked — match in progress)" : "PvP TEAMS  (click an open slot to switch)");
             BuildColumn(0, "TEAM 1", x + pad, colHeaderY, colW, rowH, locked, render);
             BuildColumn(1, "TEAM 2", x + pad * 2 + colW, colHeaderY, colW, rowH, locked, render);
+
+            if (_lockShown)
+            {
+                _lockRect = new Rect(x + pad, lockY, w - pad * 2f, rowH);
+                if (render)
+                {
+                    var prev = GUI.contentColor; GUI.contentColor = SteamNet.IsLocked ? Color.yellow : Color.white;
+                    string ll = !SteamNet.IsLocked ? "Lock lobby  (block new players)"
+                              : SteamNet.ManualLock ? "Locked — click to unlock"
+                              : "Locked (match in progress)";
+                    GUI.Button(_lockRect, ll);
+                    GUI.contentColor = prev;
+                }
+            }
 
             if (_launchShown)
             {
@@ -355,12 +379,19 @@ namespace IronNestVR
                 var rect = new Rect(x, ry, colW, rowH - 2f);
                 if (s < _gIds.Count)
                 {
+                    bool me = _gIds[s] == CoopP2P.MyId;
+                    bool canKick = !locked && CoopP2P.IsHost && !me;   // host removes any OTHER player, pre-match
                     if (render)
                     {
-                        bool me = _gIds[s] == CoopP2P.MyId;
                         var prev = GUI.contentColor; if (me) GUI.contentColor = Color.green;
-                        GUI.Label(rect, (me ? "» " : "  ") + _gNames[s]);
+                        GUI.Label(new Rect(x, ry, canKick ? colW - 42f : colW, rowH - 2f), (me ? "» " : "  ") + _gNames[s]);
                         GUI.contentColor = prev;
+                    }
+                    if (canKick)
+                    {
+                        var kr = new Rect(x + colW - 40f, ry, 38f, rowH - 2f);
+                        _kickRects.Add((kr, _gIds[s]));
+                        if (render) GUI.Button(kr, "kick");
                     }
                 }
                 else

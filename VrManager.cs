@@ -59,6 +59,7 @@ namespace IronNestVR
         private void OnGUI()
         {
             try { LobbyGui.Draw(); } catch { }
+            try { CoopRoster.DrawPanel(); } catch { }  // co-op top-center player list (opens with the F7 browser)
             try { PvpEffects.DrawFlat(); } catch { }  // PvP damage red-flash (under the HUD/toast; shipping game-feel)
             try { Notify.DrawFlat(); } catch { }   // non-focus-pulling "X joined" toast (flatscreen)
             try { PvpHud.DrawFlat(); } catch { }   // dev PvP duel readout (non-public builds, in a PvP mission)
@@ -82,6 +83,7 @@ namespace IronNestVR
             // look so the camera doesn't spin. Gated to CoopLoopback + an Active link → shipped play is untouched.
             bool testLink = !_xrReady && Config.CoopLoopback && LoopbackTransport.Active;
             bool freeCursor = lobbyFlat || (testLink && (LoopbackTransport.FreeCursor || AltHeld()));
+            CoopRoster.FlatInteractive = freeCursor;   // co-op roster kick/lock clicks work whenever the cursor is free
 #if !PUBLIC_BUILD
             PvpTeams.FlatInteractive = freeCursor;   // team-panel clicks work whenever the cursor is actually free (F7 OR loopback Alt/Ctrl+F5)
 #endif
@@ -430,6 +432,7 @@ namespace IronNestVR
 #endif
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
+            try { CoopRoster.HandleInput(); } catch { }   // co-op roster kick/lock clicks (while the F7 panel frees the cursor)
 #if !PUBLIC_BUILD
             try { PvpTeams.HandleInput(); } catch { }   // flatscreen team-slot clicks (while the F7 panel frees the cursor)
 #endif
