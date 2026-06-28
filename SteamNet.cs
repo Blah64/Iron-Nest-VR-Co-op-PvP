@@ -57,7 +57,6 @@ namespace IronNestVR
 
         // Roster scratch (members enumerated from the live Steam lobby; loopback falls back to the P2P peer set).
         public struct Member { public ulong Id; public string Name; public bool IsHost; public bool IsMe; }
-        private static readonly List<Member> _memberScratch = new List<Member>();
         private static readonly List<ulong> _peerScratch = new List<ulong>();
 
         // Shared IL2CPP dispatcher, so pumping ourselves is safe. Flip off only if it ever proves otherwise.
@@ -326,14 +325,6 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[net] lock apply: " + e.Message); }
         }
 
-        // Lock-row value text for the menus: the host sees its toggle state (+ a match-lock note); a non-host sees
-        // the read-only lobby state.
-        public static string LockLabel()
-        {
-            if (!CoopP2P.IsHost) return IsLocked ? "Locked" : "Open";
-            return (_manualLock ? "On" : "Off") + (_matchLock ? "  (match)" : "");
-        }
-
         // ---------------- kick ----------------
 
         // Host removes a player: ban them (so a rejoin is re-bounced) and broadcast the kick. The named member leaves
@@ -401,29 +392,6 @@ namespace IronNestVR
                 for (int i = 0; i < _peerScratch.Count; i++)
                     dst.Add(new Member { Id = _peerScratch[i], Name = CoopP2P.NameFor(_peerScratch[i]), IsHost = false, IsMe = false });
             }
-        }
-
-        public static int MemberCount { get { FillMembers(_memberScratch); return _memberScratch.Count; } }
-
-        // Display label for the i-th lobby member ("—" if empty) — for the VR menu's fixed player slots, whose value
-        // text auto-refreshes each tick.
-        public static string MemberLabel(int i)
-        {
-            FillMembers(_memberScratch);
-            if (i < 0 || i >= _memberScratch.Count) return "—";
-            var m = _memberScratch[i];
-            return (m.IsMe ? "» " : "  ") + m.Name + (m.IsHost ? "  (host)" : "");
-        }
-
-        // Kick the i-th listed member (host only; never self/host). Used by the VR menu player slots.
-        public static void KickMemberAt(int i)
-        {
-            if (!CoopP2P.IsHost) return;
-            FillMembers(_memberScratch);
-            if (i < 0 || i >= _memberScratch.Count) return;
-            var m = _memberScratch[i];
-            if (m.IsMe || m.IsHost) return;
-            Kick(m.Id);
         }
 
         private static string NameForId(ulong id)

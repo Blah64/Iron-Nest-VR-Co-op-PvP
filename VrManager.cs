@@ -31,6 +31,7 @@ namespace IronNestVR
         private VrSettingsMenu _menu;
         private VrPopup _popup;
         private MapScope _scope;
+        private VrRosterPanel _roster;   // world-space player list, floats beside the menu's Lobbies tab
         private bool _prevChord;
         private float _appliedRenderScale;
         private bool _xrReady;
@@ -578,6 +579,10 @@ namespace IronNestVR
                     if (_menu.IsOpen)
                     {
                         _menu.Tick(_xr.Input, _rig); // menu owns the trigger while open
+                        // The player-list window floats beside the Lobbies tab; it does its own laser raycast and
+                        // never overlaps the menu, so the shared trigger only fires the panel the laser is on.
+                        if (_menu.OnLobbiesTab && SteamNet.InLobby) _roster.Tick(_xr.Input, _rig);
+                        else _roster.Hide();
                         _handManip.Tick(_xr.Input, _rig, _hands, false); // release any held control
                         // Grab-to-place calibration runs with the menu open (the menu uses the trigger, grab
                         // uses the grip), so you can arm it on the HUD tab and immediately place the prop.
@@ -585,6 +590,7 @@ namespace IronNestVR
                     }
                     else
                     {
+                        _roster.Hide();   // no menu, no side window
                         // Screen-space confirmation popups ("I understand", exit-mission, …) are modal and
                         // invisible in VR; mirror + operate them here. While one is up it owns the trigger
                         // (like the settings menu), so locomotion/grab/cockpit clicks stand down.
@@ -698,6 +704,7 @@ namespace IronNestVR
                 _menu = new VrSettingsMenu { Hands = _hands, Grab = _grab, Manip = _handManip };
                 _popup = new VrPopup();
                 _scope = new MapScope();
+                _roster = new VrRosterPanel();
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
                 _frameFailStreak = 0;
@@ -757,6 +764,8 @@ namespace IronNestVR
             _popup = null;
             try { _scope?.Dispose(); } catch { }
             _scope = null;
+            try { _roster?.Dispose(); } catch { }
+            _roster = null;
             try { Notify.DisposeVr(); } catch { }
             try { _rig?.Destroy(); } catch { }
             _rig = null;
