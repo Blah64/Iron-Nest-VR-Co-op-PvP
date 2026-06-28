@@ -463,6 +463,7 @@ namespace IronNestVR
             CoopEntities.Tick(Time.unscaledDeltaTime);   // Phase 4: replicate host mission entities to the client
             CoopScene.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate mission/scene transitions (host drives)
             CoopScore.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate score/requisition (host-authoritative, applied out-of-mission)
+            CoopPressure.Tick(Time.unscaledDeltaTime);   // steam/pressure: per-valve damage sync (reconcile gate); engine host-auth (Phase 2, dormant)
             CoopPunchcards.Tick(Time.unscaledDeltaTime); // Phase 4: host-authoritative punchcard deck + redemption
             CoopNetDiag.Tick(Time.unscaledDeltaTime);    // REVIEW-fix: cross-machine desync detector (diagnostic only)
             PvpTeams.Tick(Time.unscaledDeltaTime);       // PvP teams: host-authoritative roster (inert unless Config.PvpActive)

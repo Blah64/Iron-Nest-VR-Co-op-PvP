@@ -225,6 +225,10 @@ namespace IronNestVR
         // owns them — keyed by console-relative path (collision-free, every relpath is unique under this root), applied
         // with SetDialValue (the proven setter). Counted per scan for the registry log.
         private static int _reconExcluded;
+        // Pressure-valve repair dials are owned by CoopPressure (MSG_VALVE / SetDamage01), not the dial-visual stream
+        // (the valve reads its dial via an event SetAccumulatedValueUnlimited won't fire; and a valve grab would mark
+        // the turret group remotely-owned). Excluded from the registry — counted per scan for the log. See PLAN-valve §4.1.
+        private static int _valveExcluded;
 
         // Reusable send buffer (control packets are tiny: 1+4+4 max). Lazily created on the Unity thread.
         private static Il2CppStructArray<byte> _buf;
@@ -1002,7 +1006,10 @@ namespace IronNestVR
                 || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
                 || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_DIAL
                 || type == PvpPlayers.MSG_PVP_POS    // PvP player position — either player authors it; host relays to other clients (N>2)
-                || type == PvpCombat.MSG_PVP_HIT;    // PvP hit report — attacker authors it, host relays; addressed to the victim's id in-payload
+                || type == PvpCombat.MSG_PVP_HIT     // PvP hit report — attacker authors it, host relays; addressed to the victim's id in-payload
+                // Pressure-valve damage is symmetric (either crew member repairs a valve), so a client's repair must
+                // reach the OTHER clients at N>2 (PLAN-valve §4.4 / REVIEW P1). MSG_ENGINE stays OFF — host-authored.
+                || type == CoopPressure.MSG_VALVE;
         }
 
         // Streaming packet types the host relays UNRELIABLE (high-rate, loss-tolerant). MSG_POSE is handled by
@@ -1318,6 +1325,7 @@ namespace IronNestVR
                     else if (type == CoopOrders.MSG_ORDER) CoopOrders.OnPacket(type, a, len);
                     else if (type == CoopCards.MSG_CARD) CoopCards.OnPacket(type, a, len);
                     else if (type == CoopScore.MSG_OUTCOME || type == CoopScore.MSG_OPSTATE) CoopScore.OnPacket(type, a, len);
+                    else if (type == CoopPressure.MSG_VALVE || type == CoopPressure.MSG_ENGINE) CoopPressure.OnPacket(type, origin, a, len);
                     else if (type == CoopImpact.MSG_IMPACT) CoopImpact.OnPacket(type, a, len);
                     else if (type == CoopPunchcards.MSG_PUNCH_DECK || type == CoopPunchcards.MSG_PUNCH_REDEEM
                              || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
@@ -1622,11 +1630,12 @@ namespace IronNestVR
             ResolveGuns(turret);
 
             _reconExcluded = 0;
+            _valveExcluded = 0;
             int added = 0;
             added += Scan(Il2CppType.Of<DialInteractable>(), true);
             added += Scan(Il2CppType.Of<LinearSliderInteractable>(), false);
             int sw = ScanSwitches();
-            if (added + sw > 0) Log.LogInfo($"[ctrl] registry: {_byId.Count} controls (+{added} drag, +{sw} click, {_reconExcluded} recon-dials-excluded; host={CoopP2P.IsHost})");
+            if (added + sw > 0) Log.LogInfo($"[ctrl] registry: {_byId.Count} controls (+{added} drag, +{sw} click, {_reconExcluded} recon-dials-excluded, {_valveExcluded} valve-dials-excluded; host={CoopP2P.IsHost})");
         }
 
         private static int Scan(Il2CppSystem.Type t, bool dial)
@@ -1651,6 +1660,12 @@ namespace IronNestVR
                 // dials, and CoopPunchcards owns them (console-relative key + SetDialValue). The submit LEVER is a click
                 // (ScanSwitches), not a dial, so it still syncs.
                 if (dial && path.IndexOf("Requisition Console", StringComparison.OrdinalIgnoreCase) >= 0) { _reconExcluded++; continue; }
+                // PRESSURE VALVES: every repair dial is a DialInteractable, but its damage is replicated by
+                // CoopPressure (MSG_VALVE / SetDamage01), NOT the dial-visual stream (the valve recomputes damage from
+                // an OnValueChanged EVENT that SetAccumulatedValueUnlimited(...,fireValueChangedEvent:false) won't fire
+                // — PLAN-valve §2). Excluding them also stops a valve grab marking the turret group remotely-owned
+                // (PLAN-valve §1.5). Path shape matches the probe: '…/PressureValve[ (n)]/Dial'.
+                if (dial && path.IndexOf("PressureValve", StringComparison.OrdinalIgnoreCase) >= 0) { _valveExcluded++; continue; }
                 int id = Fnv(path);
                 if (_byId.TryGetValue(id, out var exist))
                 {

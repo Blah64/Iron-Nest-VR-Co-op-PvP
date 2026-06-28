@@ -427,6 +427,7 @@ namespace IronNestVR
                 try { CoopEntities.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ent: " + e.Message); }
                 try { CoopPunchcards.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot punch: " + e.Message); }
                 try { CoopScore.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot score: " + e.Message); }
+                try { CoopPressure.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot valve: " + e.Message); }   // re-sent on MISSION_READY too (valves are scene objects)
             }
             finally { _snapActive = false; }
         }

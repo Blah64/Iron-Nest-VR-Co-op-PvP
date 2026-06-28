@@ -184,6 +184,7 @@ namespace IronNestVR
                     try { CoopP2P.SendSnapshotTo(origin, () => CoopEntities.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->entities: " + e.Message); }
                     try { CoopP2P.SendSnapshotTo(origin, () => CoopMap.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->map: " + e.Message); }
                     try { CoopP2P.SendSnapshotTo(origin, () => CoopPunchcards.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->punch: " + e.Message); }
+                    try { CoopP2P.SendSnapshotTo(origin, () => CoopPressure.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->valve: " + e.Message); }
                     break;
                 }
             }

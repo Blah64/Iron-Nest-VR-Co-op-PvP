@@ -142,6 +142,14 @@ namespace IronNestVR
         // OUT of a mission (LoadOperationState is heavy → never applied mid-mission). See CoopScore.
         public static bool CoopScoreSync = true;
 
+        // Pressure/steam co-op sync (PLAN-valve.md / CoopPressure). VALVE damage (currentDamage01) is replicated
+        // per-valve: repairs are symmetric, breaks host-authoritative via a reconcile gate (no Harmony — patching the
+        // RNG break component crashes this IL2CPP build). ENGINE (EnginesRunning) is host-authoritative but DEFAULTS
+        // OFF — PLAN-valve §5 wants a 2-player test first (the client's engine may already track from the synced
+        // fuel/timing dials); flip CoopEngineSync on only if it diverges.
+        public static bool CoopValveSync = true;
+        public static bool CoopEngineSync = false;
+
         // Phase 4 co-op (4c): host-authoritative IMPACT RESULT. The host broadcasts each shell impact that HIT a
         // target (location + hit entities + shell id) and the client replays it to its ImpactIndicators so the
         // tactical map shows the hit — the client's own local adjudication usually misses (target already
@@ -918,6 +926,8 @@ namespace IronNestVR
                 WB(sb, "CoopLoopback", CoopLoopback);
                 WI(sb, "CoopLoopbackPort", CoopLoopbackPort);
                 WB(sb, "CoopVerboseLog", CoopVerboseLog);
+                WB(sb, "CoopValveSync", CoopValveSync);
+                WB(sb, "CoopEngineSync", CoopEngineSync);
                 WB(sb, "CoopTestForceWindow", CoopTestForceWindow);
                 WI(sb, "CoopMaxPlayers", CoopMaxPlayers);
                 WF(sb, "CoopEntityScanHz", CoopEntityScanHz);
@@ -1092,6 +1102,8 @@ namespace IronNestVR
                 case "CoopLoopback": CoopLoopback = PB(v, CoopLoopback); break;
                 case "CoopLoopbackPort": CoopLoopbackPort = PI(v, CoopLoopbackPort); break;
                 case "CoopVerboseLog": CoopVerboseLog = PB(v, CoopVerboseLog); break;
+                case "CoopValveSync": CoopValveSync = PB(v, CoopValveSync); break;
+                case "CoopEngineSync": CoopEngineSync = PB(v, CoopEngineSync); break;
                 case "CoopTestForceWindow": CoopTestForceWindow = PB(v, CoopTestForceWindow); break;
                 case "CoopMaxPlayers": CoopMaxPlayers = PI(v, CoopMaxPlayers); break;
                 case "CoopEntityScanHz": CoopEntityScanHz = PF(v, CoopEntityScanHz); break;
