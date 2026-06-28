@@ -42,7 +42,9 @@ namespace IronNestVR
         private enum Result { None, Won, Lost }
         private static Result _result = Result.None;
 
-        private sealed class Mirror { public ulong Origin; public string ID; public GameObject Go; public EntityLocation Loc; public MapEntity Entity; public Vector2 Grid; public int Health; public CanvasGroup Vis; }
+        private sealed class Mirror { public ulong Origin; public string ID; public GameObject Go; public EntityLocation Loc; public MapEntity Entity; public Vector2 Grid; public int Health; public CanvasGroup Vis; public float RevealUntil; }
+
+        private const float ReconRevealSec = 12f;   // how long a recon sweep keeps the enemy spotted before it re-fogs
         private static readonly Dictionary<ulong, Mirror> _mirrors = new Dictionary<ulong, Mirror>();
         private static readonly List<ulong> _toRemove = new List<ulong>();
 
@@ -96,9 +98,7 @@ namespace IronNestVR
                 }
                 PruneNonCaptainMirrors();   // reap a non-captain's stale mirror once the roster is known
                 CheckMatchEnd();            // declare win/lose from the team-health state
-#if !PUBLIC_BUILD
-                RevealMirrors();   // TESTING: keep opponents visible through fog (real recon/teleprinter acquisition TBD)
-#endif
+                ApplyMirrorVisibility();    // ACQUISITION: enemy is fog-hidden until a recon card reveals it (OnReconReveal)
             }
             catch (Exception e) { Log.LogWarning("[pvp] tick: " + e.Message); }
         }
@@ -106,7 +106,7 @@ namespace IronNestVR
         private static void BroadcastMyPosition()
         {
             if (!EnsureBuf()) return;
-            Vector2 g = MyGrid();
+            Vector2 g = MyTurretGrid();   // LIVE turret position — so a card-driven relocate moves our blip on the enemy's map
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_PVP_POS);
             w.Float(g.x); w.Float(g.y); w.Int((int)EntityRoles.Enemy);
@@ -220,25 +220,47 @@ namespace IronNestVR
             try { if (m.Loc != null) m.Loc.RecalculateAndRegister(false); } catch { }
         }
 
-#if !PUBLIC_BUILD
-        // TESTING override: planning-map entities are fog-gated via EntityLocation.VisibilityGroup (a CanvasGroup the
-        // recon system fades to 0 until an area is revealed). Force our opponent mirrors' alpha to 1 every frame so
-        // they're always visible to aim at. The entity's own Update re-evaluates fog, hence per-frame re-application.
-        // Replace with the chosen acquisition mechanic (teleprinter fire mission / scout recon) before any public PvP.
-        private static void RevealMirrors()
+        // ACQUISITION (recon-card spotting, the real mechanic — replaces the old always-on RevealMirrors cheat). The
+        // enemy turret mirror is fog-hidden by DEFAULT (RevealUntil=0) and only shown while a recon sweep has it spotted
+        // (OnReconReveal pushes RevealUntil forward). We OWN the mirror's on-map visibility outright rather than relying
+        // on the native fog touching a mod-spawned clone: force its icon Image on while revealed, off otherwise. The
+        // entity's own Update keeps re-evaluating fog, so we re-assert every frame. The reveal lever is Image_Icon.enabled
+        // (a render-dump showed the fog HIDES by disabling that Image, with the CanvasGroup alpha already 1); we drive the
+        // CanvasGroup too as a belt. Runs in BOTH build flavors — this is the shipping mechanic now, not a test override.
+        private static void ApplyMirrorVisibility()
         {
+            float now = Time.unscaledTime;
             foreach (var kv in _mirrors)
             {
                 var m = kv.Value; if (m == null || m.Loc == null) continue;
-                // The recon/fog system HIDES an entity by DISABLING its Image_Icon component (dump showed en=False
-                // while the CanvasGroup alpha was already 1). Force the Image on — that's the actual reveal lever.
-                try { var img = m.Loc.Image_Icon; if (img != null) img.enabled = true; } catch { }
+                bool show = now < m.RevealUntil;
+                try { var img = m.Loc.Image_Icon; if (img != null && img.enabled != show) img.enabled = show; } catch { }
                 var v = m.Vis;
                 if (v == null) { try { v = m.Vis = m.Loc.VisibilityGroup; } catch { } }
-                if (v != null) { try { v.alpha = 1f; v.interactable = true; v.blocksRaycasts = true; } catch { } }
+                if (v != null) { try { v.alpha = show ? 1f : 0f; v.interactable = show; v.blocksRaycasts = show; } catch { } }
             }
         }
-#endif
+
+        // Harmony POSTFIX target (registered in CoopSim) on the recon fog-clear — MapReconClearer.ClearAll /
+        // MapReconClearHandle.DestroyAll. A player redeemed a recon requisition card → its (card-gated) scout plane swept
+        // → fog cleared → spot every enemy mirror for ReconRevealSec. There's one mirror per enemy team (the captain), so
+        // "all" = the enemy team(s). They re-fog after the window → recon again (or after they've relocated) to re-acquire.
+        // In a bare PvP arena the ONLY thing that clears recon fog is a player recon card (scripted scout planes are
+        // suppressed), so an unconditional reveal here is safe. Inert outside a live PvP mission.
+        private static float _nextReconLog;
+        public static void OnReconReveal()
+        {
+            try
+            {
+                if (!Active() || _mirrors.Count == 0) return;
+                float now = Time.unscaledTime;
+                float until = now + ReconRevealSec;
+                foreach (var kv in _mirrors) { var m = kv.Value; if (m != null) m.RevealUntil = until; }
+                // A sweep clears many fog handles in one frame (this postfix fires per handle) — throttle the log.
+                if (now >= _nextReconLog) { _nextReconLog = now + 1f; Log.LogInfo($"[pvp] RECON sweep — enemy spotted for {ReconRevealSec:0}s ({_mirrors.Count} mirror(s))"); }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] recon reveal: " + e.Message); }
+        }
 
         // ---------------- damage (Phase 2 shot lane, victim-authoritative) ----------------
 
@@ -385,6 +407,21 @@ namespace IronNestVR
             return CoopP2P.IsHost ? Team0Spawn : Team1Spawn;   // roster not resolved yet — fall back to role
         }
 
+        // The grid we BROADCAST as our turret's position. Once our turret is pinned (PlaceMyTurret), read the LIVE
+        // turretBase.anchoredPosition — which IS map-grid space (the placement log confirmed anchored ≈ the target grid),
+        // so when the player RELOCATES the turret with a requisition card the enemy's mirror of us follows the real turret
+        // and their learned firing solution goes stale (they must recon + re-aim). Before placement settles, broadcast the
+        // intended team grid so a frame of the scene-default origin (≈1.6,1.6) never leaks to the enemy.
+        private static Vector2 MyTurretGrid()
+        {
+            if (_turretPlaced)
+            {
+                try { var t = TurretController.Instance; var bas = t != null ? t.turretBase : null; if (bas != null) return bas.anchoredPosition; }
+                catch { }
+            }
+            return MyGrid();
+        }
+
         // Pin THIS player's turret to their deterministic grid (MyGrid) so the firing origin — and therefore the
         // azimuth/range/elevation solution to the fixed enemy marker — is identical every match. The turret moves in
         // WORLD space (SetTurretLocation takes a world position and snaps Y to the map surface; probe RUN 1 showed
@@ -438,8 +475,14 @@ namespace IronNestVR
         public static bool Eliminated => _eliminated;
         public static bool MatchOver => _result != Result.None;
         public static bool Won => _result == Result.Won;
-        public static Vector2 MyGridPublic => MyGrid();
+        public static Vector2 MyGridPublic => MyTurretGrid();   // live turret grid (tracks a card relocate)
         public static int MirrorCount => _mirrors.Count;
+
+        // True while at least one enemy mirror is currently spotted (a recon sweep is in effect). For the HUD cue.
+        public static bool EnemyAcquired
+        {
+            get { float now = Time.unscaledTime; foreach (var kv in _mirrors) { var m = kv.Value; if (m != null && now < m.RevealUntil) return true; } return false; }
+        }
 
         // First opponent mirror (1v1 = the only one). Returns its map grid + current health.
         public static bool TryGetFirstEnemy(out Vector2 grid, out int health)

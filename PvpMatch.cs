@@ -88,6 +88,18 @@ namespace IronNestVR
         private static float _launchDeadline;    // give up if BrowsingMap never comes up
         private static float _nextEnterTry;      // throttle EnterBrowsingMap re-issue while stuck at MainMenu
 
+        // PvP REQUISITION-CARD WINDOW. Turret-move and recon are PLAYER ABILITIES driven by requisition cards: redeeming
+        // a card runs its PunchcardGraph, which contains the State_MoveTurret / State_SetTurretLocation /
+        // State_SpawnScoutPlane nodes. Those nodes are CARD-GATED in CoopSim — suppressed in a bare PvP arena (so the
+        // mission script can't relocate the turret or spawn recon on its own) EXCEPT while a card is driving them.
+        // CoopPunchcards.OnAttemptRequisition calls NoteCardRedeem() the instant the local player pulls the requisition
+        // lever; the card graph's node OnEnter fires a beat later (it runs as a coroutine over a few frames) and is let
+        // through while this window is open. A bare-arena mission node firing OUTSIDE the window is still suppressed.
+        private static float _cardGraphUntil;
+        private const float CardGraphWindowSec = 8f;
+        public static void NoteCardRedeem() { try { _cardGraphUntil = Time.unscaledTime + CardGraphWindowSec; } catch { } }
+        public static bool CardGraphActive() { try { return Time.unscaledTime < _cardGraphUntil; } catch { return false; } }
+
         public static bool Active => Config.PvpActive && SteamNet.InLobby && CoopP2P.HasPeer;
 
         public static void Tick(float dt)
@@ -107,6 +119,8 @@ namespace IronNestVR
                     }
                     // DEV: host launches the arena. Ctrl+Shift+L. (Eventual UI: a lobby "Launch Match" button.)
                     if (kb[UnityEngine.InputSystem.Key.L].wasPressedThisFrame) LaunchArena();
+                    // DEV: force-spot the enemy (test the move/hit lane without first proving the recon-card path). Ctrl+Shift+R.
+                    if (kb[UnityEngine.InputSystem.Key.R].wasPressedThisFrame) { PvpPlayers.OnReconReveal(); Log.LogInfo("[pvp] DEV force-reveal enemy (Ctrl+Shift+R)"); }
                 }
 #endif
 

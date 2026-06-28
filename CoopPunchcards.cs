@@ -548,6 +548,34 @@ namespace IronNestVR
             try
             {
                 if (_applyingRemote) return true;                 // host running a client's intent — run for real
+                // PvP: each player owns their OWN turret + cards — a redemption runs LOCALLY (no co-op host-routing) and
+                // arms PvpMatch's card window so CoopSim lets THIS card's State_MoveTurret / State_SetTurretLocation /
+                // State_SpawnScoutPlane node through (card-gated; suppressed in a bare arena otherwise). Opponents never
+                // see our cards (MSG_PUNCH_* is team-scoped), so there's nothing to forward to a host. Also FLAG a RECON
+                // card (PunchcardDefinitionV2.IsRecon) so its successful redemption SPOTS the enemy on our map — the
+                // native scout plane reveals native fog (not MapReconClearer, per the test log), so we reveal our own
+                // mod-spawned mirror in OnRequisitionTrigger when the redeem confirms success.
+                if (Config.PvpActive)
+                {
+                    try { PvpMatch.NoteCardRedeem(); } catch { }
+                    // RECON card → SPOT the enemy on our map. The native scout-plane photo reveals native fog only (no
+                    // native enemy exists in a duel), so we reveal our mod-spawned mirror ourselves. Done in THIS PREFIX
+                    // (guaranteed to run on lever-pull — the success postfix OnRequisitionTrigger did NOT fire for these
+                    // redeems, so the reveal never happened). The forward observer has its own native spotter; this is
+                    // mainly what makes the one-shot scout PLANE actually spot the enemy. Logs the card id + IsRecon.
+                    try
+                    {
+                        var c = SafeCurrentCard(__instance);
+                        var d = c != null ? c.CurrentDefinition : null;
+                        bool recon = d != null && d.IsRecon;
+#if !PUBLIC_BUILD
+                        Log.LogInfo($"[pvp] requisition redeem: card='{(d != null ? d.ID : "?")}' isRecon={recon}");
+#endif
+                        if (recon) PvpPlayers.OnReconReveal();
+                    }
+                    catch (Exception e) { Log.LogWarning("[pvp] recon stage: " + e.Message); }
+                    return true;
+                }
                 if (!Config.CoopPunchcardSync || !Config.CoopPunchcardRedeemSync) return true;
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer) return true;   // solo — stock behavior
                 if (CoopP2P.IsHost)
@@ -1005,6 +1033,20 @@ namespace IronNestVR
         {
             _lastTrigger = success;
             _lastTriggerSet = true;
+
+            // PvP RECON: a successful recon-card redemption SPOTS the enemy on OUR map. The native scout plane reveals
+            // native fog (no native entity exists in a duel arena, and it doesn't drive MapReconClearer per the test
+            // log), so we reveal our mod-spawned mirror ourselves. Runs LOCALLY on whoever reconned (PvP cards run
+            // locally) → host and client each spot their own opponent. Consume the staging either way.
+            try
+            {
+                if (_pvpReconStaged)
+                {
+                    _pvpReconStaged = false;
+                    if (success && Config.PvpActive) PvpPlayers.OnReconReveal();
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[punch] pvp recon: " + e.Message); }
 
             // RESULT replication: this fires synchronously inside AttemptRequisition with the verdict, for the host's
             // own redeem AND a client-forwarded one (RunRedeem). If it succeeded, broadcast the staged card + vars so

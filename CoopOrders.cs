@@ -60,6 +60,7 @@ namespace IronNestVR
         {
             try
             {
+                if (Config.PvpActive) return;   // PvP: teleprinters are per-player (recon is local) — never replicate/host-author
                 if (!Config.CoopOrdersSync || !CoopP2P.IsHost) return;
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer) return;
                 if (!InMission()) return;
@@ -89,6 +90,7 @@ namespace IronNestVR
             try
             {
                 if (ApplyingRemote) return;                                   // host's replayed text — keep it
+                if (Config.PvpActive) return;                                 // PvP: each player prints their own recon/orders locally — NEVER blank
                 if (!Config.CoopOrdersSync || CoopP2P.IsHost) return;         // feature off / host authors
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer || !InMission()) return;  // solo / hub: local is correct
                 var blank = new Il2CppSystem.Collections.Generic.List<string>();
@@ -135,6 +137,7 @@ namespace IronNestVR
         public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
         {
             if (type != MSG_ORDER) return;
+            if (Config.PvpActive) return; // PvP: no cross-player order replication (teleprinters are per-player)
             if (CoopP2P.IsHost) return;   // host authored it; never replays
             var r = new CoopWire.Reader(a, len, 1);
             byte ptype = r.Byte();

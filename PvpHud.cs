@@ -43,14 +43,17 @@ namespace IronNestVR
 
                 if (PvpPlayers.TryGetFirstEnemy(out var eg, out var ehp))
                 {
-                    GUI.Label(new Rect(lx, cy, lw, rh), $"ENEMY TEAM: grid ({eg.x:0.0}, {eg.y:0.0})   hp {ehp}"); cy += rh;
+                    bool acq = PvpPlayers.EnemyAcquired;
+                    if (acq) { GUI.Label(new Rect(lx, cy, lw, rh), $"ENEMY TEAM: grid ({eg.x:0.0}, {eg.y:0.0})   hp {ehp}   [SPOTTED]"); cy += rh; }
+                    else { var pc = GUI.contentColor; GUI.contentColor = Color.yellow; GUI.Label(new Rect(lx, cy, lw, rh), "ENEMY TEAM: not acquired — redeem a recon card to spot"); GUI.contentColor = pc; cy += rh; }
                     if (PvpCombat.LastImpactTime > 0f)
                     {
                         Vector2 li = PvpCombat.LastImpact;
-                        float d = Vector2.Distance(li, eg);
-                        GUI.Label(new Rect(lx, cy, lw, rh), $"Last impact: ({li.x:0.0}, {li.y:0.0})   off by {d:0.0}{(PvpCombat.LastImpactHit ? "   HIT!" : "")}"); cy += rh;
+                        // "off by" only once spotted — blind, you just see where your own shell landed.
+                        if (acq) { float d = Vector2.Distance(li, eg); GUI.Label(new Rect(lx, cy, lw, rh), $"Last impact: ({li.x:0.0}, {li.y:0.0})   off by {d:0.0}{(PvpCombat.LastImpactHit ? "   HIT!" : "")}"); cy += rh; }
+                        else { GUI.Label(new Rect(lx, cy, lw, rh), $"Last impact: ({li.x:0.0}, {li.y:0.0})"); cy += rh; }
                     }
-                    else { GUI.Label(new Rect(lx, cy, lw, rh), "Last impact: (fire a ranging shot toward the enemy grid)"); cy += rh; }
+                    else { GUI.Label(new Rect(lx, cy, lw, rh), "Last impact: (fire a ranging shot)"); cy += rh; }
                 }
                 else { GUI.Label(new Rect(lx, cy, lw, rh), "ENEMY: (waiting for opponent…)"); cy += rh; }
 

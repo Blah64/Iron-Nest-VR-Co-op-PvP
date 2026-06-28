@@ -54,6 +54,9 @@ namespace IronNestVR
         private static Harmony _harmony;
         private static int _patched;
         private static float _nextGateLog;
+#if !PUBLIC_BUILD
+        private static float _nextCardNodeLog;   // throttle the card-gated node allow/suppress trace (dev builds only)
+#endif
 
         // Called once from Plugin.Load. The single spawn-node target is patched in its own try/catch so a
         // missing/renamed method can't take down the rest of startup; we log whether it landed so a tester's
@@ -89,17 +92,22 @@ namespace IronNestVR
             // the scene's wired klaxon/lights fire (onTimerStarted) on whoever fired (the host). Gating the NODE kills
             // the scripted counter-battery on BOTH machines at the source; PvpMatch then drives the timer DIRECTLY
             // (TurretController-independent) as the VICTIM's hit effect. We skip the node's action; the graph advances.
-            foreach (var nodeName in new[] { "State_SpawnScoutPlane", "State_DamageEntity", "State_SetEntityState", "State_MoveMapEntity", "State_MoveTurret", "State_SetTurretLocation", "State_StartTimer", "State_UnpauseTimer" })
-            {
-                try
-                {
-                    var t = AccessTools.TypeByName("SleepyNodes." + nodeName);
-                    var mi = t != null ? AccessTools.Method(t, "OnEnter") : null;
-                    if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopSim), nameof(PvpSuppressPrefix))); Log.LogInfo($"[sim] PvP content suppressor patched ({nodeName}.OnEnter — inert unless PvpActive)"); }
-                    else Log.LogWarning($"[sim] SleepyNodes.{nodeName}.OnEnter not found — PvP suppression for it off");
-                }
-                catch (Exception e) { Log.LogWarning($"[sim] {nodeName} patch: " + e.Message); }
-            }
+            //
+            // HARD-SUPPRESSED (always skip in PvP): scripted PvE content + NRE sources. State_DamageEntity is the critical
+            // one — the engine's StartImpact INVOKES it on our mirror and it NREs (aborting StartImpact so our hit postfix
+            // never runs); SetEntityState/MoveMapEntity NRE the same way; StartTimer/UnpauseTimer = the scripted klaxon.
+            // None of these is ever needed by a player ability, so a blanket skip is correct.
+            foreach (var nodeName in new[] { "State_DamageEntity", "State_SetEntityState", "State_MoveMapEntity", "State_StartTimer", "State_UnpauseTimer" })
+                PatchPvpNode(nodeName, nameof(PvpSuppressPrefix), "hard-suppress");
+
+            // CARD-GATED (skip in PvP UNLESS a requisition card is driving): these are the PLAYER's two requisition-card
+            // abilities — RELOCATE the turret (State_MoveTurret / State_SetTurretLocation) and RECON the enemy
+            // (State_SpawnScoutPlane). A bare arena must not let the mission script fire them, but a player who redeems the
+            // matching card MUST be able to. PvpCardGatedSuppressPrefix runs the node only while a card graph is in flight
+            // (PvpMatch.CardGraphActive, armed by CoopPunchcards.OnAttemptRequisition), and suppresses it otherwise. This
+            // is what un-breaks "move the turret by requisition card" and "recon to spot the enemy" in PvP.
+            foreach (var nodeName in new[] { "State_MoveTurret", "State_SetTurretLocation", "State_SpawnScoutPlane" })
+                PatchPvpNode(nodeName, nameof(PvpCardGatedSuppressPrefix), "card-gated");
 
             // TELEPRINTER ORDERS are the ONE thing the client can't resolve locally: the gated spawn node is what
             // stashes the target in a graph context variable, so a client that skips it prints a BLANK order (the
@@ -229,6 +237,23 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[sim] requestfire hook: " + e.Message); }
 
+            // PvP ACQUISITION (recon-card spotting): in PvP the enemy turret mirror is fog-hidden until reconned. A recon
+            // requisition card spawns a scout plane (State_SpawnScoutPlane, card-gated above) whose sweep CLEARS the recon
+            // fog overlay by destroying its GameObjects — MapReconClearer.ClearAll iterates handles, MapReconClearHandle.
+            // DestroyAll clears one region. We postfix BOTH (whichever the plane drives) so the instant fog is cleared we
+            // reveal the enemy mirror for a spell (PvpPlayers.OnReconReveal — inert unless PvpActive). Reveal is OURS, not
+            // the native fog's, so it doesn't depend on whether a mod-spawned clone participates in the fog system.
+            try
+            {
+                int rn = 0;
+                var ca = AccessTools.Method(typeof(MapReconClearer), "ClearAll");
+                if (ca != null) { _harmony.Patch(ca, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnReconReveal))); rn++; }
+                var da = AccessTools.Method(typeof(MapReconClearHandle), "DestroyAll");
+                if (da != null) { _harmony.Patch(da, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnReconReveal))); rn++; }
+                Log.LogInfo($"[sim] PvP recon-reveal capture patched ({rn}/2 recon-clear method(s) — reveals enemy mirror on a recon sweep)");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] recon-reveal patch: " + e.Message); }
+
             // SCORE / OUTCOME: the host replays mission complete/fail onto the client so the result screens match.
             // CoopScore broadcasts (host-only); the client's replay re-hits these postfixes but bails on !IsHost.
             try
@@ -261,8 +286,27 @@ namespace IronNestVR
             // CRITICAL: this prefix runs on EVERY spawn-node entry for host AND client. It must NEVER throw — a
             // throw here would propagate into the game's mission state machine and break the mission for everyone.
             // Any error → behave as "don't gate" (run the original), the safe default.
-            // PvP: a duel arena spawns NO scripted enemies/targets on EITHER machine (PvpPlayers spawns the players).
-            try { if (Config.PvpActive) { float tp = Time.unscaledTime; if (tp >= _nextGateLog) { _nextGateLog = tp + 1f; Log.LogInfo("[sim] PvP SPAWN-gate ACTIVE — bare arena, no scripted spawns on either machine"); } return false; } }
+            // PvP: a duel arena spawns NO scripted enemies/targets on EITHER machine (PvpPlayers spawns the players) —
+            // EXCEPT a player's requisition CARD legitimately spawns its OWN native recon asset (the FORWARD OBSERVER
+            // card spawns a spotter unit via this node, which then reveals + reports to the teleprinter like base game).
+            // So allow the spawn while a card graph is in flight (PvpMatch.CardGraphActive), suppress mission-scripted
+            // spawns otherwise. Safe to card-gate: unlike the entity-MUTATOR nodes (Damage/SetState/Move), the spawn node
+            // is never invoked by StartImpact, so allowing it can't re-introduce the impact-adjudication NRE.
+            try
+            {
+                if (Config.PvpActive)
+                {
+                    if (PvpMatch.CardGraphActive())
+                    {
+#if !PUBLIC_BUILD
+                        float tc = Time.unscaledTime; if (tc >= _nextCardNodeLog) { _nextCardNodeLog = tc + 0.5f; Log.LogInfo("[sim] PvP spawn ALLOWED (requisition card driving — e.g. forward observer's spotter)"); }
+#endif
+                        return true;   // run the spawn — it's the card's own asset
+                    }
+                    float tp = Time.unscaledTime; if (tp >= _nextGateLog) { _nextGateLog = tp + 1f; Log.LogInfo("[sim] PvP SPAWN-gate ACTIVE — bare arena, no scripted spawns on either machine"); }
+                    return false;
+                }
+            }
             catch { }
             try { if (!ShouldGate()) return true; }   // run original (solo or host, or on any error)
             catch { return true; }
@@ -273,8 +317,40 @@ namespace IronNestVR
 
         // PvP-only node suppressor: skip the patched node ONLY in a PvP arena (returns false). Otherwise run the
         // original (returns true), so co-op + solo are unaffected. Never throws into the graph. Used for content
-        // nodes co-op deliberately leaves running (scout plane, etc.) but a bare PvP arena must not.
+        // nodes a bare PvP arena must never run (damage/state/scripted-timer).
         public static bool PvpSuppressPrefix() { try { return !Config.PvpActive; } catch { return true; } }
+
+        // PvP CARD-GATED node suppressor: in a PvP arena, run the node ONLY while a requisition card graph is driving it
+        // (PvpMatch.CardGraphActive — armed when the local player pulls the requisition lever); suppress it otherwise so
+        // the mission script can't fire it in the bare arena. Co-op + solo always run the original. Never throws.
+        public static bool PvpCardGatedSuppressPrefix()
+        {
+            try
+            {
+                if (!Config.PvpActive) return true;            // co-op / solo unaffected
+                bool allow = PvpMatch.CardGraphActive();
+#if !PUBLIC_BUILD
+                float t = Time.unscaledTime;
+                if (t >= _nextCardNodeLog) { _nextCardNodeLog = t + 0.5f; Log.LogInfo($"[sim] PvP card-gated node OnEnter -> {(allow ? "ALLOWED (a requisition card is driving)" : "suppressed (no card in flight)")}"); }
+#endif
+                return allow;
+            }
+            catch { return true; }
+        }
+
+        // Patch one SleepyNodes.<name>.OnEnter with the named PvP prefix (resolved by reflection so a renamed node can't
+        // take down startup). Shared by the hard-suppress and card-gated lists.
+        private static void PatchPvpNode(string nodeName, string prefixName, string label)
+        {
+            try
+            {
+                var t = AccessTools.TypeByName("SleepyNodes." + nodeName);
+                var mi = t != null ? AccessTools.Method(t, "OnEnter") : null;
+                if (mi != null) { _harmony.Patch(mi, prefix: new HarmonyMethod(typeof(CoopSim), prefixName)); Log.LogInfo($"[sim] PvP {label} suppressor patched ({nodeName}.OnEnter — inert unless PvpActive)"); }
+                else Log.LogWarning($"[sim] SleepyNodes.{nodeName}.OnEnter not found — PvP {label} for it off");
+            }
+            catch (Exception e) { Log.LogWarning($"[sim] {nodeName} patch: " + e.Message); }
+        }
 
         // OBSERVE-ONLY prefix on GunController.RequestFire (Bug 2 fix). Tags a local shot in CoopBallistics' per-side
         // intent queue. Returns void -> never skips the original, so it cannot affect PvP/solo firing; inert unless
