@@ -94,9 +94,16 @@ namespace IronNestVR
             if (Config.CoopEngineSync) TickEngine(now);
         }
 
+        // Valve authority for THIS machine's turret. Co-op: the session host owns all valves (one shared crew).
+        // PvP: a team IS one shared vehicle, so the team's CAPTAIN (lowest SteamID — PvpTeams, the SAME owner that
+        // already holds the team's shared HEALTH + map position) owns its turret's valve state. The host is NOT
+        // special in PvP — the captain is often a client teammate. Deterministic + identical on every machine, with
+        // seamless failover if the captain drops (PvpTeams.TeamCaptain). Non-owners author only repairs (decreases).
+        private static bool OwnsValves() => Config.PvpActive ? PvpTeams.AmICaptain : CoopP2P.IsHost;
+
         private static void TickValves(float now)
         {
-            bool host = CoopP2P.IsHost;
+            bool owns = OwnsValves();
 
             foreach (var kv in _byId)
             {
@@ -112,9 +119,10 @@ namespace IronNestVR
                 if (CoopWire.Finite(st.Prev) && Mathf.Abs(cur - st.Prev) > ValveEps && !suppressed)
                 {
                     bool increased = cur > st.Prev;
-                    // RECONCILE GATE: the client never authors a break (increase) — that's the host's RNG. It only
-                    // authors a repair (decrease, a dial drag). The host authors everything (break + repair).
-                    if (host || !increased)
+                    // RECONCILE GATE: a NON-owner never authors a break (increase) — that's the owner's RNG. It only
+                    // authors a repair (decrease, a dial drag). The valve OWNER (co-op host / PvP team captain) authors
+                    // everything (break + repair).
+                    if (owns || !increased)
                     {
                         SendValve(id, cur);
                         Diagnostics.V($"[valve] {(increased ? "break" : "repair")} id=0x{(uint)id:X8} dmg={cur:0.000} -> peer");
@@ -123,10 +131,10 @@ namespace IronNestVR
                 st.Prev = cur;
             }
 
-            // HOST heartbeat: re-assert the FULL valve set so (a) a value lost in a blackout re-converges, and (b) a
-            // spurious client-local RNG break (which the client refused to send) is overwritten back to the host's
-            // truth within ≤2s. The client does NOT heartbeat — the host owns the canonical state.
-            if (host && now >= _nextValveBeat)
+            // OWNER heartbeat: re-assert the FULL valve set so (a) a value lost in a blackout re-converges, and (b) a
+            // spurious non-owner-local RNG break (which the non-owner refused to send) is overwritten back to the
+            // owner's truth within ≤2s. Only the owner (host / team captain) heartbeats — it holds the canonical state.
+            if (owns && now >= _nextValveBeat)
             {
                 _nextValveBeat = now + ValveHeartbeatSec;
                 foreach (var kv in _byId)
@@ -180,17 +188,18 @@ namespace IronNestVR
                     if (_byId.TryGetValue(id, out var v) && v != null)
                     {
                         float cur; try { cur = v.currentDamage01; } catch { cur = float.NaN; }
-                        // AUTHORITY BOUNDARY (REVIEW-valve P2): the host accepts only REPAIRS (decreases) from a
-                        // client — a client must NEVER author a break (increase); that's the host's RNG. The reconcile
-                        // gate is enforced HERE, not just trusted in the client's sender, so a stale/buggy/unexpected
-                        // client can't push a break into the host (which would then re-broadcast it as truth on the 2s
-                        // heartbeat). On reject, immediately re-assert the host's true value so the offending sender
-                        // converges now instead of waiting for the heartbeat. (The transport relay can't value-inspect,
-                        // so a relayed break still reaches other clients for ≤1 round-trip; this + the heartbeat heal it.)
-                        if (CoopP2P.IsHost && CoopWire.Finite(cur) && dmg > cur + ValveEps)
+                        // AUTHORITY BOUNDARY (REVIEW-valve P2): the valve OWNER (co-op host / PvP team captain) accepts
+                        // only REPAIRS (decreases) from a non-owner — a non-owner must NEVER author a break (increase);
+                        // that's the owner's RNG. The reconcile gate is enforced HERE, not just trusted in the sender, so
+                        // a stale/buggy/unexpected peer can't push a break into the owner (which would then re-broadcast
+                        // it as truth on the 2s heartbeat). On reject, immediately re-assert the owner's true value so the
+                        // offending sender converges now instead of waiting for the heartbeat. (The transport relay can't
+                        // value-inspect, so a relayed break still reaches teammates for ≤1 round-trip; this + the
+                        // heartbeat heal it.)
+                        if (OwnsValves() && CoopWire.Finite(cur) && dmg > cur + ValveEps)
                         {
                             SendValve(id, cur);
-                            Diagnostics.V($"[valve] REJECT client break id=0x{(uint)id:X8} dmg={dmg:0.000} > host {cur:0.000} (from {origin}) — re-asserting");
+                            Diagnostics.V($"[valve] REJECT non-owner break id=0x{(uint)id:X8} dmg={dmg:0.000} > owner {cur:0.000} (from {origin}) — re-asserting");
                             break;
                         }
                         bool changed = !CoopWire.Finite(cur) || Mathf.Abs(cur - dmg) > ValveEps;
