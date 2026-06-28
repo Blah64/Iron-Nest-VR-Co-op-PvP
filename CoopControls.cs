@@ -59,6 +59,7 @@ namespace IronNestVR
         private const byte MSG_AIM = 41;     // [t][desRot f32][turretElev f32][gunLElev f32][gunRElev f32]  reliable  EITHER→peer, symmetric firing-solution edge-replicate (40=entities ENTSET). The FDC graph resolves the aim with NO drag, so it never rides the drag-owned MSG_GROUP stream → the peer kept its stale default and missed.
         // 42-44 = PvP (PVP_POS/PVP_HIT/PVP_TEAM).
         private const byte MSG_TURRET_POS = 45;  // [t][gridX f32][gridY f32]  reliable  HOST→client, host-authoritative turret MAP ORIGIN (turretBase.anchoredPosition). Edge-on-change (throttled) + ~2s heal beat. NOT client-authored (never relayed): the host is the sole author and Send() already fans out to every client. Bug 1 (cross-player divergence): identical aim/range lands at a different MAP point when each machine's turret sits at a different origin.
+        private const byte MSG_RELOAD_STATE = 46;  // [t][side u8][stateIdx u8][loaded u8 (0/1)][powder i32]  reliable  EITHER→peer, symmetric per-gun reload state. The reload is animation-gated (click-replay can't drive a remote one — it stalls), so we replicate the AUTHORITATIVE state and the peer reaches it through the game's OWN paced AdvanceState() path (never pokes internals — eject corrupts). PLAN-reload §5. Co-op + same-team PvP LOAD direction.
 
         // How long remote ownership / streamed state survives without a refresh. The stream runs at
         // CoopSendHz (~30/s), so 2s easily rides minor packet loss but recovers fast if the peer vanishes
@@ -132,6 +133,67 @@ namespace IronNestVR
         private const float AimHeartbeatSec = 2f;
         private const float AimEps = 0.05f;   // deg threshold: ignore sub-tenth jitter so we don't spam the stream
         private static readonly int AimKey = Fnv("__coop_aim__");
+
+        // Per-gun RELOAD-state edge-replication (PLAN-reload §5; mirrors the powder/aim pattern). The reload is a
+        // 10-state animation-gated machine (HandManipulator.cs:724) — replaying the cockpit CLICKS to a remote gun
+        // stalls it (the clip sub-state never lines up). So we replicate the AUTHORITATIVE (stateIdx, loaded, powder),
+        // and the peer DRIVES its own gun to that target via the game's legit AdvanceState()/SetPowderCharge, paced by
+        // the controller's `working` flag (Step-0-validated), NEVER poking chamber/eject/SetState (those corrupt).
+        // Symmetric last-writer-wins + echo-suppress + heartbeat, exactly like powder. EMPTY/fired direction is owned
+        // by the MSG_FIRE replay in co-op (deferred in same-team PvP) — we never drive a gun empty here.
+        private static readonly int ReloadKeyL = Fnv("__coop_reload_L"), ReloadKeyR = Fnv("__coop_reload_R");
+        private static float _nextReloadBeat;
+        private const float ReloadHeartbeatSec = 2f;
+        // Target MODE is derived in ONE place (never inferred from `loaded` alone — it's overloaded: empty-rest at idx 0
+        // vs actively-reloading at idx>0): drive toward loaded UNLESS empty-rest (idx==0 && !loaded).
+        private struct ReloadSide
+        {
+            public int  PrevIdx;      // last sampled CurrentStateIndex (int.MinValue = unseeded, seed silently)
+            public bool PrevLoaded;   // last sampled ChamberedShellBlueprint != null
+            public bool Authored;     // we own re-asserting this gun's reload until we adopt the peer's
+            // paced driver (the §5.3 converger toward a LoadedRest/Reloading target)
+            public bool  Driving;
+            public int   TgtPowder;
+            public float Deadline;    // unscaledTime hard stop
+            public float LastActT;    // min spacing between actions
+            public int   Actions;     // action cap
+            public int   LastSeenIdx; // stall detector
+            public int   SameIdx;
+        }
+        private static ReloadSide _rsL = new ReloadSide { PrevIdx = int.MinValue, LastSeenIdx = int.MinValue };
+        private static ReloadSide _rsR = new ReloadSide { PrevIdx = int.MinValue, LastSeenIdx = int.MinValue };
+        private const float ReloadDriveSpacingSec = 0.2f;   // ≤5 legit actions/sec (let each clip play)
+        private const float ReloadDriveTimeoutSec = 30f;
+        private const int   ReloadDriveStallActions = 6;    // consecutive actions w/o index movement → stop+log
+        private const int   ReloadDriveActionCap = 80;
+        // Startup grace: the gun's spawn-time initialization (and any mission-start auto-load) runs IDENTICALLY and
+        // LOCALLY on both machines — replicating it would make the peer redundantly drive its own guns ("host started
+        // loading both cannons on spawn"). So for a few seconds after the turret resolves we SEED baselines silently
+        // (track current, never send) — only PLAYER-driven changes after the gun has settled get replicated. Deliberate
+        // join-time state will ride the §5.6 JIP reseed (Step 4), not this noisy spawn window.
+        private static float _reloadStartupUntil;
+        private const float ReloadStartupGraceSec = 6f;
+
+        // ===== Host-side RELOAD-CLICK PACING (2026-06-28) — the actual fix for the intermittent reload desync. =====
+        // The reload syncs by REPLAYING the operator's lever/button clicks; the peer LAGS (each step's animation + net
+        // latency), so a click the operator sent at reload state N arrives while the peer is still at N-1. Applying it
+        // immediately lands it at the WRONG state and breaks the sequence — observed: a 'Charge Rammer' click applied at
+        // SelectPowderCharge (instead of RamCharges) killed the dispense->auto-advance, sticking the peer mid-reload
+        // ("shell loaded but no powders came out"). FIX: queue ALL of a gun's reload-step clicks per side and drain them
+        // strictly IN ORDER, applying the next only when the gun is idle (controller `working`==False) + a small settle —
+        // so a step's animation and the auto-advance it triggers finish before the next click lands. Non-reload clicks
+        // still apply immediately. (The dispensers live on PowderChargeController, so they must be matched too — else
+        // they'd take the immediate lane and jump ahead of a still-queued earlier step, breaking order.)
+        // SINGLE queue: the reload controls are SHARED between L/R (the button names carry no side — 'Button Dispencer',
+        // 'Charge Rammer', 'Move Cylinder'), so only one cannon is loaded at a time. Ordering is global; the !working gate
+        // checks BOTH guns (the idle gun's flag is false anyway). Reload buttons are identified by NAME (the per-gun
+        // ref-match fails for these shared controls — they aren't ref-equal to either gun's controller members).
+        private struct PendingReloadClick { public int NetId; public float EnqueuedAt; }
+        private static readonly System.Collections.Generic.Queue<PendingReloadClick> _reloadClickQ = new System.Collections.Generic.Queue<PendingReloadClick>();
+        private static float _reloadClickLastApply;
+        private const float ReloadClickSettleSec   = 0.20f;   // min gap between applies — spans the !working->auto-advance race + paces same-state clicks
+        private const float ReloadClickTimeoutSec  = 25f;     // drop a click the peer can't reach a state for, so the queue can't wedge the rest
+        private const int   ReloadClickQueueCap    = 32;
 
         // Host-authoritative turret MAP ORIGIN broadcast (MSG_TURRET_POS). Edge-on-change with a throttle (a scripted
         // State_MoveTurret animates anchoredPosition continuously — we cap the send rate so an animated move ships a
@@ -260,6 +322,9 @@ namespace IronNestVR
                 DetectPowder(now);
                 DetectAim(now);
                 DetectTurretPos(now);
+                DetectReload(now);        // (dormant) reload state mirror — parked; reload syncs via paced click replay
+                DriveReloadTick(now);     // (dormant) AdvanceState driver — parked alongside the mirror
+                DrainReloadClicks(now);   // pace replayed reload clicks so each lands at the right state (the intermittent-desync fix)
 
                 // REVIEW-fix (P3): host broadcasts a low-rate CURRENT-state reconcile so the client can correct any
                 // accumulated CurrentAngle/elevation drift (framerate-dependent slew, a missed reliable packet).
@@ -425,6 +490,170 @@ namespace IronNestVR
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_AIM); w.Float(rot); w.Float(elev); w.Float(elevL); w.Float(elevR);
             CoopP2P.Send(_buf, w.Length, true);   // reliable: a discrete firing-solution change, must not be lost
+        }
+
+        // ===== Per-gun RELOAD-state replication (PLAN-reload §5) — mirrors powder/aim. Detect+send on the operating
+        // machine; the peer DRIVES its own gun to the target via the game's legit AdvanceState path (§5.3). =====
+
+        // DORMANT kill-switch (2026-06-28): the reload syncs via CLICK replication (re-enabled in ScanSwitches). The
+        // MSG_RELOAD_STATE mirror could not drive a non-operated gun (animation-gated) and is parked — kept (not deleted)
+        // because it may return as a self-healing RECONCILER (re-fire the missing step toward the peer's state target) once
+        // the intermittent dropped-click is understood. `readonly` (not const) so the dead body doesn't trip CS0162.
+        private static readonly bool ReloadStateMirrorEnabled = false;
+
+        private static void DetectReload(float now)
+        {
+            if (!Config.CoopControlSync || !ReloadStateMirrorEnabled) return;   // mirror parked → emit nothing (don't interfere with click sync)
+            DetectReloadGun(ref _rsL, _gunL, 0, ReloadKeyL, now);
+            DetectReloadGun(ref _rsR, _gunR, 1, ReloadKeyR, now);
+
+            // Self-heal heartbeat: re-assert the reload state WE authored (and aren't currently driving from a peer)
+            // so a value lost in a link-drop blackout re-converges (the peer adopts/drives idempotently).
+            if (now >= _nextReloadBeat)
+            {
+                _nextReloadBeat = now + ReloadHeartbeatSec;
+                if (_rsL.Authored && !_rsL.Driving && _gunL != null) { try { ReSendReload(0, _gunL); } catch { } }
+                if (_rsR.Authored && !_rsR.Driving && _gunR != null) { try { ReSendReload(1, _gunR); } catch { } }
+            }
+        }
+
+        // Edge-detect (idx OR loaded) and push. Skipped while we're DRIVING this gun from a peer's target (so our own
+        // driver's AdvanceState calls don't echo back as locally-authored changes). Powder alone is NOT a trigger
+        // (it rides MSG_POWDER) but is carried as a passenger so the peer converges chamber+powder together.
+        private static void DetectReloadGun(ref ReloadSide rs, GunController gun, byte side, int echoKey, float now)
+        {
+            if (gun == null || rs.Driving) return;
+            ArtilleryReloadController rc = null;
+            try { rc = gun.artilleryReloadController; } catch { }
+            if (rc == null) return;
+            int idx; bool loaded; int powder;
+            try { idx = rc.CurrentStateIndex; loaded = gun.ChamberedShellBlueprint != null; powder = gun.PowderCharges; }
+            catch { return; }
+            if (idx == rs.PrevIdx && loaded == rs.PrevLoaded) return;
+            bool suppressed = _echoUntil.TryGetValue(echoKey, out var u) && now < u;
+            // prev==MinValue: first sample after (re)connect — seed silently (join state rides MSG_SNAP / JIP reseed).
+            // now < _reloadStartupUntil: still in the spawn grace — track the baseline but DON'T replicate the
+            // identical-on-both spawn/initial-load sequence (else the peer redundantly drives its own guns).
+            if (rs.PrevIdx != int.MinValue && !suppressed && now >= _reloadStartupUntil)
+            {
+                SendReload(side, idx, loaded, powder);
+                rs.Authored = true;   // a local change → we own re-asserting this gun's reload until we adopt the peer's
+                Diagnostics.V($"[ctrl] reload gun {side} -> peer (idx={idx} loaded={loaded} powder={powder})");
+            }
+            rs.PrevIdx = idx; rs.PrevLoaded = loaded;
+        }
+
+        private static void ReSendReload(byte side, GunController gun)
+        {
+            ArtilleryReloadController rc = null; try { rc = gun.artilleryReloadController; } catch { }
+            if (rc == null) return;
+            int idx; bool loaded; int powder;
+            try { idx = rc.CurrentStateIndex; loaded = gun.ChamberedShellBlueprint != null; powder = gun.PowderCharges; } catch { return; }
+            SendReload(side, idx, loaded, powder);
+        }
+
+        private static void SendReload(byte side, int idx, bool loaded, int powder)
+        {
+            if (!EnsureBuf()) return;
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_RELOAD_STATE); w.Byte(side); w.Byte((byte)idx); w.Byte((byte)(loaded ? 1 : 0)); w.Int(powder);
+            CoopP2P.Send(_buf, w.Length, true);   // reliable: a discrete state change, must not be lost
+        }
+
+        // Apply a received reload target. EmptyRest (idx==0 && !loaded) → never drive (don't poke eject; co-op empties
+        // via MSG_FIRE). Else (LoadedRest / Reloading) → drive toward loaded via the paced AdvanceState driver.
+        private static void ApplyReloadTarget(ref ReloadSide rs, GunController gun, int echoKey, byte side, int idx, bool loaded, int powder, float now)
+        {
+            _echoUntil[echoKey] = now + 0.3f;
+            rs.Authored = false;   // adopting the peer's value yields authorship (they re-assert, not us)
+
+            if (!loaded && idx == 0)   // EmptyRest
+            {
+                rs.Driving = false; rs.PrevIdx = idx; rs.PrevLoaded = false;
+                Diagnostics.V($"[ctrl] applied remote reload gun {side} <- empty-rest");
+                return;
+            }
+
+            rs.TgtPowder = powder;
+            bool already = false; try { already = gun.ChamberedShellBlueprint != null && gun.CanFire; } catch { }
+            if (already)
+            {
+                // Already converged — set powder + adopt baseline, no drive (prevents 2s heartbeat churn).
+                try { if (gun.PowderCharges != powder) gun.SetPowderCharge(powder); } catch { }
+                rs.Driving = false; rs.PrevLoaded = true;
+                try { var rc = gun.artilleryReloadController; rs.PrevIdx = rc != null ? rc.CurrentStateIndex : idx; } catch { rs.PrevIdx = idx; }
+                Diagnostics.V($"[ctrl] remote reload gun {side}: already loaded, powder={powder} set");
+                return;
+            }
+
+            // APPLY PATH PARKED (2026-06-28 loopback run): the AdvanceState driver CANNOT load a gun nobody is operating.
+            // The chamber transfer is fired by the reload CLIP's animation event (AnimationEvent_TransferShellToChamber),
+            // which only runs while the gun is actively operated; programmatic AdvanceState() on the peer ripped through
+            // the state indices with working=False and gunChamber=False FOREVER (never loaded), and the 2s "loaded"
+            // heartbeat re-armed the drive each cycle → the host "stuck in a shell loading loop". So we DO NOT drive here.
+            // We log the target but leave the gun untouched (DetectReload keeps tracking its REAL state — PrevIdx/PrevLoaded
+            // unchanged, so we never re-broadcast). A working apply path (AutoReloadManager.StartAutoReload / direct chamber
+            // set — under probe test, CoopFireProbe Ctrl+Alt+5/6) will replace this. Until then the LOAD direction is inert
+            // (the peer gun looks unloaded); shots still arrive via the §5.5 MSG_FIRE fallback (Step 3).
+            rs.Driving = false; rs.Deadline = now + ReloadDriveTimeoutSec;   // (Deadline kept assigned: driver scaffold is dormant, not removed)
+            Diagnostics.V($"[ctrl] remote reload gun {side}: load target idx={idx} powder={powder} — apply path PARKED, not driving");
+        }
+
+        // The §5.3 paced driver — runs every frame while a side is Driving. Takes ONE legit action per spacing window
+        // when not `working`, until the gun is loaded+CanFire (or a guard trips). Never pokes chamber/eject/SetState.
+        private static void DriveReloadTick(float now)
+        {
+            if (!Config.CoopControlSync) return;
+            DriveReloadSide(ref _rsL, _gunL, 0, ReloadKeyL, now);
+            DriveReloadSide(ref _rsR, _gunR, 1, ReloadKeyR, now);
+        }
+
+        private static void DriveReloadSide(ref ReloadSide rs, GunController gun, byte side, int echoKey, float now)
+        {
+            if (!rs.Driving) return;
+            if (gun == null) { rs.Driving = false; return; }
+            ArtilleryReloadController rc = null; try { rc = gun.artilleryReloadController; } catch { }
+            if (rc == null) { rs.Driving = false; return; }
+
+            bool loaded = false; try { loaded = gun.ChamberedShellBlueprint != null; } catch { }
+            bool canFire = false; try { canFire = gun.CanFire; } catch { }
+            if (loaded && canFire)   // success: loaded & fireable (powder not required for CanFire; set it on the way out)
+            {
+                try { if (gun.PowderCharges != rs.TgtPowder) gun.SetPowderCharge(rs.TgtPowder); } catch { }
+                StopReloadDrive(ref rs, gun, rc, echoKey, now, "success");
+                return;
+            }
+            if (now > rs.Deadline) { StopReloadDrive(ref rs, gun, rc, echoKey, now, "timeout"); return; }
+
+            bool working = false; try { working = rc.working; } catch { }
+            if (working) return;                                       // a clip is playing — let it finish
+            if (now - rs.LastActT < ReloadDriveSpacingSec) return;     // min spacing between actions
+
+            int idx = -1; try { idx = rc.CurrentStateIndex; } catch { }
+            string key = null; try { var cs = rc.CurrentState; if (cs != null) key = cs.stateKey; } catch { }
+
+            if (idx == rs.LastSeenIdx) rs.SameIdx++; else { rs.SameIdx = 0; rs.LastSeenIdx = idx; }
+            if (rs.SameIdx > ReloadDriveStallActions) { Diagnostics.V($"[ctrl] reload drive gun {side} STALLED at idx={idx} key='{key}' — stop"); StopReloadDrive(ref rs, gun, rc, echoKey, now, "stall"); return; }
+            if (++rs.Actions > ReloadDriveActionCap) { Diagnostics.V($"[ctrl] reload drive gun {side} action cap — stop"); StopReloadDrive(ref rs, gun, rc, echoKey, now, "cap"); return; }
+
+            // ONE legit action: set powder at the charge state (so charges ram to target), else AdvanceState().
+            int powder = 0; try { powder = gun.PowderCharges; } catch { }
+            if (key == "SelectPowderCharge" && powder < rs.TgtPowder) { try { gun.SetPowderCharge(rs.TgtPowder); } catch { } }
+            else { try { rc.AdvanceState(); } catch (Exception e) { Diagnostics.V("[ctrl] reload drive AdvanceState: " + e.Message); } }
+            rs.LastActT = now;
+        }
+
+        // Stop the driver and adopt the gun's CURRENT (idx, loaded) as our baseline so DetectReload doesn't then
+        // re-broadcast the post-drive state as locally-authored; echo-suppress to be safe.
+        private static void StopReloadDrive(ref ReloadSide rs, GunController gun, ArtilleryReloadController rc, int echoKey, float now, string why)
+        {
+            rs.Driving = false;
+            int idx = 0; bool loaded = false;
+            try { idx = rc.CurrentStateIndex; } catch { }
+            try { loaded = gun.ChamberedShellBlueprint != null; } catch { }
+            rs.PrevIdx = idx; rs.PrevLoaded = loaded; rs.Authored = false;
+            _echoUntil[echoKey] = now + 0.3f;
+            Diagnostics.V($"[ctrl] reload drive done ({why}) idx={idx} loaded={loaded}");
         }
 
         // ---------------- turret map ORIGIN (host-authoritative) ----------------
@@ -930,9 +1159,17 @@ namespace IronNestVR
                     int id = r.Int();
                     if (_byId.TryGetValue(id, out var c) && c.Switch != null)
                     {
-                        ReplayClick(c.Switch);
-                        _echoUntil[id] = now + 0.3f;   // don't bounce our own replay back
-                        Diagnostics.V($"[ctrl] applied remote click '{c.T.name}' <- peer");
+                        string cnm = null; try { cnm = c.T != null ? c.T.name : null; } catch { }
+                        if (IsReloadButtonName(cnm) || IsReloadButton(c.Switch))
+                        {
+                            EnqueueReloadClick(id, now);   // paced + in-order so it lands at the right reload state, not mid-animation
+                        }
+                        else
+                        {
+                            ReplayClick(c.Switch);
+                            _echoUntil[id] = now + 0.3f;   // don't bounce our own replay back
+                            Diagnostics.V($"[ctrl] applied remote click '{c.T.name}' <- peer");
+                        }
                     }
                     break;
                 }
@@ -1004,6 +1241,26 @@ namespace IronNestVR
                     _aimPrevRot = rot; _aimPrevElev = elev; _aimPrevElevL = eL; _aimPrevElevR = eR;
                     _aimAuthored = false;   // adopting the peer's value yields authorship — they re-assert, not us
                     _echoUntil[AimKey] = now + 0.3f;
+                    break;
+                }
+
+                case MSG_RELOAD_STATE:
+                {
+                    // Strict validation (PLAN-reload §5.3): t + side u8 + idx u8 + loaded u8 + powder i32 = 8 bytes.
+                    if (len < 8) return;
+                    byte side = r.Byte();
+                    int idx = r.Byte();
+                    int lb = r.Byte();
+                    int powder = r.Int();
+                    if (r.Bad || side > 1 || (lb != 0 && lb != 1)) { Diagnostics.V($"[ctrl] reload pkt rejected side={side} lb={lb}"); return; }
+                    var gun = side == 0 ? _gunL : _gunR;
+                    ArtilleryReloadController rc = null; try { if (gun != null) rc = gun.artilleryReloadController; } catch { }
+                    if (gun == null || rc == null) break;   // no gun resolved yet — drop (JIP reseed re-delivers)
+                    int stateCount = 0; try { var st = rc.reloadStates; stateCount = st != null ? st.Count : 0; } catch { }
+                    if (idx < 0 || idx >= stateCount) { Diagnostics.V($"[ctrl] reload pkt bad idx={idx}/{stateCount}"); return; }
+                    if (powder < 0) powder = 0; else if (powder > 99) powder = 99;   // clamp defensively
+                    if (side == 0) ApplyReloadTarget(ref _rsL, gun, ReloadKeyL, 0, idx, lb != 0, powder, now);
+                    else           ApplyReloadTarget(ref _rsR, gun, ReloadKeyR, 1, idx, lb != 0, powder, now);
                     break;
                 }
                 case MSG_SNAP:
@@ -1097,6 +1354,53 @@ namespace IronNestVR
 #if !PUBLIC_BUILD
             finally { CoopFireProbe.InClickReplay = false; }
 #endif
+        }
+
+        // ---------------- reload-click pacing ----------------
+
+        // Queue a replayed RELOAD click (single shared queue). Order is preserved; drained by DrainReloadClicks only when
+        // no gun is mid reload-animation.
+        private static void EnqueueReloadClick(int netId, float now)
+        {
+            if (_reloadClickQ.Count >= ReloadClickQueueCap) { var d = _reloadClickQ.Dequeue(); Diagnostics.V($"[ctrl] reload click queue full — dropped oldest netId={d.NetId}"); }
+            _reloadClickQ.Enqueue(new PendingReloadClick { NetId = netId, EnqueuedAt = now });
+            Diagnostics.V($"[ctrl] reload click QUEUED (depth={_reloadClickQ.Count})");
+        }
+
+        // True while EITHER gun is mid reload-animation (a clip playing). Applying a click now would land mid-step. The
+        // idle gun's flag is false, so this naturally tracks the cannon currently being loaded (shared controls).
+        private static bool AnyReloadWorking()
+        {
+            try { if (_gunL != null) { var rc = _gunL.artilleryReloadController; if (rc != null && rc.working) return true; } } catch { }
+            try { if (_gunR != null) { var rc = _gunR.artilleryReloadController; if (rc != null && rc.working) return true; } } catch { }
+            return false;
+        }
+
+        // Drain one queued reload click when no gun is animating + a settle gap has elapsed, so a step's animation and the
+        // auto-advance it triggers complete before the next click lands. Drops a click that can't apply within the timeout
+        // (peer diverged) so the queue can't wedge. Called every frame from Tick.
+        private static void DrainReloadClicks(float now)
+        {
+            if (_reloadClickQ.Count == 0) return;
+            var head = _reloadClickQ.Peek();
+
+            // Timeout: drop a click the peer can't reach a state for, so the queue (and the rest of the reload) can't wedge.
+            if (now - head.EnqueuedAt > ReloadClickTimeoutSec)
+            {
+                _reloadClickQ.Dequeue();
+                Diagnostics.V($"[ctrl] reload click TIMED OUT (netId={head.NetId}) — dropped, depth now {_reloadClickQ.Count}");
+                return;
+            }
+
+            if (now - _reloadClickLastApply < ReloadClickSettleSec) return;   // settle gap between applies
+            if (AnyReloadWorking()) return;                                   // hold while a clip is playing — applying now lands mid-step
+
+            if (!_byId.TryGetValue(head.NetId, out var c) || c.Switch == null) { _reloadClickQ.Dequeue(); return; }   // button vanished → drop
+            _reloadClickQ.Dequeue();
+            ReplayClick(c.Switch);
+            _echoUntil[head.NetId] = now + 0.3f;
+            _reloadClickLastApply = now;
+            Diagnostics.V($"[ctrl] applied remote RELOAD click '{c.T.name}' <- peer (paced; depth now {_reloadClickQ.Count})");
         }
 
         // ---------------- diagnostics ----------------
@@ -1305,6 +1609,13 @@ namespace IronNestVR
             {
                 _byId.Clear();
                 for (int i = 0; i < _grp.Length; i++) { _grp[i].RemoteOwned = false; _grp[i].RemoteOwner = 0; _grp[i].Has = false; }
+                // Re-seed reload baselines from scratch and open a startup grace so the spawn/initial-load sequence
+                // isn't replicated (it runs identically on both machines — see _reloadStartupUntil).
+                _rsL = new ReloadSide { PrevIdx = int.MinValue, LastSeenIdx = int.MinValue };
+                _rsR = new ReloadSide { PrevIdx = int.MinValue, LastSeenIdx = int.MinValue };
+                _nextReloadBeat = 0f;
+                _reloadStartupUntil = Time.unscaledTime + ReloadStartupGraceSec;
+                _reloadClickQ.Clear(); _reloadClickLastApply = 0f;
             }
             _turret = turret; _turretIid = iid;
             ResolveGuns(turret);
@@ -1387,6 +1698,10 @@ namespace IronNestVR
                 try { sw = arr[i].TryCast<LookAtTarget>(); } catch { }
                 if (sw == null) continue;
                 if (IsFireButton(sw)) continue;                                   // REVIEW-host P1: fire button fires via MSG_FIRE, never the click lane
+                // (2026-06-28) Reload buttons are BACK on the click lane. The reload syncs by REPLAYING the lever/button
+                // clicks (the mechanism that worked MOST of the time); the MSG_RELOAD_STATE driver that this exclusion was
+                // protecting can't drive a non-operated gun (animation-gated) and is retired. The real bug is an
+                // INTERMITTENT dropped step in click replication — diagnosed/fixed at the click level, not by excluding it.
                 Transform tr = sw.transform;
                 if (tr == null || HasInParent<PickUpZoomTarget>(tr)) continue;     // manual read-zoom — skip
                 string path = PathOf(tr);
@@ -1457,6 +1772,77 @@ namespace IronNestVR
             return false;
         }
 
+        // True if this LookAtTarget is one of a gun's RELOAD-step buttons: a per-state advanceButton, a cylinder
+        // load/move button, or a powder dispenser / load-charges button (PowderChargeController). Used to route a
+        // replayed click into the per-side PACED QUEUE (DrainReloadClicks) instead of applying it immediately — the
+        // peer lags, so an immediate apply lands the click at the wrong reload state and breaks the sequence (the
+        // intermittent reload desync). These clicks DO still replicate (unlike the abandoned exclusion); they're just
+        // paced. Local clicks drive the LOCAL reload via the game's own handlers regardless.
+        private static bool IsReloadButton(LookAtTarget sw)
+        {
+            if (sw == null) return false;
+            try
+            {
+                if (GunReloadButtonMatch(_gunL, sw)) return true;
+                if (GunReloadButtonMatch(_gunR, sw)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool GunReloadButtonMatch(GunController gun, LookAtTarget sw)
+        {
+            if (gun == null) return false;
+            ArtilleryReloadController rc = null;
+            try { rc = gun.artilleryReloadController; } catch { }
+            if (rc == null) return false;
+            // per-state advance buttons
+            try
+            {
+                var states = rc.reloadStates;
+                if (states != null)
+                {
+                    int n = states.Count;
+                    for (int i = 0; i < n; i++)
+                    {
+                        var def = states[i];
+                        if (def == null) continue;
+                        LookAtTarget ab = null; try { ab = def.advanceButton; } catch { }
+                        if (ab != null && (object)ab == (object)sw) return true;
+                    }
+                }
+            }
+            catch { }
+            // cylinder load/move buttons (interop-confirmed separate LookAtTargets — not the same objects as advanceButton)
+            try
+            {
+                var css = rc.cylinderShellSelector;
+                if (css != null)
+                {
+                    LookAtTarget lb = null, mb = null;
+                    try { lb = css.loadButton; } catch { }
+                    try { mb = css.moveButton; } catch { }
+                    if (lb != null && (object)lb == (object)sw) return true;
+                    if (mb != null && (object)mb == (object)sw) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        // Reload-step buttons are SHARED L/R controls with distinctive, stable names; the per-gun ref-match
+        // (GunReloadButtonMatch) doesn't catch them, so identify them by name. These are the click-driven reload steps
+        // that must be PACED (the auto breech/guide advances need no click and aren't named here). 'Universal Button Arm
+        // Right/Left' (the arming lever) is deliberately NOT included — it's not a reload step.
+        private static bool IsReloadButtonName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string n = name.ToLowerInvariant();
+            return n.Contains("dispencer") || n.Contains("dispenser")
+                || n.Contains("charge rammer") || n.Contains("shell rammer")
+                || n.Contains("move cylinder");
+        }
+
         // ---------------- ownership bookkeeping ----------------
 
         private static void MarkGroupRemote(Group g, ulong origin, float now)
@@ -1494,6 +1880,10 @@ namespace IronNestVR
             _powderAuthoredL = false; _powderAuthoredR = false; _nextPowderBeat = 0f;
             _aimPrevRot = float.NaN; _aimPrevElev = float.NaN; _aimPrevElevL = float.NaN; _aimPrevElevR = float.NaN;
             _aimAuthored = false; _nextAimBeat = 0f;
+            _rsL = new ReloadSide { PrevIdx = int.MinValue, LastSeenIdx = int.MinValue };
+            _rsR = new ReloadSide { PrevIdx = int.MinValue, LastSeenIdx = int.MinValue };
+            _nextReloadBeat = 0f;
+            _reloadClickQ.Clear(); _reloadClickLastApply = 0f;
             _turretPosPrev = new Vector2(float.NaN, float.NaN); _nextTurretPosSend = 0f; _nextTurretPosBeat = 0f;   // re-seed origin broadcast on next connect
             RestoreGunDrive();   // hand gun-elevation control back to the local turret controller on link-down
         }
