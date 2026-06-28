@@ -429,6 +429,12 @@ namespace IronNestVR
         // normal co-op/flatscreen session is untouched. See PvpProbe.cs and PLAN-pvp.md §5.
         public static bool PvpProbe = false;
 
+        // FIRE-STATE PROBE (CoopFireProbe). DEV-ONLY, read/log-only: hooks GunController.RequestFire/FireShell +
+        // ShellVisual.Initialize to answer the PLAN-host §6.0 questions (RequestFire<->FireShell 1:1 ordering per gun,
+        // synchronous no-op detection, reload spacing, call source) before the Phase-2 intent queue is finalized. OFF
+        // by default; set "FireProbe=true" in IronNestVR.cfg to arm it. Inert (and compiled out in the public build).
+        public static bool FireProbe = false;
+
         // PvP MODE master switch (PLAN-pvp.md §1a, Appendix B). DERIVED at runtime, never a cfg toggle: the host's
         // lobby is tagged invr_mode=coop|pvp (SteamNet), and every member reads it on lobby-enter → PvpActive. While
         // true, the conflicting co-op replication (control/fire/impact sync, client spawn-gate, entity mirror) is
@@ -1027,6 +1033,7 @@ namespace IronNestVR
                 case "LowSpecQualityLevel": LowSpecQualityLevel = PI(v, LowSpecQualityLevel); break;
                 case "CrashHeartbeat": CrashHeartbeat = PB(v, CrashHeartbeat); break;
                 case "PvpProbe": PvpProbe = PB(v, PvpProbe); break;
+                case "FireProbe": FireProbe = PB(v, FireProbe); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;
                 case "SnapTurnAngle": SnapTurnAngle = PF(v, SnapTurnAngle); break;

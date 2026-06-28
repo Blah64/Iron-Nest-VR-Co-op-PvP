@@ -55,6 +55,9 @@ namespace IronNestVR
             CoopSim.ApplyPatches();
             CoopMap.Init();   // Harmony hooks for fire-mission map pieces (MapPiece3D drag) + bearing/range lines (MapMarkerLineUI finalize)
             PvpProbe.ApplyPatches();   // PvP plan Phase 0: impact-logger patch (inert unless Config.PvpProbe; cfg-only)
+#if !PUBLIC_BUILD
+            CoopFireProbe.ApplyPatches();   // PLAN-host §6.0 fire-state probe (inert unless Config.FireProbe; dev build only)
+#endif
 
             // Make our MonoBehaviour type callable from the IL2CPP runtime.
             ClassInjector.RegisterTypeInIl2Cpp<VrManager>();

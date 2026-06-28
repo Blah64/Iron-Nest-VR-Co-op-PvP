@@ -57,6 +57,8 @@ namespace IronNestVR
         private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
         private const byte MSG_POWDER = 39;  // [t][side u8][charges i32]    reliable   per-gun powder/charge state, EITHER→peer (symmetric, last-writer-wins)
         private const byte MSG_AIM = 41;     // [t][desRot f32][turretElev f32][gunLElev f32][gunRElev f32]  reliable  EITHER→peer, symmetric firing-solution edge-replicate (40=entities ENTSET). The FDC graph resolves the aim with NO drag, so it never rides the drag-owned MSG_GROUP stream → the peer kept its stale default and missed.
+        // 42-44 = PvP (PVP_POS/PVP_HIT/PVP_TEAM).
+        private const byte MSG_TURRET_POS = 45;  // [t][gridX f32][gridY f32]  reliable  HOST→client, host-authoritative turret MAP ORIGIN (turretBase.anchoredPosition). Edge-on-change (throttled) + ~2s heal beat. NOT client-authored (never relayed): the host is the sole author and Send() already fans out to every client. Bug 1 (cross-player divergence): identical aim/range lands at a different MAP point when each machine's turret sits at a different origin.
 
         // How long remote ownership / streamed state survives without a refresh. The stream runs at
         // CoopSendHz (~30/s), so 2s easily rides minor packet loss but recovers fast if the peer vanishes
@@ -130,6 +132,17 @@ namespace IronNestVR
         private const float AimHeartbeatSec = 2f;
         private const float AimEps = 0.05f;   // deg threshold: ignore sub-tenth jitter so we don't spam the stream
         private static readonly int AimKey = Fnv("__coop_aim__");
+
+        // Host-authoritative turret MAP ORIGIN broadcast (MSG_TURRET_POS). Edge-on-change with a throttle (a scripted
+        // State_MoveTurret animates anchoredPosition continuously — we cap the send rate so an animated move ships a
+        // handful of reliable packets, not one per frame; the change-detect's last send is the settled value) + a slow
+        // heal beat (re-assert so a dropped packet / late joiner converges; the client applies idempotently).
+        private static Vector2 _turretPosPrev = new Vector2(float.NaN, float.NaN);   // last grid we SENT (host)
+        private static float _nextTurretPosSend;   // host: throttle floor between change-driven sends
+        private static float _nextTurretPosBeat;   // host: next unconditional heal beat
+        private const float TurretPosEps = 0.05f;          // grid units: ignore float jitter
+        private const float TurretPosMinSendSec = 0.2f;    // ≤5 change-sends/sec during an animated move
+        private const float TurretPosHeartbeatSec = 2f;
 
         // Join-in-progress snapshot received before the turret/guns resolved locally (scene still loading on the
         // joiner). Held here and applied once the registry is ready — see Tick / ApplySnapshot.
@@ -246,6 +259,7 @@ namespace IronNestVR
 
                 DetectPowder(now);
                 DetectAim(now);
+                DetectTurretPos(now);
 
                 // REVIEW-fix (P3): host broadcasts a low-rate CURRENT-state reconcile so the client can correct any
                 // accumulated CurrentAngle/elevation drift (framerate-dependent slew, a missed reliable packet).
@@ -399,6 +413,51 @@ namespace IronNestVR
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_AIM); w.Float(rot); w.Float(elev); w.Float(elevL); w.Float(elevR);
             CoopP2P.Send(_buf, w.Length, true);   // reliable: a discrete firing-solution change, must not be lost
+        }
+
+        // ---------------- turret map ORIGIN (host-authoritative) ----------------
+
+        // HOST only. Broadcast the turret's map grid (turretBase.anchoredPosition) so every client snaps its shared
+        // turret to the host's origin → identical aim/range lands at the same map point (Bug 1). _turret != null only
+        // ever holds during an active mission, so no separate phase check is needed. Edge-detect (throttled) + heal beat.
+        private static void DetectTurretPos(float now)
+        {
+            if (Config.PvpActive || !Config.CoopControlSync || !CoopP2P.IsHost || _turret == null) return;
+
+            Vector2 grid;
+            try { var bas = _turret.turretBase; if (bas == null) return; grid = bas.anchoredPosition; }
+            catch { return; }
+            if (!CoopWire.Finite(grid.x) || !CoopWire.Finite(grid.y)) return;
+
+            bool seeded = !float.IsNaN(_turretPosPrev.x);
+            bool changed = !seeded || Mathf.Abs(grid.x - _turretPosPrev.x) > TurretPosEps
+                                   || Mathf.Abs(grid.y - _turretPosPrev.y) > TurretPosEps;
+            bool sent = false;
+            if (changed && now >= _nextTurretPosSend)
+            {
+                SendTurretPos(grid);
+                _turretPosPrev = grid;
+                _nextTurretPosSend = now + TurretPosMinSendSec;
+                _nextTurretPosBeat = now + TurretPosHeartbeatSec;   // a fresh send already heals — defer the next beat
+                sent = true;
+                Diagnostics.V($"[ctrl] turret origin -> peer grid=({grid.x:0.00},{grid.y:0.00})");
+            }
+
+            // Heal beat: re-assert the current origin at a low rate (idempotent on the client) so a lost packet or a
+            // late joiner converges without waiting for the next move. Skipped on a tick we already sent.
+            if (!sent && seeded && now >= _nextTurretPosBeat)
+            {
+                _nextTurretPosBeat = now + TurretPosHeartbeatSec;
+                try { SendTurretPos(grid); _turretPosPrev = grid; } catch { }
+            }
+        }
+
+        private static void SendTurretPos(Vector2 grid)
+        {
+            if (!EnsureBuf()) return;
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_TURRET_POS); w.Float(grid.x); w.Float(grid.y);
+            CoopP2P.Send(_buf, w.Length, true);   // reliable: a discrete origin change, must not be lost
         }
 
         // ---------------- after the game's Update: apply remote visuals + snap turret state ----------------
@@ -950,6 +1009,35 @@ namespace IronNestVR
                     ApplyRecon(v);
                     break;
                 }
+                case MSG_TURRET_POS:
+                {
+                    // Client-only: snap the shared turret to the HOST's authoritative map origin (Bug 1). The host
+                    // ignores its own broadcast; PvP keeps per-player origins so a PvP machine never reaches here.
+                    if (Config.PvpActive || CoopP2P.IsHost || _turret == null) break;
+                    if (len < 1 + 2 * 4) return;
+                    float gx = r.Float(), gy = r.Float();
+                    if (r.Bad || !CoopWire.Finite(gx) || !CoopWire.Finite(gy)) break;
+                    try
+                    {
+                        // Diff-guard: if we're already at the host's grid, do nothing — avoids re-snapping (and any
+                        // fight with an in-progress local move) on every heal beat.
+                        var bas = _turret.turretBase;
+                        if (bas != null)
+                        {
+                            var cur = bas.anchoredPosition;
+                            if (Mathf.Abs(cur.x - gx) <= TurretPosEps && Mathf.Abs(cur.y - gy) <= TurretPosEps) break;
+                        }
+                        // Grid → world through the SAME frame the map markers use (CoopMapFrame), then the exact call
+                        // PvpPlayers.PlaceMyTurret proved snaps anchoredPosition to the grid (X/Z preserved, Y resolved).
+                        var fmr = CoopMapFrame.Resolve();
+                        if (fmr == null) { Diagnostics.V("[ctrl] turret origin apply skipped — no map frame yet"); break; }
+                        Vector3 world = fmr.TransformPoint(new Vector3(gx, gy, 0f));
+                        _turret.SetTurretLocation(world);
+                        Diagnostics.V($"[ctrl] applied turret origin <- peer grid=({gx:0.00},{gy:0.00})");
+                    }
+                    catch (Exception e) { Log.LogWarning("[ctrl] apply turret origin: " + e.Message); }
+                    break;
+                }
                 default:
                     // Other co-op subsystems share the same P2P channel; forward by type.
                     if (type == CoopClipboard.MSG_SECTION || type == CoopClipboard.MSG_TOOL) CoopClipboard.OnPacket(type, a, len);
@@ -976,6 +1064,9 @@ namespace IronNestVR
         // so the game's own handler runs — switch animation + the gameplay effect (reload, powder, toggle).
         private static void ReplayClick(LookAtTarget sw)
         {
+#if !PUBLIC_BUILD
+            CoopFireProbe.InClickReplay = true;   // Q4 (PLAN-host §6.0): tag any RequestFire reached via a replayed fire-button click
+#endif
             try
             {
                 var it = sw.interactable;
@@ -988,6 +1079,9 @@ namespace IronNestVR
                 else { sw.OnClickDown(); sw.OnClickUp(); }
             }
             catch (Exception e) { Log.LogWarning("[ctrl] replay click: " + e.Message); }
+#if !PUBLIC_BUILD
+            finally { CoopFireProbe.InClickReplay = false; }
+#endif
         }
 
         // ---------------- diagnostics ----------------
@@ -1362,6 +1456,7 @@ namespace IronNestVR
             _powderAuthoredL = false; _powderAuthoredR = false; _nextPowderBeat = 0f;
             _aimPrevRot = float.NaN; _aimPrevElev = float.NaN; _aimPrevElevL = float.NaN; _aimPrevElevR = float.NaN;
             _aimAuthored = false; _nextAimBeat = 0f;
+            _turretPosPrev = new Vector2(float.NaN, float.NaN); _nextTurretPosSend = 0f; _nextTurretPosBeat = 0f;   // re-seed origin broadcast on next connect
             RestoreGunDrive();   // hand gun-elevation control back to the local turret controller on link-down
         }
 
