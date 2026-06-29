@@ -28,11 +28,13 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        public const byte MSG_PVP_POS = 42;   // [t][gridX f][gridY f][role i32][health i32]  — author's map position + HP; either player authors it
+        public const byte MSG_PVP_POS = 42;   // [t][gridX f][gridY f][role i32][health f32]  — author's map position + HP; either player authors it
         public const byte MSG_PVP_SPAWN = 50; // [t][t0x f][t0y f][t1x f][t1y f]  reliable  HOST->all (global) — the two randomized team spawn grids
-        public const int MaxHealth = 100;
+        // A nest dies in 4 HEALTH POINTS. Per-shell damage (PvpCombat.DamageForShell): AP 2, HE 1, HCHE 0.5, STAR 0
+        // (STAR is recon only — it reveals enemies, see OnStarShell). So a nest takes 2 AP, 4 HE, or 8 HCHE to kill.
+        public const float MaxHealth = 4f;
 
-        private static int _teamHealth = MaxHealth;   // MY TEAM's shared health. The team CAPTAIN owns it authoritatively
+        private static float _teamHealth = MaxHealth;   // MY TEAM's shared health. The team CAPTAIN owns it authoritatively
                                                        // and broadcasts it on POS; teammates adopt it from the captain's
                                                        // keyframe. Victim-authoritative, one pool per team (vehicle).
         private static bool _eliminated;              // my team is at 0 hp
@@ -46,7 +48,7 @@ namespace IronNestVR
         // Grid = the enemy's LIVE position (rides in on every POS keyframe) — hit adjudication (CollectHits) uses this so
         // you must shell where they ACTUALLY are. RevealedGrid = the position FROZEN at the moment a recon spotted them —
         // the on-map icon is drawn here and only re-snapshots when re-scouted (last-known-position intel, not a live track).
-        private sealed class Mirror { public ulong Origin; public string ID; public GameObject Go; public EntityLocation Loc; public MapEntity Entity; public Vector2 Grid; public Vector2 RevealedGrid; public bool HasRevealedPos; public int Health; public CanvasGroup Vis; public float RevealUntil; }
+        private sealed class Mirror { public ulong Origin; public string ID; public GameObject Go; public EntityLocation Loc; public MapEntity Entity; public Vector2 Grid; public Vector2 RevealedGrid; public bool HasRevealedPos; public float Health; public CanvasGroup Vis; public float RevealUntil; }
 
         private const float ReconRevealSec = 30f;   // how long a recon photo keeps a spotted enemy visible before it re-fogs
                                                       // (generous — the player redeems at the console then walks to the map)
@@ -83,6 +85,19 @@ namespace IronNestVR
         private static int _sent, _spawned, _moved;
         private static bool _turretPlaced;   // pinned my turret to MyGrid this match?
         private static float _placeTurretAt;  // when to attempt placement (settle delay after entering the arena)
+
+        // Teleprinter battery-position report ("tell each team their turret position on spawn + after a move card").
+        // Local print only — in PvP, CoopOrders' replicate (OnSubmitLines) and blank (SuppressLocalPrint) both bail on
+        // PvpActive, so each crew member's own printer states their own (shared-team) battery grid. Unified by settle-
+        // detection: the turret lands on its spawn at deploy and traverses on a requisition move card; each time it
+        // goes stationary at a NEW grid we print (DEPLOYED the first time, RELOCATED after).
+        private static Vector2 _lastTurretGrid = new Vector2(-9999f, -9999f);   // last sampled live grid (move detector)
+        private static Vector2 _announcedGrid = new Vector2(-9999f, -9999f);    // last grid we printed to the teleprinter
+        private static float _turretStableSince;     // when the turret last went stationary
+        private static int _posAnnounceCount;        // 0 => next print is DEPLOYED, else RELOCATED
+        private const float TurretMoveEps = 0.05f;       // grid delta (km) above which the turret counts as moving
+        private const float TurretSettleSec = 1.0f;      // must be stationary this long after a move before we print
+        private const float AnnounceMinDeltaGrid = 0.2f; // ignore a "move" smaller than this (no spurious re-print)
 
         // SCOUT-PHOTO FOOTPRINT (production, both flavors). A scout plane's photo "develops" LATE — a few seconds after the
         // flyover the game registers a reveal REGION (MapReconClearer.Register(handle)); that handle's fog-tile children ARE
@@ -131,6 +146,7 @@ namespace IronNestVR
                 if (_mirrors.Count > 0) { ClearMirrors(); Log.LogInfo("[pvp] left PvP mission — cleared player mirrors"); }
                 _teamHealth = MaxHealth; _eliminated = false; _result = Result.None;
                 _turretPlaced = false; _placeTurretAt = 0f;   // re-pin the turret next match
+                _lastTurretGrid = _announcedGrid = new Vector2(-9999f, -9999f); _turretStableSince = 0f; _posAnnounceCount = 0;   // re-announce battery grid next match
                 _spawnsAssigned = false; _spawnGenAt = 0f; _nextSpawnBeat = 0f;   // re-randomize spawns next match
                 _team0Spawn = Team0SpawnDefault; _team1Spawn = Team1SpawnDefault;
                 _scoutWindowUntil = 0f; _scoutFallbackArmed = false; _scoutHandled = false; _pendingRegions.Clear();
@@ -164,6 +180,9 @@ namespace IronNestVR
                     else if (now >= _placeTurretAt && PlaceMyTurret()) _turretPlaced = true;
                 }
 
+                // Report MY battery's grid on the teleprinter — once on deploy, and again after a move card relocates it.
+                TickTurretPositionReport(now);
+
                 // Only the TEAM CAPTAIN broadcasts the team's keyframe → opponents see ONE mirror per enemy team
                 // (the vehicle), not one per player. Fall back to broadcasting if the roster isn't resolved yet so a
                 // 1v1 still works before the first roster packet lands.
@@ -192,7 +211,7 @@ namespace IronNestVR
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_PVP_POS);
             w.Float(g.x); w.Float(g.y); w.Int((int)EntityRoles.Enemy);
-            w.Int(_teamHealth);
+            w.Float(_teamHealth);
             if (w.Overflow) { Log.LogWarning("[pvp] pos packet overflow"); return; }
             CoopP2P.Send(_buf, w.Length, true);
             _sent++;
@@ -303,7 +322,7 @@ namespace IronNestVR
             var r = new CoopWire.Reader(a, len, 1);
             float x = r.Float(), y = r.Float();
             int role = r.Int();
-            int health = r.Int();
+            float health = r.Float();
             if (r.Bad) return;
 
             // A TEAMMATE's keyframe is my CAPTAIN announcing the shared team health (allies are co-op avatars, never a
@@ -323,7 +342,7 @@ namespace IronNestVR
             UpsertRemote(origin, new Vector2(x, y), role, health);
         }
 
-        private static void UpsertRemote(ulong origin, Vector2 grid, int role, int health)
+        private static void UpsertRemote(ulong origin, Vector2 grid, int role, float health)
         {
             if (_mirrors.TryGetValue(origin, out var m)) { MoveMirror(m, grid); ApplyMirrorHealth(m, health); return; }
             SpawnMirror(origin, grid, role, health);
@@ -331,7 +350,7 @@ namespace IronNestVR
 
         // ---------------- spawn / move (the Phase 0 locked recipe) ----------------
 
-        private static void SpawnMirror(ulong origin, Vector2 grid, int role, int health)
+        private static void SpawnMirror(ulong origin, Vector2 grid, int role, float health)
         {
             var tmpl = FindCloneSource();
             if (tmpl == null) { Log.LogWarning("[pvp] no EntityLocation to clone — can't spawn player mirror yet"); return; }
@@ -360,7 +379,7 @@ namespace IronNestVR
                 e.Role = EntityRoles.Enemy;
                 e.Position = new Vector3(grid.x, grid.y, 0f);
                 e.State = StateForHealth(health);
-                e.Health = health; e.MaxHealth = MaxHealth; e.Armour = 0; e.Stars = 0; e.Scale = 1;
+                e.Health = HpInt(health); e.MaxHealth = HpInt(MaxHealth); e.Armour = 0; e.Stars = 0; e.Scale = 1;
             }
             catch (Exception ex) { Log.LogWarning("[pvp] build MapEntity: " + ex.Message); try { UnityEngine.Object.Destroy(go); } catch { } return; }
 
@@ -373,7 +392,7 @@ namespace IronNestVR
             _mirrors[origin] = new Mirror { Origin = origin, ID = id, Go = go, Loc = loc, Entity = e, Grid = grid, RevealedGrid = grid, HasRevealedPos = false, Health = health, Vis = vis };
             _spawned++;
             // (render-state dump retired — marker rendering is confirmed; RevealMirrors keeps it through fog)
-            Log.LogInfo($"[pvp] spawned player mirror '{id}' at grid ({grid.x:0.0},{grid.y:0.0}) hp={health} <- peer {origin}");
+            Log.LogInfo($"[pvp] spawned player mirror '{id}' at grid ({grid.x:0.0},{grid.y:0.0}) hp={health:0.#} <- peer {origin}");
         }
 
         private static void MoveMirror(Mirror m, Vector2 grid)
@@ -398,13 +417,13 @@ namespace IronNestVR
         }
 
         // Reflect the victim's authoritative health (rode in on their POS keyframe) onto their mirror on THIS map.
-        private static void ApplyMirrorHealth(Mirror m, int health)
+        private static void ApplyMirrorHealth(Mirror m, float health)
         {
             if (m == null) return;
             health = Clamp(health);
             if (m.Health == health) return;
             m.Health = health;
-            try { if (m.Entity != null) { m.Entity.Health = health; m.Entity.State = StateForHealth(health); } } catch { }
+            try { if (m.Entity != null) { m.Entity.Health = HpInt(health); m.Entity.State = StateForHealth(health); } } catch { }
             try { if (m.Loc != null) m.Loc.RecalculateAndRegister(false); } catch { }
         }
 
@@ -686,6 +705,23 @@ namespace IronNestVR
             return n;
         }
 
+        // STAR (illumination) shell burst — reveal enemy mirrors within StarRevealRadius of the impact (user spec:
+        // "STAR shells reveal enemies within 1 radius"). STAR deals NO damage; revealing is its whole purpose. Local
+        // to the firing machine, like the recon-card reveal, reusing the recon reveal duration + icon snapshot path.
+        // Called from PvpCombat on every STAR impact (both build flavors — this is shipping behaviour, not a dev tool).
+        public const float StarRevealRadius = 1f;   // grid units (== km): a star shell lights up enemies within 1 km
+        public static int OnStarShell(Vector2 impact)
+        {
+            try
+            {
+                if (!Active() || _mirrors.Count == 0) return 0;
+                int n = RevealMirrorsNear(impact, StarRevealRadius);
+                Diagnostics.V($"[pvp] STAR shell @ ({impact.x:0.0},{impact.y:0.0}) r={StarRevealRadius:0.0} -> spotted {n} enemy unit(s) for {ReconRevealSec:0}s");
+                return n;
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] star reveal: " + e.Message); return 0; }
+        }
+
 #if !PUBLIC_BUILD
         // ---------------- recon footprint telemetry (dev only) ----------------
 
@@ -842,26 +878,26 @@ namespace IronNestVR
         // Called by PvpCombat when a peer reports their shell hit MY team. The hit is addressed to the team CAPTAIN (the
         // only member with a mirror), so this runs on the captain, who owns the shared team health: decrement it and
         // push an immediate keyframe so the attacker's mirror AND my teammates update without waiting for the next tick.
-        public static void ApplyTeamDamage(int dmg, ulong from)
+        public static void ApplyTeamDamage(float dmg, ulong from)
         {
-            if (dmg <= 0 || _eliminated) return;
-            int before = _teamHealth;
+            if (dmg <= 0f || _eliminated) return;
+            float before = _teamHealth;
             _teamHealth = Clamp(_teamHealth - dmg);
-            Diagnostics.V($"[pvp] team took {dmg} damage from peer {from} ({before} -> {_teamHealth})");
+            Diagnostics.V($"[pvp] team took {dmg:0.#} damage from peer {from} ({before:0.#} -> {_teamHealth:0.#})");
             try { PvpEffects.OnTeamHit(before - _teamHealth, _teamHealth); } catch { }   // captain's own hit cue
-            if (_teamHealth <= 0) { _eliminated = true; Log.LogWarning("[pvp] === YOUR TEAM WAS ELIMINATED ==="); }
+            if (_teamHealth <= 0f) { _eliminated = true; Log.LogWarning("[pvp] === YOUR TEAM WAS ELIMINATED ==="); }
             try { BroadcastMyPosition(); } catch { }   // immediate health keyframe (captain) → attacker + teammates
         }
 
         // Non-captain: adopt the shared team health announced by my captain's keyframe (HUD + elimination). The captain
         // is authoritative — I never broadcast it myself.
-        private static void AdoptTeamHealth(int health)
+        private static void AdoptTeamHealth(float health)
         {
             health = Clamp(health);
-            int drop = _teamHealth - health;
+            float drop = _teamHealth - health;
             _teamHealth = health;
-            _eliminated = health <= 0;
-            if (drop > 0) { try { PvpEffects.OnTeamHit(drop, health); } catch { } }   // teammate feels the captain's hit
+            _eliminated = health <= 0f;
+            if (drop > 0f) { try { PvpEffects.OnTeamHit(drop, health); } catch { } }   // teammate feels the captain's hit
         }
 
         private static bool SafeAmICaptain() { try { return PvpTeams.AmICaptain; } catch { return false; } }
@@ -884,7 +920,7 @@ namespace IronNestVR
             if (_result != Result.None) return;
             if (_eliminated) { _result = Result.Lost; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM LOST ==="); try { PvpEffects.OnMatchResult(false); } catch { } return; }
             if (_mirrors.Count == 0) return;
-            foreach (var kv in _mirrors) { var m = kv.Value; if (m != null && m.Health > 0) return; }   // an enemy still alive
+            foreach (var kv in _mirrors) { var m = kv.Value; if (m != null && m.Health > 0f) return; }   // an enemy still alive
             _result = Result.Won; Log.LogWarning("[pvp] === MATCH OVER — YOUR TEAM WON ==="); try { PvpEffects.OnMatchResult(true); } catch { }
         }
 
@@ -928,7 +964,11 @@ namespace IronNestVR
         }
 #endif
 
-        private static int Clamp(int h) => h < 0 ? 0 : (h > MaxHealth ? MaxHealth : h);
+        private static float Clamp(float h) => h < 0f ? 0f : (h > MaxHealth ? MaxHealth : h);
+
+        // MapEntity.Health / MaxHealth are ints; round the float HP UP for the on-map marker so a nest with a
+        // fractional point left (e.g. 3.5 after an HCHE hit) still reads as alive (>=1), never a false "destroyed".
+        private static int HpInt(float h) => Mathf.Max(0, Mathf.CeilToInt(h));
 
         // The map marker needs BOTH a valid Icon KEY (in EntityLocation.PossibleMapIcons) AND the resolved Sprite
         // (MapEntity.IconRaw) — the key alone draws a blank (the Phase-1 invisible-marker bug). PossibleMapIcons maps
@@ -962,10 +1002,10 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[pvp] resolve icon: " + e.Message); }
         }
 
-        private static MapEntityStates StateForHealth(int health)
+        private static MapEntityStates StateForHealth(float health)
         {
-            if (health <= 0) return MapEntityStates.Destroyed;
-            if (health < MaxHealth / 2) return MapEntityStates.Damaged;
+            if (health <= 0f) return MapEntityStates.Destroyed;
+            if (health < MaxHealth / 2f) return MapEntityStates.Damaged;
             return MapEntityStates.None;
         }
 
@@ -1031,6 +1071,50 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[pvp] place turret: " + e.Message); return false; }
         }
 
+        // ---------------- teleprinter battery-position report ----------------
+
+        // Announce MY battery's grid on the teleprinter — once when it deploys, and again after a requisition move card
+        // relocates it. Settle-detection unifies both: the turret jumps to its spawn on placement (DEPLOYED) and
+        // traverses on a move card (RELOCATED); each time it goes stationary at a NEW grid we print. (In a bare PvP
+        // arena only a requisition move card can move the turret — the mission's own move nodes are suppressed.)
+        private static void TickTurretPositionReport(float now)
+        {
+            if (!_turretPlaced) return;
+            Vector2 g = MyTurretGrid();
+            if ((g - _lastTurretGrid).magnitude > TurretMoveEps) { _lastTurretGrid = g; _turretStableSince = now; return; }  // still moving — reset settle clock
+            if (now - _turretStableSince < TurretSettleSec) return;             // not stationary long enough yet
+            if ((g - _announcedGrid).magnitude < AnnounceMinDeltaGrid) return;  // already announced this position
+            _announcedGrid = g;
+            bool deployed = _posAnnounceCount == 0;
+            _posAnnounceCount++;
+            AnnounceTurretPosition(g, deployed);
+        }
+
+        // Print a short field message to the (local) teleprinter stating our battery's map grid. PvP teleprinters are
+        // per-player (CoopOrders never replicates/suppresses while PvpActive), so this prints only on this machine —
+        // exactly what we want: each crew member's printer reports their own (shared-team) battery position.
+        private static void AnnounceTurretPosition(Vector2 grid, bool deployed)
+        {
+            try
+            {
+                Teleprinter tp = null;
+                try { tp = Teleprinter.GetTeleprinter(Teleprinter.Teleprinters.Primary); } catch { }
+                if (tp == null)
+                {
+                    try { var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<Teleprinter>(), FindObjectsSortMode.None); if (arr != null && arr.Length > 0) tp = arr[0].TryCast<Teleprinter>(); } catch { }
+                }
+                if (tp == null) { Log.LogWarning("[pvp] no teleprinter to report battery position"); return; }
+
+                var lines = new Il2CppSystem.Collections.Generic.List<string>();
+                lines.Add(deployed ? "FRIENDLY BATTERY DEPLOYED" : "FRIENDLY BATTERY RELOCATED");
+                lines.Add($"OWN POSITION  GRID {grid.x:0.0}, {grid.y:0.0} KM");
+                tp.SubmitLines("PVP_BATTERY", lines.Cast<Il2CppSystem.Collections.Generic.IEnumerable<string>>(), null, false);
+                tp.TryStart(false);
+                Diagnostics.V($"[pvp] teleprinter: own battery {(deployed ? "DEPLOYED" : "RELOCATED")} at grid ({grid.x:0.0},{grid.y:0.0})");
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] battery report: " + e.Message); }
+        }
+
         private static bool Active()
         {
             if (!Config.PvpActive) return false;
@@ -1046,7 +1130,7 @@ namespace IronNestVR
 
         // ---------------- HUD accessors ----------------
 
-        public static int MyHealth => _teamHealth;   // my TEAM's shared health (named for HUD compat)
+        public static float MyHealth => _teamHealth;   // my TEAM's shared health (named for HUD compat)
         public static bool Eliminated => _eliminated;
         public static bool MatchOver => _result != Result.None;
         public static bool Won => _result == Result.Won;
@@ -1060,9 +1144,9 @@ namespace IronNestVR
         }
 
         // First opponent mirror (1v1 = the only one). Returns its map grid + current health.
-        public static bool TryGetFirstEnemy(out Vector2 grid, out int health)
+        public static bool TryGetFirstEnemy(out Vector2 grid, out float health)
         {
-            grid = Vector2.zero; health = 0;
+            grid = Vector2.zero; health = 0f;
             foreach (var kv in _mirrors) { var m = kv.Value; if (m != null) { grid = m.Grid; health = m.Health; return true; } }
             return false;
         }
@@ -1131,6 +1215,6 @@ namespace IronNestVR
 
         // ---------------- diagnostics ----------------
 
-        public static string Status() => $"pvpPlayers: active={Active()} teamHp={_teamHealth}{(_eliminated ? " ELIM" : "")}{(_result != Result.None ? " " + _result : "")} cap={SafeAmICaptain()} mirrors={_mirrors.Count} spawn={(_spawnsAssigned ? $"t0({_team0Spawn.x:0.0},{_team0Spawn.y:0.0})/t1({_team1Spawn.x:0.0},{_team1Spawn.y:0.0})" : "pending")} sent={_sent} spawned={_spawned} moved={_moved}";
+        public static string Status() => $"pvpPlayers: active={Active()} teamHp={_teamHealth:0.#}{(_eliminated ? " ELIM" : "")}{(_result != Result.None ? " " + _result : "")} cap={SafeAmICaptain()} mirrors={_mirrors.Count} spawn={(_spawnsAssigned ? $"t0({_team0Spawn.x:0.0},{_team0Spawn.y:0.0})/t1({_team1Spawn.x:0.0},{_team1Spawn.y:0.0})" : "pending")} sent={_sent} spawned={_spawned} moved={_moved}";
     }
 }

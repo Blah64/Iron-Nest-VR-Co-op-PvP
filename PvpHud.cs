@@ -36,7 +36,7 @@ namespace IronNestVR
 
                 int myTeam = -1; try { myTeam = PvpTeams.MyTeam; } catch { }
                 string capTag = PvpTeams.AmICaptain ? " [captain]" : "";
-                GUI.Label(new Rect(lx, cy, lw, rh), $"Your team {(myTeam >= 0 ? (myTeam + 1).ToString() : "?")}{capTag}: hp {PvpPlayers.MyHealth}/{PvpPlayers.MaxHealth}{(PvpPlayers.Eliminated ? "   *ELIMINATED*" : "")}"); cy += rh;
+                GUI.Label(new Rect(lx, cy, lw, rh), $"Your team {(myTeam >= 0 ? (myTeam + 1).ToString() : "?")}{capTag}: hp {PvpPlayers.MyHealth:0.#}/{PvpPlayers.MaxHealth:0.#}{(PvpPlayers.Eliminated ? "   *ELIMINATED*" : "")}"); cy += rh;
 
                 Vector2 myg = PvpPlayers.MyGridPublic;
                 GUI.Label(new Rect(lx, cy, lw, rh), $"Your grid: ({myg.x:0.0}, {myg.y:0.0})"); cy += rh;
@@ -44,7 +44,7 @@ namespace IronNestVR
                 if (PvpPlayers.TryGetFirstEnemy(out var eg, out var ehp))
                 {
                     bool acq = PvpPlayers.EnemyAcquired;
-                    if (acq) { GUI.Label(new Rect(lx, cy, lw, rh), $"ENEMY TEAM: grid ({eg.x:0.0}, {eg.y:0.0})   hp {ehp}   [SPOTTED]"); cy += rh; }
+                    if (acq) { GUI.Label(new Rect(lx, cy, lw, rh), $"ENEMY TEAM: grid ({eg.x:0.0}, {eg.y:0.0})   hp {ehp:0.#}   [SPOTTED]"); cy += rh; }
                     else { var pc = GUI.contentColor; GUI.contentColor = Color.yellow; GUI.Label(new Rect(lx, cy, lw, rh), "ENEMY TEAM: not acquired — redeem a recon card to spot"); GUI.contentColor = pc; cy += rh; }
                     if (PvpCombat.LastImpactTime > 0f)
                     {

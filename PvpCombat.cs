@@ -29,8 +29,11 @@ namespace IronNestVR
     {
         private static ManualLogSource Log => Plugin.Logger;
 
-        public const byte MSG_PVP_HIT = 43;   // [t][victimLo i32][victimHi i32][dmg i32][shellId str]  attacker -> victim
-        public const int BaseHitDamage = 25;  // per direct hit; scaled by the shell's Damage multiplier (AP=2 -> 50, HE=1 -> 25)
+        public const byte MSG_PVP_HIT = 43;   // [t][victimLo i32][victimHi i32][dmg f32][shellId str]  attacker -> victim
+        // DAMAGE vs the 4-HP nest, per shell type (user spec): AP 2, HE 1, HCHE 0.5, STAR 0 (recon only — STAR reveals,
+        // it never damages), everything else 1. Keyed on ShellId, NOT the authored ShellDefinition.Damage, because that
+        // field is an int (AP=2 / STAR=0 / rest=1) and can't express HCHE's 0.5. See DamageForShell.
+        //
         // Hit radius = the shell's OWN authored ImpactRadius (the base game's normal blast radius per shell type), read
         // live from the ShellDefinition. Demo values (grid units, == the game's own EvaluateImpact space): AP 0.15,
         // HE 0.25, HCHE 0.55, PGAS 0.75, SMK 1.0, TGAS 1.0, STAR 0.2. FallbackHitRadius is used ONLY when the shell /
@@ -58,17 +61,20 @@ namespace IronNestVR
                 if (!Config.PvpActive) return;                       // co-op path is CoopImpact's
                 if (!SteamNet.InLobby || !CoopP2P.HasPeer) return;
 
-                int shellDmg = 1; string shellId = ""; float impactRadius = 0f;
-                try { if (shell != null) { shellId = shell.ShellId ?? ""; shellDmg = shell.Damage; impactRadius = shell.ImpactRadius; } } catch { }
-                int dmg = BaseHitDamage * Mathf.Max(1, shellDmg);
+                string shellId = ""; float impactRadius = 0f;
+                try { if (shell != null) { shellId = shell.ShellId ?? ""; impactRadius = shell.ImpactRadius; } } catch { }
+                float dmg = DamageForShell(shellId);
                 float radius = impactRadius > 0f ? impactRadius : FallbackHitRadius;   // the game's normal per-shell blast radius
 
                 LastImpact = impactLocation; LastImpactTime = Time.unscaledTime; LastImpactHit = false;   // HUD ranging feedback
 
+                // STAR (illumination) shells deal no damage — they SPOT the enemy. Reveal enemies near the burst.
+                if (IsStar(shellId)) { try { PvpPlayers.OnStarShell(impactLocation); } catch { } }
+
 #if !PUBLIC_BUILD
                 int engineCount = -1; try { if (__result != null) engineCount = __result.Count; } catch { }
                 string origin = "?"; try { var t = TurretController.Instance; if (t != null && t.turretBase != null) origin = t.turretBase.position.ToString("0.0"); } catch { }
-                Log.LogInfo($"[pvp] impact ({impactLocation.x:0.00},{impactLocation.y:0.00}) shell='{shellId}' ImpactRadius={impactRadius:0.00} hitRadius={radius:0.00} engineHits={engineCount} mirrors={PvpPlayers.MirrorCount} turretBase={origin}");
+                Log.LogInfo($"[pvp] impact ({impactLocation.x:0.00},{impactLocation.y:0.00}) shell='{shellId}' dmg={dmg:0.#} ImpactRadius={impactRadius:0.00} hitRadius={radius:0.00} engineHits={engineCount} mirrors={PvpPlayers.MirrorCount} turretBase={origin}");
                 try { PvpPlayers.LogImpactProximity(impactLocation, radius); } catch { }
 #endif
 
@@ -76,26 +82,27 @@ namespace IronNestVR
                 // NOT return programmatically-spawned entities (Phase 0 / PvpProbe RUN notes), so we don't rely on it:
                 // we placed each opponent mirror and know its map grid, and impactLocation is in that same map space —
                 // so a shell within `radius` of a mirror is a hit on that peer.
+                if (dmg <= 0f) return;   // a non-damaging shell (STAR) — its reveal (above) is the whole effect
                 int n = PvpPlayers.CollectHits(impactLocation, radius, _victims);
                 for (int i = 0; i < n; i++)
                 {
                     ulong victim = _victims[i];
                     SendHit(victim, dmg, shellId);
                     _dealt++; LastImpactHit = true;
-                    Log.LogInfo($"[pvp] my shell hit opponent peer {victim} for {dmg} (shell='{shellId}') at ({impactLocation.x:0.0},{impactLocation.y:0.0})");
+                    Log.LogInfo($"[pvp] my shell hit opponent peer {victim} for {dmg:0.#} (shell='{shellId}') at ({impactLocation.x:0.0},{impactLocation.y:0.0})");
                 }
             }
             catch (Exception ex) { Log.LogWarning("[pvp] impact: " + ex.Message); }
         }
 
-        private static void SendHit(ulong victim, int dmg, string shellId)
+        private static void SendHit(ulong victim, float dmg, string shellId)
         {
             if (!EnsureBuf()) return;
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_PVP_HIT);
             w.Int((int)(victim & 0xFFFFFFFFUL));   // SteamID low 32
             w.Int((int)(victim >> 32));            // SteamID high 32
-            w.Int(dmg);
+            w.Float(dmg);
             w.Str(shellId, 64);
             if (w.Overflow) { Log.LogWarning("[pvp] hit packet overflow"); return; }
             CoopP2P.Send(_buf, w.Length, true);    // broadcast; only the addressed victim applies it
@@ -110,7 +117,7 @@ namespace IronNestVR
             if (origin == CoopP2P.MyId) return;            // never damage myself from my own packet
             var r = new CoopWire.Reader(a, len, 1);
             ulong victim = (uint)r.Int() | ((ulong)(uint)r.Int() << 32);
-            int dmg = r.Int();
+            float dmg = r.Float();
             string shellId = r.Str(64);
             if (r.Bad) return;
             if (victim != CoopP2P.MyId) return;            // addressed to a different peer (N>2) — ignore
@@ -121,6 +128,23 @@ namespace IronNestVR
         // ---------------- diagnostics ----------------
 
         public static string Status() => $"pvpCombat: dealt={_dealt} taken={_taken}";
+
+        // Damage a shell deals to the 4-HP nest, by ShellId (user spec). STAR is 0 (it reveals instead); HCHE's 0.5
+        // is why this is a float map and not the int ShellDefinition.Damage. Unlisted shells (smoke/gas/empty) -> 1.
+        private static float DamageForShell(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return 1f;
+            switch (id.Trim().ToUpperInvariant())
+            {
+                case "AP":   return 2f;
+                case "HE":   return 1f;
+                case "HCHE": return 0.5f;
+                case "STAR": return 0f;
+                default:     return 1f;
+            }
+        }
+
+        private static bool IsStar(string id) => !string.IsNullOrEmpty(id) && string.Equals(id.Trim(), "STAR", StringComparison.OrdinalIgnoreCase);
 
         private static bool EnsureBuf()
         {

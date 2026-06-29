@@ -28,12 +28,12 @@ namespace IronNestVR
         private static Texture2D _px;
 
         // The whole team took a hit. dmg = HP lost (already clamped), newHealth = remaining shared team HP.
-        public static void OnTeamHit(int dmg, int newHealth)
+        public static void OnTeamHit(float dmg, float newHealth)
         {
             try
             {
-                if (!Config.PvpActive || dmg <= 0) return;
-                Notify.Show(newHealth > 0 ? $"TEAM HIT   -{dmg}   (hp {newHealth})" : "TEAM DOWN");
+                if (!Config.PvpActive || dmg <= 0f) return;
+                Notify.Show(newHealth > 0f ? $"TEAM HIT   -{dmg:0.#}   (hp {newHealth:0.#})" : "TEAM DOWN");
                 _flashUntil = Time.unscaledTime + FlashSec;
                 try { PvpMatch.SpawnIncomingImpact(); } catch { }   // the game's own explosion VFX+sound (VR + flatscreen)
             }
