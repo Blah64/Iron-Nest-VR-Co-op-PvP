@@ -1105,14 +1105,33 @@ namespace IronNestVR
                 }
                 if (tp == null) { Log.LogWarning("[pvp] no teleprinter to report battery position"); return; }
 
+                string label = GridLabel(grid);
                 var lines = new Il2CppSystem.Collections.Generic.List<string>();
                 lines.Add(deployed ? "FRIENDLY BATTERY DEPLOYED" : "FRIENDLY BATTERY RELOCATED");
-                lines.Add($"OWN POSITION  GRID {grid.x:0.0}, {grid.y:0.0} KM");
+                lines.Add($"OWN POSITION  GRID {label}");
                 tp.SubmitLines("PVP_BATTERY", lines.Cast<Il2CppSystem.Collections.Generic.IEnumerable<string>>(), null, false);
                 tp.TryStart(false);
-                Diagnostics.V($"[pvp] teleprinter: own battery {(deployed ? "DEPLOYED" : "RELOCATED")} at grid ({grid.x:0.0},{grid.y:0.0})");
+                Diagnostics.V($"[pvp] teleprinter: own battery {(deployed ? "DEPLOYED" : "RELOCATED")} at GRID {label} ({grid.x:0.0},{grid.y:0.0} km)");
             }
             catch (Exception e) { Log.LogWarning("[pvp] battery report: " + e.Message); }
+        }
+
+        // Format an FMR-local grid position (km; 1 unit = 1 major cell) as the game's grid reference. Convention
+        // (user-confirmed 2026-06-29): major columns A-T LEFT->RIGHT (A at the grid's left edge), major rows 1-10
+        // BOTTOM->TOP (1 at the bottom); inside each major square the sub-grid runs 1-10 LEFT->RIGHT (sub X) and
+        // 1-10 BOTTOM->TOP (sub Y), each sub-cell 0.1 km. Origin is taken from the arena's real grid min (FireMission
+        // bounds) so an offset map space still labels correctly; falls back to (0,0) = the user-confirmed 20x10 box.
+        private static string GridLabel(Vector2 grid)
+        {
+            Vector2 mn = FallbackGridMin;
+            try { if (TryGetMapGridBounds(out Vector2 bmn, out Vector2 _)) mn = bmn; } catch { }
+            float lx = grid.x - mn.x, ly = grid.y - mn.y;                       // position from the grid's bottom-left
+            int col = Mathf.Clamp(Mathf.FloorToInt(lx), 0, 25);                 // 0 => 'A'
+            int row = Mathf.FloorToInt(ly) + 1;                                 // 0 => row 1 (bottom)
+            int subX = Mathf.Clamp(Mathf.FloorToInt((lx - Mathf.Floor(lx)) * 10f + 1e-4f) + 1, 1, 10);  // 1..10 left->right
+            int subY = Mathf.Clamp(Mathf.FloorToInt((ly - Mathf.Floor(ly)) * 10f + 1e-4f) + 1, 1, 10);  // 1..10 bottom->top
+            char letter = (char)('A' + col);
+            return $"{letter}{row} ({subX},{subY})";
         }
 
         private static bool Active()
