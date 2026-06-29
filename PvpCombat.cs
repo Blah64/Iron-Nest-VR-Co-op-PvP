@@ -31,7 +31,11 @@ namespace IronNestVR
 
         public const byte MSG_PVP_HIT = 43;   // [t][victimLo i32][victimHi i32][dmg i32][shellId str]  attacker -> victim
         public const int BaseHitDamage = 25;  // per direct hit; scaled by the shell's Damage multiplier (AP=2 -> 50, HE=1 -> 25)
-        public const float MinHitRadius = 2.0f; // floor so a clean ranging shot near the marker counts (real HE blast is only 0.25; tune toward real for shipping)
+        // Hit radius = the shell's OWN authored ImpactRadius (the base game's normal blast radius per shell type), read
+        // live from the ShellDefinition. Demo values (grid units, == the game's own EvaluateImpact space): AP 0.15,
+        // HE 0.25, HCHE 0.55, PGAS 0.75, SMK 1.0, TGAS 1.0, STAR 0.2. FallbackHitRadius is used ONLY when the shell /
+        // its radius couldn't be read (shell null / interop glitch) so a valid impact isn't silently un-hittable.
+        public const float FallbackHitRadius = 0.5f;
 
         private static Il2CppStructArray<byte> _buf;
         private static int _dealt, _taken;
@@ -57,7 +61,7 @@ namespace IronNestVR
                 int shellDmg = 1; string shellId = ""; float impactRadius = 0f;
                 try { if (shell != null) { shellId = shell.ShellId ?? ""; shellDmg = shell.Damage; impactRadius = shell.ImpactRadius; } } catch { }
                 int dmg = BaseHitDamage * Mathf.Max(1, shellDmg);
-                float radius = Mathf.Max(impactRadius, MinHitRadius);
+                float radius = impactRadius > 0f ? impactRadius : FallbackHitRadius;   // the game's normal per-shell blast radius
 
                 LastImpact = impactLocation; LastImpactTime = Time.unscaledTime; LastImpactHit = false;   // HUD ranging feedback
 

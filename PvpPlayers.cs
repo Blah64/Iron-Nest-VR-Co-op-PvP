@@ -29,6 +29,7 @@ namespace IronNestVR
         private static ManualLogSource Log => Plugin.Logger;
 
         public const byte MSG_PVP_POS = 42;   // [t][gridX f][gridY f][role i32][health i32]  — author's map position + HP; either player authors it
+        public const byte MSG_PVP_SPAWN = 50; // [t][t0x f][t0y f][t1x f][t1y f]  reliable  HOST->all (global) — the two randomized team spawn grids
         public const int MaxHealth = 100;
 
         private static int _teamHealth = MaxHealth;   // MY TEAM's shared health. The team CAPTAIN owns it authoritatively
@@ -57,15 +58,54 @@ namespace IronNestVR
         private static float _nextSend;
         private const float SendIntervalSec = 0.5f;   // position is static in Phase 1 — a slow reliable keyframe is plenty
 
-        // Per-TEAM spawn grids (within the coord range Phase 0 observed on the demo maps). Both teammates pin their
-        // local turret to the SAME team grid so a team reads as ONE vehicle. Phase C derives these from a match-start
-        // placement; the values match the old host/client placeholders so a 1v1 is unchanged (host=team0, client=team1).
-        private static readonly Vector2 Team0Spawn = new Vector2(4f, 2f);
-        private static readonly Vector2 Team1Spawn = new Vector2(6f, 8f);
+        // Per-TEAM spawn grids (FMR-local grid units; 1 unit == 1 km on the demo maps — the map is 20x10 km). The HOST
+        // RANDOMIZES these at match start within the arena's REAL grid bounds, guaranteeing the two team turrets spawn at
+        // least MinSpawnSepGrid km apart, then broadcasts them (MSG_PVP_SPAWN). Both teammates pin to the SAME team grid so
+        // a team reads as ONE vehicle. Default to the old fixed placeholders until the host's assignment lands (and as a
+        // solo/dev fallback). _spawnsAssigned latches once randomized (host) or received (client).
+        private static readonly Vector2 Team0SpawnDefault = new Vector2(4f, 2f);
+        private static readonly Vector2 Team1SpawnDefault = new Vector2(6f, 8f);
+        private static Vector2 _team0Spawn = Team0SpawnDefault;
+        private static Vector2 _team1Spawn = Team1SpawnDefault;
+        private static bool _spawnsAssigned;
+        private static float _spawnGenAt;       // host: when to generate (settle so FireMission's map bounds exist)
+        private static float _nextSpawnBeat;    // host: re-broadcast heartbeat (JIP / lost-packet heal)
+        private static System.Random _spawnRng;
+        private const float SpawnBeatSec = 3f;
+        private const float KmPerGridUnit = 1f;       // demo map scale: 1 grid unit = 1 km (map is 20 km x 10 km)
+        private const float MinSpawnSepGrid = 3f;     // turrets >= 3 km apart (user requirement); grid == km so 3 units
+        private const float SpawnEdgeInsetGrid = 1f;  // keep turrets >= 1 km off the map edge
+        // Fallback grid bounds — used only if FireMission.GetGridBounds can't be read: the user-confirmed map size with a
+        // bottom-left origin (matches the small positive demo coords, e.g. the scene-default turret at ~ (1.6,1.6)).
+        private static readonly Vector2 FallbackGridMin = new Vector2(0f, 0f);
+        private static readonly Vector2 FallbackGridMax = new Vector2(20f, 10f);
 
         private static int _sent, _spawned, _moved;
         private static bool _turretPlaced;   // pinned my turret to MyGrid this match?
         private static float _placeTurretAt;  // when to attempt placement (settle delay after entering the arena)
+
+        // SCOUT-PHOTO FOOTPRINT (production, both flavors). A scout plane's photo "develops" LATE — a few seconds after the
+        // flyover the game registers a reveal REGION (MapReconClearer.Register(handle)); that handle's fog-tile children ARE
+        // the exact photographed area. We arm a window when the plane launches, capture the region (event-driven via the
+        // Register hook, plus a polling backup), and reveal only the enemy mirrors INSIDE that region. The dialed circle is
+        // a fallback used only if no region ever lands. Tied to the scout window so a forward observer never reveals.
+        private const float ScoutWindowSec = 30f;        // how long after launch we accept the late photo region
+        private const float FallbackAfterSec = 20f;      // if no region landed by now, reveal the dialed circle instead (backstop)
+        private const float HandleSettleSec = 0.75f;     // let RegisterChild populate the region's children before reading
+        private const float FootprintMargin = 1.0f;      // photo strip HALF-WIDTH: a mirror within this of the strip segment is "on the photo"
+        private const float HandleScanInterval = 0.25f;  // how often we re-scan for newly-appeared recon regions
+        private static float _scoutWindowUntil;
+        private static float _lastScoutLaunch;
+        private static Vector2 _scoutFallbackCenter;
+        private static bool _scoutFallbackArmed;
+        private static float _scoutFallbackAt;
+        private static bool _scoutHandled;               // a photo region resolved this scout → suppress the circle fallback
+        private static float _nextHandleScan;
+        private static bool _handlesInit;                // first scan done? (baselines scene handles so they aren't seen as photos)
+        private static readonly HashSet<int> _knownHandles = new HashSet<int>();          // every recon handle seen this mission (PERSISTENT, no per-pass race)
+        private static readonly HashSet<int> _scoutHandlesCaptured = new HashSet<int>();  // handles already turned into a reveal
+        private sealed class PendingRegion { public MapReconClearHandle H; public float At; }
+        private static readonly List<PendingRegion> _pendingRegions = new List<PendingRegion>();
 
 #if !PUBLIC_BUILD
         // RECON FOOTPRINT TELEMETRY (dev only) — after a scout-plane run, capture WHERE the photos actually land so the
@@ -91,16 +131,34 @@ namespace IronNestVR
                 if (_mirrors.Count > 0) { ClearMirrors(); Log.LogInfo("[pvp] left PvP mission — cleared player mirrors"); }
                 _teamHealth = MaxHealth; _eliminated = false; _result = Result.None;
                 _turretPlaced = false; _placeTurretAt = 0f;   // re-pin the turret next match
+                _spawnsAssigned = false; _spawnGenAt = 0f; _nextSpawnBeat = 0f;   // re-randomize spawns next match
+                _team0Spawn = Team0SpawnDefault; _team1Spawn = Team1SpawnDefault;
+                _scoutWindowUntil = 0f; _scoutFallbackArmed = false; _scoutHandled = false; _pendingRegions.Clear();
+                _knownHandles.Clear(); _scoutHandlesCaptured.Clear(); _handlesInit = false; _nextHandleScan = 0f;
                 return;
             }
             try
             {
                 float now = Time.unscaledTime;
 
-                // Pin MY turret to MY deterministic grid once, a moment after the arena settles, so the firing origin
-                // is identical every match and a learned firing solution repeats. Retries each tick until the turret
-                // exists. The mission's own turret-move nodes are suppressed (CoopSim) so nothing fights this.
-                if (!_turretPlaced)
+                // HOST assigns the two team spawn grids ONCE per match — randomized, within the arena's real grid bounds,
+                // and >= MinSpawnSepGrid km apart — then broadcasts them (clients adopt via MSG_PVP_SPAWN). A short settle
+                // lets FireMission (the map-bounds source) awake first. A slow heartbeat heals a late joiner / lost packet.
+                if (CoopP2P.IsHost)
+                {
+                    if (!_spawnsAssigned)
+                    {
+                        if (_spawnGenAt <= 0f) _spawnGenAt = now + 2.5f;
+                        else if (now >= _spawnGenAt) GenerateAndBroadcastSpawns();
+                    }
+                    else if (now >= _nextSpawnBeat) { _nextSpawnBeat = now + SpawnBeatSec; BroadcastSpawns(); }
+                }
+
+                // Pin MY turret to MY assigned team grid once spawns are known, a moment after they settle, so the firing
+                // origin is deterministic for the match and a learned solution repeats. Gated on _spawnsAssigned so we
+                // never place at the pre-assignment default and then have to re-place when the real grid arrives. Retries
+                // each tick until the turret exists. The mission's own turret-move nodes are suppressed (CoopSim).
+                if (!_turretPlaced && _spawnsAssigned)
                 {
                     if (_placeTurretAt <= 0f) _placeTurretAt = now + 2f;
                     else if (now >= _placeTurretAt && PlaceMyTurret()) _turretPlaced = true;
@@ -118,8 +176,10 @@ namespace IronNestVR
                 PruneNonCaptainMirrors();   // reap a non-captain's stale mirror once the roster is known
                 CheckMatchEnd();            // declare win/lose from the team-health state
                 ApplyMirrorVisibility();    // ACQUISITION: enemy is fog-hidden until a recon card reveals it (OnReconReveal)
+                ScanHandles(now);           // baseline scene recon regions + detect a developed scout photo region
+                if (_scoutWindowUntil > 0f) ProcessScoutFootprint(now);   // resolve a scout photo into a footprint reveal
 #if !PUBLIC_BUILD
-                if (_reconWatchUntil > 0f) ReconWatchTick(now);   // capture the REAL photo footprint after a scout run
+                if (_reconWatchUntil > 0f) ReconWatchTick(now);   // dev telemetry: fog/plane diff after a scout run
 #endif
             }
             catch (Exception e) { Log.LogWarning("[pvp] tick: " + e.Message); }
@@ -138,10 +198,105 @@ namespace IronNestVR
             _sent++;
         }
 
+        // ---------------- randomized team spawns (host-authoritative) ----------------
+
+        // HOST: pick the two team spawn grids for this match — random, within the arena's REAL grid bounds, and at least
+        // MinSpawnSepGrid (km) apart — then latch + broadcast. Bounds come from FireMission.GetGridBounds (the map's own
+        // grid extent) so the points are on-map regardless of the coord origin; a user-confirmed 20x10 fallback covers
+        // the rare case the bounds can't be read. Latched per match by _spawnsAssigned.
+        private static void GenerateAndBroadcastSpawns()
+        {
+            Vector2 mn, mx; bool fromMap = TryGetMapGridBounds(out mn, out mx);
+            if (!fromMap) { mn = FallbackGridMin; mx = FallbackGridMax; }
+            mn.x += SpawnEdgeInsetGrid; mn.y += SpawnEdgeInsetGrid; mx.x -= SpawnEdgeInsetGrid; mx.y -= SpawnEdgeInsetGrid;
+            if (mx.x <= mn.x || mx.y <= mn.y) { mn = FallbackGridMin; mx = FallbackGridMax; }   // degenerate inset -> safe box
+
+            if (_spawnRng == null) _spawnRng = new System.Random();
+            Vector2 p0 = RandGrid(mn, mx), p1 = RandGrid(mn, mx);
+            bool ok = false;
+            for (int i = 0; i < 200; i++)
+            {
+                p0 = RandGrid(mn, mx); p1 = RandGrid(mn, mx);
+                if ((p0 - p1).magnitude >= MinSpawnSepGrid) { ok = true; break; }
+            }
+            if (!ok) { p0 = new Vector2(mn.x, mn.y); p1 = new Vector2(mx.x, mx.y); }   // box too small -> opposite corners (max sep)
+
+            _team0Spawn = p0; _team1Spawn = p1;
+            _spawnsAssigned = true;
+            _nextSpawnBeat = now2() + SpawnBeatSec;
+            float sepKm = (p0 - p1).magnitude * KmPerGridUnit;
+            Log.LogInfo($"[pvp] randomized spawns: team0 ({p0.x:0.0},{p0.y:0.0}) team1 ({p1.x:0.0},{p1.y:0.0}) = {sepKm:0.00} km apart (bounds [{mn.x:0.0},{mn.y:0.0}]..[{mx.x:0.0},{mx.y:0.0}] {(fromMap ? "from FireMission" : "fallback 20x10")})");
+            BroadcastSpawns();
+        }
+
+        // Random grid point in [mn,mx], snapped to the map's 0.1 km sub-grid lines.
+        private static Vector2 RandGrid(Vector2 mn, Vector2 mx)
+        {
+            float x = mn.x + (float)_spawnRng.NextDouble() * (mx.x - mn.x);
+            float y = mn.y + (float)_spawnRng.NextDouble() * (mx.y - mn.y);
+            x = Mathf.Round(x * 10f) / 10f; y = Mathf.Round(y * 10f) / 10f;   // 0.1 grid == 0.1 km (the sub-grid lines)
+            return new Vector2(x, y);
+        }
+
+        // The arena's grid bounds in FMR-local grid space (== the space PlaceMyTurret/MyGrid use), from the game's own
+        // FireMission.GetGridBounds() (world-space corners) converted through Fire Mission Root. Returns false if the map
+        // isn't up yet or the result doesn't look like the ~20x10 demo map (then the caller uses the fallback box).
+        private static bool TryGetMapGridBounds(out Vector2 min, out Vector2 max)
+        {
+            min = Vector2.zero; max = Vector2.zero;
+            try
+            {
+                var fm = FireMission.Instance; if (fm == null) return false;
+                var corners = fm.GetGridBounds(); if (corners == null || corners.Length == 0) return false;
+                var fmr = ResolveParent(); if (fmr == null) return false;
+                Vector2 mn = new Vector2(float.MaxValue, float.MaxValue), mx = new Vector2(float.MinValue, float.MinValue);
+                for (int i = 0; i < corners.Length; i++)
+                {
+                    Vector2 g = WorldToGrid(fmr, corners[i]);
+                    if (g.x < mn.x) mn.x = g.x; if (g.y < mn.y) mn.y = g.y;
+                    if (g.x > mx.x) mx.x = g.x; if (g.y > mx.y) mx.y = g.y;
+                }
+                float w = mx.x - mn.x, h = mx.y - mn.y;
+                if (w < 4f || w > 60f || h < 2f || h > 40f) return false;   // not the expected ~20x10 grid -> fallback
+                min = mn; max = mx;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // HOST: send the two randomized team spawn grids to everyone (global type -> crosses teams). Reliable.
+        private static void BroadcastSpawns()
+        {
+            if (!CoopP2P.IsHost) return;
+            if (!EnsureBuf()) return;
+            var w = new CoopWire.Writer(_buf);
+            w.Byte(MSG_PVP_SPAWN);
+            w.Float(_team0Spawn.x); w.Float(_team0Spawn.y);
+            w.Float(_team1Spawn.x); w.Float(_team1Spawn.y);
+            if (w.Overflow) { Log.LogWarning("[pvp] spawn packet overflow"); return; }
+            CoopP2P.Send(_buf, w.Length, true);
+        }
+
+        // CLIENT: adopt the host's randomized team spawn grids. Only the host sends MSG_PVP_SPAWN, so any received one is
+        // authoritative; the host sets its own in GenerateAndBroadcastSpawns and ignores echoes here.
+        private static void OnSpawnPacket(ulong origin, Il2CppStructArray<byte> a, int len)
+        {
+            if (origin == CoopP2P.MyId || CoopP2P.IsHost) return;   // host is the author — never overwrite from a packet
+            var r = new CoopWire.Reader(a, len, 1);
+            float t0x = r.Float(), t0y = r.Float(), t1x = r.Float(), t1y = r.Float();
+            if (r.Bad) return;
+            bool first = !_spawnsAssigned;
+            _team0Spawn = new Vector2(t0x, t0y);
+            _team1Spawn = new Vector2(t1x, t1y);
+            _spawnsAssigned = true;
+            if (first) Log.LogInfo($"[pvp] received team spawns: team0 ({t0x:0.0},{t0y:0.0}) team1 ({t1x:0.0},{t1y:0.0}) <- host");
+        }
+
         // ---------------- receive ----------------
 
         public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
+            if (type == MSG_PVP_SPAWN) { OnSpawnPacket(origin, a, len); return; }   // accept regardless of Active() so it's ready by placement time
             if (type != MSG_PVP_POS) return;
             if (!Active()) return;                 // only mirror while we're in a PvP mission ourselves
             if (origin == CoopP2P.MyId) return;    // never mirror ourselves
@@ -274,12 +429,12 @@ namespace IronNestVR
             }
         }
 
-        // Harmony POSTFIX target (registered in CoopSim) on State_SpawnScoutPlane.OnEnter — a SCOUT-PLANE recon card just
-        // launched its photo run. A scout plane spots only the units INSIDE its photo footprint, so we reveal just the
-        // enemy mirrors near the player's DIALED recon target (CoopPunchcards.TryGetReconTarget reads the Coordinate the
-        // player set on the requisition console), not a blanket reveal. Gated to a PvP card window so a mission-scripted
-        // plane can't trigger it. The FORWARD OBSERVER uses a DIFFERENT node (State_SpawnMapEntity), so it never reaches
-        // here — it correctly does NOT reveal the enemy on the map; it only reports its spotting to the teleprinter.
+        // Harmony POSTFIX (CoopSim) on State_SpawnScoutPlane.OnEnter — a SCOUT-PLANE recon card just launched its flyover.
+        // The photo doesn't land yet; it "develops" a few seconds later as a registered reveal REGION whose fog-tile
+        // children are the exact footprint (see OnReconRegionRegistered). So here we just ARM a window to accept that
+        // region, and stash the dialed coordinate as a fallback (used only if no region ever registers). Gated to a PvP
+        // card window so a mission-scripted plane can't trigger it. The FORWARD OBSERVER uses a DIFFERENT node
+        // (State_SpawnMapEntity) and never flies a plane, so it never arms this → it correctly never reveals the map.
         public static void OnScoutPlanePhoto(SleepyNodes.State_SpawnScoutPlane __instance)
         {
             try
@@ -288,38 +443,188 @@ namespace IronNestVR
                 bool card = false; try { card = PvpMatch.CardGraphActive(); } catch { }
                 if (!card) return;   // mission-scripted plane, not a player recon card — ignore
 
+                float now = Time.unscaledTime;
+                _scoutWindowUntil = now + ScoutWindowSec;
+                _scoutHandled = false;
+                _lastScoutLaunch = now;
+                // NOTE: handle tracking is PERSISTENT (ScanHandles / _knownHandles), not re-baselined per pass — so a photo
+                // that develops late is still seen as new even if another pass launched meanwhile. Don't clear it here.
+
+                // Fallback target: the dialed recon coordinate (or the node's inline grid). Only used if no region lands.
+                bool have = CoopPunchcards.TryGetReconTarget(out Vector2 center);
+                if (!have || center == Vector2.zero) { if (TryGetNodeGrid(__instance, out Vector2 ng)) { center = ng; have = true; } }
+                _scoutFallbackArmed = have;
+                _scoutFallbackCenter = center;
+                _scoutFallbackAt = now + FallbackAfterSec;
+
+                Diagnostics.V($"[pvp] scout plane launched — waiting for the photo to develop into a reveal region (fallback {(have ? $"circle @ ({center.x:0.0},{center.y:0.0}) r={PhotoRadius:0.0} in {FallbackAfterSec:0}s" : "none")})");
+
 #if !PUBLIC_BUILD
                 try { ArmReconWatch(__instance); } catch (Exception e) { Log.LogWarning("[pvp-recon] arm: " + e.Message); }
 #endif
-
-                // Where did the plane photograph? Prefer the player's DIALED recon coordinate (a Coordinate
-                // PunchcardVariable). If the card carried no dialed coordinate, fall back to the node's own
-                // LocationToSpawn (the scripted/inline spawn grid the plane flies over).
-                bool have = CoopPunchcards.TryGetReconTarget(out Vector2 center);
-                if (!have || center == Vector2.zero)
-                {
-                    if (TryGetNodeGrid(__instance, out Vector2 nodeGrid))
-                    {
-                        center = nodeGrid; have = true;
-#if !PUBLIC_BUILD
-                        Log.LogInfo($"[pvp] scout-plane: using node LocationToSpawn grid ({center.x:0.#},{center.y:0.#}) (dial gave nothing usable)");
-#endif
-                    }
-                }
-
-                if (!have)
-                {
-                    Log.LogWarning("[pvp] scout-plane recon: no recon coordinate found (no Coordinate variable dialed, no inline node grid) — nothing spotted");
-                    return;
-                }
-
-                int n = RevealMirrorsNear(center, PhotoRadius);
-#if !PUBLIC_BUILD
-                foreach (var kv in _mirrors) { var m = kv.Value; if (m == null) continue; float d = Vector2.Distance(m.Grid, center); Log.LogInfo($"[pvp]   photo vs mirror '{m.ID}' grid ({m.Grid.x:0.0},{m.Grid.y:0.0}) dist={d:0.0} r={PhotoRadius:0.0} -> {(d <= PhotoRadius ? "SPOTTED" : "not in photo")}"); }
-#endif
-                Log.LogInfo($"[pvp] scout-plane recon photo @ ({center.x:0.0},{center.y:0.0}) r={PhotoRadius:0.0} -> spotted {n} unit(s) for {ReconRevealSec:0}s");
             }
             catch (Exception e) { Log.LogWarning("[pvp] scout photo: " + e.Message); }
+        }
+
+        // Harmony POSTFIX (CoopSim) on MapReconClearer.Register — fires the instant the developed photo's reveal region is
+        // registered. If it lands inside an armed scout window, that handle IS the photographed footprint: capture it (its
+        // children populate over the next frames, so defer the read by HandleSettleSec). Ignored outside a scout window
+        // (scene/forward-observer recon) so only a player scout plane reveals the enemy.
+        public static void OnReconRegionRegistered(MapReconClearHandle handle)
+        {
+            try
+            {
+                if (!Config.PvpActive || handle == null) return;
+                if (Time.unscaledTime >= _scoutWindowUntil) return;   // not a player scout photo
+                CaptureScoutHandle(handle);
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] recon region: " + e.Message); }
+        }
+
+        private static void CaptureScoutHandle(MapReconClearHandle handle)
+        {
+            if (handle == null) return;
+            int id; try { var go = handle.gameObject; if (go == null) return; id = go.GetInstanceID(); } catch { return; }
+            if (_scoutHandlesCaptured.Contains(id)) return;
+            _scoutHandlesCaptured.Add(id);
+            _pendingRegions.Add(new PendingRegion { H = handle, At = Time.unscaledTime + HandleSettleSec });
+        }
+
+        // PERSISTENT recon-region detection — runs every tick while in a PvP mission (throttled). The first scan baselines
+        // the handles already in the scene; after that, any NEWLY-appeared handle is a developed photo. If it shows up while
+        // a scout window is open, it's a player's scout photo → capture it (its children = the footprint). Tracking is
+        // mission-global (not re-baselined per pass), so a photo that develops late is still caught even after another pass.
+        private static void ScanHandles(float now)
+        {
+            if (now < _nextHandleScan) return;
+            _nextHandleScan = now + HandleScanInterval;
+            try
+            {
+                var hs = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearHandle>(), FindObjectsSortMode.None);
+                if (hs == null) return;
+                bool windowActive = now < _scoutWindowUntil;
+                for (int i = 0; i < hs.Length; i++)
+                {
+                    var h = hs[i].TryCast<MapReconClearHandle>(); if (h == null) continue;
+                    var go = h.gameObject; if (go == null) continue;
+                    int id = go.GetInstanceID();
+                    if (_knownHandles.Contains(id)) continue;
+                    _knownHandles.Add(id);
+                    if (!_handlesInit) continue;   // first scan: baseline existing scene handles, never a photo
+                    if (windowActive)
+                    {
+                        Diagnostics.V($"[pvp] scout photo region detected (+{now - _lastScoutLaunch:0.0}s after launch) — resolving footprint");
+                        CaptureScoutHandle(h);
+                    }
+#if !PUBLIC_BUILD
+                    else Log.LogInfo($"[pvp-recon] new recon handle id={id} but no scout window active — ignored");
+#endif
+                }
+                _handlesInit = true;
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] handle scan: " + e.Message); }
+        }
+
+        // Per-frame: resolve captured photo regions into reveals once their children populate; if nothing landed in time,
+        // fall back to the dialed circle as a backstop. (Detection itself is in ScanHandles, which runs every tick.)
+        private static void ProcessScoutFootprint(float now)
+        {
+            // Resolve settled regions into a footprint reveal.
+            for (int i = _pendingRegions.Count - 1; i >= 0; i--)
+            {
+                var pr = _pendingRegions[i];
+                if (pr == null) { _pendingRegions.RemoveAt(i); continue; }
+                if (now < pr.At) continue;
+                _pendingRegions.RemoveAt(i);
+                RevealMirrorsInHandle(pr.H);
+                _scoutHandled = true;            // a photo resolved — do NOT also fire the circle (even if it revealed 0)
+                _scoutFallbackArmed = false;
+            }
+
+            // Fallback: no region ever landed — give the player the dialed-circle reveal so they still get intel.
+            if (_scoutFallbackArmed && !_scoutHandled && now >= _scoutFallbackAt)
+            {
+                _scoutFallbackArmed = false;
+                int n = RevealMirrorsNear(_scoutFallbackCenter, PhotoRadius);
+                Diagnostics.V($"[pvp] scout photo never registered a region — fallback circle @ ({_scoutFallbackCenter.x:0.0},{_scoutFallbackCenter.y:0.0}) r={PhotoRadius:0.0} -> spotted {n} unit(s)");
+            }
+
+            if (now >= _scoutWindowUntil && _pendingRegions.Count == 0) _scoutWindowUntil = 0f;   // close the window
+        }
+
+        private static bool SaneGrid(Vector2 g) { return Mathf.Abs(g.x) < 50f && Mathf.Abs(g.y) < 50f; }
+
+        // Perpendicular distance from point p to the infinite LINE through a-b (NOT clamped to the segment). The scout
+        // plane photographs the full traverse along the bearing, so the strip runs the whole line a->b direction across
+        // the map, not just the short a->b marker span — clamping to the segment wrongly drops units past the markers.
+        private static float DistToLine(Vector2 p, Vector2 a, Vector2 b)
+        {
+            Vector2 ab = b - a; float len2 = ab.sqrMagnitude;
+            if (len2 < 1e-6f) return Vector2.Distance(p, a);   // degenerate (no direction known) -> point
+            float cross = (p.x - a.x) * ab.y - (p.y - a.y) * ab.x;
+            return Mathf.Abs(cross) / Mathf.Sqrt(len2);
+        }
+
+        // Reveal only the enemy mirrors that fall on the photographed STRIP — an ORIENTED line along the dialed bearing,
+        // NOT a circle or an axis-aligned box. The handle (P0) and its on-map child 'Parent' (P1) give the strip's
+        // DIRECTION; the plane photographs the full traverse along it, so we use perpendicular distance to the LINE
+        // through P0->P1 (not the short P0->P1 segment — the strip continues past the markers). Children that resolve to
+        // canvas-pixel space (off-map UI 'Plane Flyover', e.g. (-530,968)) are filtered. A mirror is "on the photo" if
+        // it's within FootprintMargin (the strip half-width) of that line. Each spotted mirror's icon is snapshotted.
+        private static int RevealMirrorsInHandle(MapReconClearHandle h)
+        {
+            if (h == null) return 0;
+            Transform fmr = ResolveParent();
+
+            // Collect sane on-map points: the handle (p0) and its children. The strip runs from the handle to the
+            // child farthest from it (the far end of the photo run along the bearing).
+            Vector2 p0; bool haveP0 = false;
+            Vector2 hg = WorldToGrid(fmr, h.transform.position);
+            if (SaneGrid(hg)) { p0 = hg; haveP0 = true; } else p0 = hg;
+            Vector2 p1 = p0; float far = 0f;
+            try
+            {
+                var ch = h._allChildren;
+                if (ch != null) for (int i = 0; i < ch.Count; i++)
+                {
+                    var c = ch[i]; if (c == null) continue;
+                    Vector2 g; try { g = WorldToGrid(fmr, c.transform.position); } catch { continue; }
+#if !PUBLIC_BUILD
+                    float w = 0f, ht = 0f; bool hasR = false; try { var rt = c.GetComponent<RectTransform>(); if (rt != null) { hasR = true; var rc = rt.rect; w = rc.width; ht = rc.height; } } catch { }
+                    string nm = null; try { nm = c.name; } catch { }
+                    Log.LogInfo($"[pvp-recon]   child '{nm}' grid ({g.x:0.0},{g.y:0.0}) sane={SaneGrid(g)} rect={hasR}({w:0.0}x{ht:0.0})");
+#endif
+                    if (!SaneGrid(g)) continue;
+                    if (!haveP0) { p0 = g; p1 = g; haveP0 = true; continue; }
+                    float d = Vector2.Distance(g, p0); if (d > far) { far = d; p1 = g; }
+                }
+            }
+            catch { }
+            if (!haveP0) return 0;
+
+            float until = now2() + ReconRevealSec; int revealed = 0;
+            foreach (var kv in _mirrors)
+            {
+                var m = kv.Value; if (m == null) continue;
+                float d = DistToLine(m.Grid, p0, p1);
+                bool on = d <= FootprintMargin;
+#if !PUBLIC_BUILD
+                Log.LogInfo($"[pvp]   footprint vs mirror '{m.ID}' grid ({m.Grid.x:0.0},{m.Grid.y:0.0}) strip-line ({p0.x:0.0},{p0.y:0.0})->({p1.x:0.0},{p1.y:0.0}) perp={d:0.0} w={FootprintMargin:0.0} -> {(on ? "SPOTTED" : "not on photo")}");
+#endif
+                if (on) { RevealOne(m, until); revealed++; }
+            }
+            Diagnostics.V($"[pvp] scout photo strip-line ({p0.x:0.0},{p0.y:0.0})->({p1.x:0.0},{p1.y:0.0}) w={FootprintMargin:0.0} -> spotted {revealed} unit(s) for {ReconRevealSec:0}s");
+            return revealed;
+        }
+
+        private static float now2() { try { return Time.unscaledTime; } catch { return 0f; } }
+
+        // World position -> map grid (FMR-local), the same space mirror grids use. Parent-agnostic, so it works for any
+        // map GameObject (fog tiles, recon-region children) regardless of where they're parented.
+        private static Vector2 WorldToGrid(Transform fmr, Vector3 world)
+        {
+            try { if (fmr != null) { var l = fmr.InverseTransformPoint(world); return new Vector2(l.x, l.y); } } catch { }
+            return new Vector2(world.x, world.y);
         }
 
         // Fallback recon target: read the scout-plane node's own LocationToSpawn. When it's an INLINE grid we use it
@@ -362,13 +667,22 @@ namespace IronNestVR
             return false;
         }
 
+        // Spot one mirror until `until`: arm its reveal AND freeze its on-map icon at the current live position (the
+        // scouted snapshot). The single place a reveal is applied, so every path snapshots consistently.
+        private static void RevealOne(Mirror m, float until)
+        {
+            if (m == null) return;
+            if (until > m.RevealUntil) m.RevealUntil = until;
+            SnapshotRevealPos(m);
+        }
+
         // Reveal enemy mirrors within `radius` grid-units of `center` (the photo footprint) for ReconRevealSec; returns
         // how many were in the photo. Mirrors outside it stay fogged (the scout plane only spots what it photographed).
         private static int RevealMirrorsNear(Vector2 center, float radius)
         {
             float until = Time.unscaledTime + ReconRevealSec;
             float r2 = radius * radius; int n = 0;
-            foreach (var kv in _mirrors) { var m = kv.Value; if (m == null) continue; if ((m.Grid - center).sqrMagnitude <= r2) { m.RevealUntil = until; SnapshotRevealPos(m); n++; } }
+            foreach (var kv in _mirrors) { var m = kv.Value; if (m == null) continue; if ((m.Grid - center).sqrMagnitude <= r2) { RevealOne(m, until); n++; } }
             return n;
         }
 
@@ -533,7 +847,7 @@ namespace IronNestVR
             if (dmg <= 0 || _eliminated) return;
             int before = _teamHealth;
             _teamHealth = Clamp(_teamHealth - dmg);
-            Log.LogInfo($"[pvp] team took {dmg} damage from peer {from} ({before} -> {_teamHealth})");
+            Diagnostics.V($"[pvp] team took {dmg} damage from peer {from} ({before} -> {_teamHealth})");
             try { PvpEffects.OnTeamHit(before - _teamHealth, _teamHealth); } catch { }   // captain's own hit cue
             if (_teamHealth <= 0) { _eliminated = true; Log.LogWarning("[pvp] === YOUR TEAM WAS ELIMINATED ==="); }
             try { BroadcastMyPosition(); } catch { }   // immediate health keyframe (captain) → attacker + teammates
@@ -643,7 +957,7 @@ namespace IronNestVR
                 }
                 _iconId = pArtillery ?? pFdc ?? pEnemy ?? first ?? "";
                 if (!string.IsNullOrEmpty(_iconId)) { try { var mei = dict[_iconId]; if (mei != null) _iconSprite = mei.Icon; } catch { } }
-                Log.LogInfo($"[pvp] map icons: [{all}] -> mirrors use '{_iconId}' (sprite={_iconSprite != null})");
+                Diagnostics.V($"[pvp] map icons: [{all}] -> mirrors use '{_iconId}' (sprite={_iconSprite != null})");
             }
             catch (Exception e) { Log.LogWarning("[pvp] resolve icon: " + e.Message); }
         }
@@ -657,15 +971,15 @@ namespace IronNestVR
 
         // ---------------- helpers ----------------
 
-        // My own map grid = MY TEAM's spawn (teammates coincide → one shared vehicle position). Falls back to
-        // host/client role until the roster is known (the first frames after join), which keeps a 1v1 identical to
-        // the old per-side placeholders. Phase C derives this from a real match-start placement.
+        // My own map grid = MY TEAM's (randomized, host-assigned) spawn — teammates coincide → one shared vehicle
+        // position. Falls back to host/client role for the team mapping until the roster is known (the first frames after
+        // join); _team0Spawn/_team1Spawn hold the random values once assigned, else the fixed defaults.
         private static Vector2 MyGrid()
         {
             int team = -1; try { team = PvpTeams.MyTeam; } catch { }
-            if (team == 0) return Team0Spawn;
-            if (team == 1) return Team1Spawn;
-            return CoopP2P.IsHost ? Team0Spawn : Team1Spawn;   // roster not resolved yet — fall back to role
+            if (team == 0) return _team0Spawn;
+            if (team == 1) return _team1Spawn;
+            return CoopP2P.IsHost ? _team0Spawn : _team1Spawn;   // roster not resolved yet — fall back to role
         }
 
         // The grid we BROADCAST as our turret's position. Once our turret is pinned (PlaceMyTurret), read the LIVE
@@ -817,6 +1131,6 @@ namespace IronNestVR
 
         // ---------------- diagnostics ----------------
 
-        public static string Status() => $"pvpPlayers: active={Active()} teamHp={_teamHealth}{(_eliminated ? " ELIM" : "")}{(_result != Result.None ? " " + _result : "")} cap={SafeAmICaptain()} mirrors={_mirrors.Count} sent={_sent} spawned={_spawned} moved={_moved}";
+        public static string Status() => $"pvpPlayers: active={Active()} teamHp={_teamHealth}{(_eliminated ? " ELIM" : "")}{(_result != Result.None ? " " + _result : "")} cap={SafeAmICaptain()} mirrors={_mirrors.Count} spawn={(_spawnsAssigned ? $"t0({_team0Spawn.x:0.0},{_team0Spawn.y:0.0})/t1({_team1Spawn.x:0.0},{_team1Spawn.y:0.0})" : "pending")} sent={_sent} spawned={_spawned} moved={_moved}";
     }
 }

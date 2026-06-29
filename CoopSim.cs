@@ -248,10 +248,22 @@ namespace IronNestVR
             try
             {
                 var sp = AccessTools.Method(AccessTools.TypeByName("SleepyNodes.State_SpawnScoutPlane"), "OnEnter");
-                if (sp != null) { _harmony.Patch(sp, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnScoutPlanePhoto))); Log.LogInfo("[sim] PvP scout-plane recon patched (State_SpawnScoutPlane.OnEnter postfix — area reveal of photographed enemies)"); }
+                if (sp != null) { _harmony.Patch(sp, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnScoutPlanePhoto))); Log.LogInfo("[sim] PvP scout-plane recon patched (State_SpawnScoutPlane.OnEnter postfix — arms the footprint watch)"); }
                 else Log.LogWarning("[sim] State_SpawnScoutPlane.OnEnter not found — scout-plane recon reveal off");
             }
             catch (Exception e) { Log.LogWarning("[sim] scout-plane recon patch: " + e.Message); }
+
+            // The scout photo lands LATE (the plane flies, then the photo "develops" and a MapReconClearer.Register(handle)
+            // adds the REVEALED REGION — that handle's fog-tile children ARE the exact photographed footprint). Capturing it
+            // event-driven (vs polling) gives the precise region the instant it appears. PvpPlayers gates it to the scout
+            // window armed by State_SpawnScoutPlane above, so a forward observer (no plane, no scout window) never reveals.
+            try
+            {
+                var reg = AccessTools.Method(AccessTools.TypeByName("MapReconClearer"), "Register");
+                if (reg != null) { _harmony.Patch(reg, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnReconRegionRegistered))); Log.LogInfo("[sim] PvP recon-region patched (MapReconClearer.Register postfix — captures the scout's photo footprint)"); }
+                else Log.LogWarning("[sim] MapReconClearer.Register not found — scout footprint falls back to dialed-circle reveal");
+            }
+            catch (Exception e) { Log.LogWarning("[sim] recon-region patch: " + e.Message); }
 
             // SCORE / OUTCOME: the host replays mission complete/fail onto the client so the result screens match.
             // CoopScore broadcasts (host-only); the client's replay re-hits these postfixes but bails on !IsHost.

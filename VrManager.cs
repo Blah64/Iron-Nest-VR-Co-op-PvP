@@ -65,7 +65,7 @@ namespace IronNestVR
             try { Notify.DrawFlat(); } catch { }   // non-focus-pulling "X joined" toast (flatscreen)
             try { PvpHud.DrawFlat(); } catch { }   // dev PvP duel readout (non-public builds, in a PvP mission)
 #if !PUBLIC_BUILD
-            try { PvpTeams.DrawPanel(); } catch { }  // dev flatscreen team roster / slot picker (PvP lobby; VR panel TBD)
+            try { PvpTeams.DrawPanel(); } catch { }  // dev flatscreen team roster / slot picker (PvP lobby; the VR teams view is VrRosterPanel.BuildPvp)
 #endif
         }
 

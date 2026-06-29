@@ -57,7 +57,7 @@ namespace IronNestVR
         private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
         private const byte MSG_POWDER = 39;  // [t][side u8][charges i32]    reliable   per-gun powder/charge state, EITHER→peer (symmetric, last-writer-wins)
         private const byte MSG_AIM = 41;     // [t][desRot f32][turretElev f32][gunLElev f32][gunRElev f32]  reliable  EITHER→peer, symmetric firing-solution edge-replicate (40=entities ENTSET). The FDC graph resolves the aim with NO drag, so it never rides the drag-owned MSG_GROUP stream → the peer kept its stale default and missed.
-        // 42-44 = PvP (PVP_POS/PVP_HIT/PVP_TEAM).
+        // 42-44 = PvP (PVP_POS/PVP_HIT/PVP_TEAM); 50 = PVP_SPAWN (host->all randomized team spawn grids).
         private const byte MSG_TURRET_POS = 45;  // [t][gridX f32][gridY f32]  reliable  HOST→client, host-authoritative turret MAP ORIGIN (turretBase.anchoredPosition). Edge-on-change (throttled) + ~2s heal beat. NOT client-authored (never relayed): the host is the sole author and Send() already fans out to every client. Bug 1 (cross-player divergence): identical aim/range lands at a different MAP point when each machine's turret sits at a different origin.
         private const byte MSG_RELOAD_STATE = 46;  // [t][side u8][stateIdx u8][loaded u8 (0/1)][powder i32]  reliable  EITHER→peer, symmetric per-gun reload state. The reload is animation-gated (click-replay can't drive a remote one — it stalls), so we replicate the AUTHORITATIVE state and the peer reaches it through the game's OWN paced AdvanceState() path (never pokes internals — eject corrupts). PLAN-reload §5. Co-op + same-team PvP LOAD direction.
 
@@ -1044,7 +1044,7 @@ namespace IronNestVR
         public static bool IsGlobalType(byte type)
         {
             return type == CoopScene.MSG_MISSION_START || type == CoopScene.MSG_MISSION_END || type == CoopScene.MSG_MISSION_READY
-                || type == PvpPlayers.MSG_PVP_POS || type == PvpCombat.MSG_PVP_HIT || type == PvpTeams.MSG_PVP_TEAM
+                || type == PvpPlayers.MSG_PVP_POS || type == PvpPlayers.MSG_PVP_SPAWN || type == PvpCombat.MSG_PVP_HIT || type == PvpTeams.MSG_PVP_TEAM
                 || type == CoopNetDiag.MSG_DIGEST;
         }
 
@@ -1332,7 +1332,7 @@ namespace IronNestVR
                              || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_CONSUME
                              || type == CoopPunchcards.MSG_PUNCH_GRAPH || type == CoopPunchcards.MSG_PUNCH_DIAL) CoopPunchcards.OnPacket(type, origin, a, len);
                     else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
-                    else if (type == PvpPlayers.MSG_PVP_POS) PvpPlayers.OnPacket(type, origin, a, len);
+                    else if (type == PvpPlayers.MSG_PVP_POS || type == PvpPlayers.MSG_PVP_SPAWN) PvpPlayers.OnPacket(type, origin, a, len);
                     else if (type == PvpCombat.MSG_PVP_HIT) PvpCombat.OnPacket(type, origin, a, len);
                     else if (type == PvpTeams.MSG_PVP_TEAM) PvpTeams.OnPacket(type, origin, a, len);
                     else if (type == SteamNet.MSG_KICK) SteamNet.OnPacket(type, origin, a, len);
