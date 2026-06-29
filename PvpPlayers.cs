@@ -422,9 +422,11 @@ namespace IronNestVR
             if (m == null) return;
             health = Clamp(health);
             if (m.Health == health) return;
+            float before = m.Health;
             m.Health = health;
             try { if (m.Entity != null) { m.Entity.Health = HpInt(health); m.Entity.State = StateForHealth(health); } } catch { }
             try { if (m.Loc != null) m.Loc.RecalculateAndRegister(false); } catch { }
+            if (health < before) { try { ReportEnemyHit(health); } catch { } }   // our team just landed a hit on this enemy
         }
 
         // ACQUISITION (recon-card spotting, the real mechanic — replaces the old always-on RevealMirrors cheat). The
@@ -885,6 +887,7 @@ namespace IronNestVR
             _teamHealth = Clamp(_teamHealth - dmg);
             Diagnostics.V($"[pvp] team took {dmg:0.#} damage from peer {from} ({before:0.#} -> {_teamHealth:0.#})");
             try { PvpEffects.OnTeamHit(before - _teamHealth, _teamHealth); } catch { }   // captain's own hit cue
+            try { ReportTeamHit(_teamHealth); } catch { }   // teleprinter: we are hit + remaining strength (captain)
             if (_teamHealth <= 0f) { _eliminated = true; Log.LogWarning("[pvp] === YOUR TEAM WAS ELIMINATED ==="); }
             try { BroadcastMyPosition(); } catch { }   // immediate health keyframe (captain) → attacker + teammates
         }
@@ -897,7 +900,7 @@ namespace IronNestVR
             float drop = _teamHealth - health;
             _teamHealth = health;
             _eliminated = health <= 0f;
-            if (drop > 0f) { try { PvpEffects.OnTeamHit(drop, health); } catch { } }   // teammate feels the captain's hit
+            if (drop > 0f) { try { PvpEffects.OnTeamHit(drop, health); } catch { } try { ReportTeamHit(health); } catch { } }   // teammate feels the captain's hit
         }
 
         private static bool SafeAmICaptain() { try { return PvpTeams.AmICaptain; } catch { return false; } }
@@ -1095,6 +1098,33 @@ namespace IronNestVR
         // exactly what we want: each crew member's printer reports their own (shared-team) battery position.
         private static void AnnounceTurretPosition(Vector2 grid, bool deployed)
         {
+            string label = GridLabel(grid);
+            PrintTeleprinter("PVP_BATTERY", deployed ? "FRIENDLY BATTERY DEPLOYED" : "FRIENDLY BATTERY RELOCATED", $"OWN POSITION  GRID {label}");
+            Diagnostics.V($"[pvp] teleprinter: own battery {(deployed ? "DEPLOYED" : "RELOCATED")} at GRID {label} ({grid.x:0.0},{grid.y:0.0} km)");
+        }
+
+        // Our shell landed on an enemy battery (its shared-team HP just dropped) — confirm the hit + the enemy's
+        // remaining strength on the (local) teleprinter. Fires on every member of our team (each holds the enemy mirror)
+        // and regardless of fog: it's hit confirmation, NOT a position reveal (the enemy grid is only on the map once
+        // recon/STAR spots it). Driven from ApplyMirrorHealth on a health DROP.
+        private static void ReportEnemyHit(float health)
+        {
+            if (health <= 0f) PrintTeleprinter("PVP_REPORT", "ENEMY BATTERY DESTROYED", "TARGET NEUTRALISED");
+            else PrintTeleprinter("PVP_REPORT", "ENEMY BATTERY HIT", $"ENEMY STRENGTH  {health:0.#}/{MaxHealth:0.#}");
+        }
+
+        // An enemy shell hit US — report it + our remaining strength on the (local) teleprinter. Fires on every member
+        // of our team: the captain from ApplyTeamDamage, teammates from AdoptTeamHealth (the captain's keyframe).
+        private static void ReportTeamHit(float newHealth)
+        {
+            if (newHealth <= 0f) PrintTeleprinter("PVP_REPORT", "FRIENDLY BATTERY ELIMINATED", "WE ARE OUT OF ACTION");
+            else PrintTeleprinter("PVP_REPORT", "INCOMING - WE ARE HIT", $"FRIENDLY STRENGTH  {newHealth:0.#}/{MaxHealth:0.#}");
+        }
+
+        // Submit 1-2 field-report lines to the (local) Primary teleprinter, shared by every PvP report. PvP teleprinters
+        // are per-player (CoopOrders' replicate + blank both bail on PvpActive), so this prints only on this machine.
+        private static void PrintTeleprinter(string sourceId, string line1, string line2)
+        {
             try
             {
                 Teleprinter tp = null;
@@ -1103,17 +1133,14 @@ namespace IronNestVR
                 {
                     try { var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<Teleprinter>(), FindObjectsSortMode.None); if (arr != null && arr.Length > 0) tp = arr[0].TryCast<Teleprinter>(); } catch { }
                 }
-                if (tp == null) { Log.LogWarning("[pvp] no teleprinter to report battery position"); return; }
-
-                string label = GridLabel(grid);
+                if (tp == null) { Log.LogWarning("[pvp] no teleprinter for report '" + line1 + "'"); return; }
                 var lines = new Il2CppSystem.Collections.Generic.List<string>();
-                lines.Add(deployed ? "FRIENDLY BATTERY DEPLOYED" : "FRIENDLY BATTERY RELOCATED");
-                lines.Add($"OWN POSITION  GRID {label}");
-                tp.SubmitLines("PVP_BATTERY", lines.Cast<Il2CppSystem.Collections.Generic.IEnumerable<string>>(), null, false);
+                lines.Add(line1);
+                if (!string.IsNullOrEmpty(line2)) lines.Add(line2);
+                tp.SubmitLines(sourceId, lines.Cast<Il2CppSystem.Collections.Generic.IEnumerable<string>>(), null, false);
                 tp.TryStart(false);
-                Diagnostics.V($"[pvp] teleprinter: own battery {(deployed ? "DEPLOYED" : "RELOCATED")} at GRID {label} ({grid.x:0.0},{grid.y:0.0} km)");
             }
-            catch (Exception e) { Log.LogWarning("[pvp] battery report: " + e.Message); }
+            catch (Exception e) { Log.LogWarning("[pvp] teleprinter print: " + e.Message); }
         }
 
         // Format an FMR-local grid position (km; 1 unit = 1 major cell) as the game's grid reference. Convention

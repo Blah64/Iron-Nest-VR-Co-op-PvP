@@ -1,5 +1,6 @@
-# IRON NEST VR & CO-OP
-This mod lets players play in VR and to play cooperative multiplayer with up to 3 other players in the same Iron Nest.
+# IRON NEST VR, CO-OP & PVP
+This mod lets players play in VR and to play cooperative or competitive multiplayer with up to 3 other players in the same nest for co-op or split between 2
+nests for PvP.
 Crossplay is supported with flatscreen players.
 
 > This package contains **only the mod**. You install BepInEx yourself first
@@ -21,9 +22,10 @@ BepInEx 5 (Mono).
    files), then quit.
 
 ## 2. Install this mod
-Copy everything inside this package's **`game-files`** folder into that same game
-folder (say **Yes** to merge). This adds:
-- `openxr_loader.dll` in the game root — the OpenXR loader the VR layer needs, and
+Extract this zip's contents directly into your game folder (the one containing
+`Iron Nest Heavy Turret Simulator.exe`), choosing **Yes / Replace** if asked to
+merge. That's it — it drops in:
+- `openxr_loader.dll` next to the game `.exe` — the OpenXR loader the VR layer needs, and
 - the mod under `BepInEx\plugins\IronNestVR\`.
 
 ## 3. Set launch options (required)

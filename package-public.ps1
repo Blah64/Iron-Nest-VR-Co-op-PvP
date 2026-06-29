@@ -29,11 +29,11 @@ if (-not $NoBuild) {
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 }
 
-# 2. Stage a plugin-only overlay.
+# 2. Stage a plugin-only overlay whose layout mirrors the game directory, so the
+#    zip extracts straight into the game folder (no intermediate "game-files" folder).
 $stage     = Join-Path $env:TEMP ("invr_pub_" + [System.Guid]::NewGuid().ToString("N"))
-$pkg       = "$stage\IRON-NEST-VR-Mod"
-$gf        = "$pkg\game-files"
-$pluginDst = "$gf\BepInEx\plugins\IronNestVR"
+$pkg       = "$stage\pkg"
+$pluginDst = "$pkg\BepInEx\plugins\IronNestVR"
 New-Item -ItemType Directory -Force -Path $pluginDst | Out-Null
 
 Copy-Item $readme "$pkg\README.md" -Force
@@ -41,7 +41,7 @@ Copy-Item $readme "$pkg\README.md" -Force
 # openxr_loader.dll -> game root (VR native dependency; not part of the base demo or BepInEx).
 $oxr = Join-Path $game "openxr_loader.dll"
 if (-not (Test-Path $oxr)) { throw "required game-root file missing: $oxr" }
-Copy-Item $oxr $gf -Force
+Copy-Item $oxr $pkg -Force
 
 # The plugin itself -> BepInEx\plugins\IronNestVR.
 # Stage ONLY known canonical files - never robocopy the deployed folder, which is mutable
@@ -66,7 +66,7 @@ if (-not (Test-Path "$pluginDst\hands.bundle"))     { throw "required file missi
 # 3. Zip it.
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path $pkg -DestinationPath $zip -CompressionLevel Optimal
+Compress-Archive -Path "$pkg\*" -DestinationPath $zip -CompressionLevel Optimal
 Remove-Item $stage -Recurse -Force
 
 $z = Get-Item $zip
