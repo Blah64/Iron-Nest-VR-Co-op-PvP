@@ -42,9 +42,14 @@ namespace IronNestVR
         private enum Result { None, Won, Lost }
         private static Result _result = Result.None;
 
-        private sealed class Mirror { public ulong Origin; public string ID; public GameObject Go; public EntityLocation Loc; public MapEntity Entity; public Vector2 Grid; public int Health; public CanvasGroup Vis; public float RevealUntil; }
+        // Grid = the enemy's LIVE position (rides in on every POS keyframe) — hit adjudication (CollectHits) uses this so
+        // you must shell where they ACTUALLY are. RevealedGrid = the position FROZEN at the moment a recon spotted them —
+        // the on-map icon is drawn here and only re-snapshots when re-scouted (last-known-position intel, not a live track).
+        private sealed class Mirror { public ulong Origin; public string ID; public GameObject Go; public EntityLocation Loc; public MapEntity Entity; public Vector2 Grid; public Vector2 RevealedGrid; public bool HasRevealedPos; public int Health; public CanvasGroup Vis; public float RevealUntil; }
 
-        private const float ReconRevealSec = 12f;   // how long a recon sweep keeps the enemy spotted before it re-fogs
+        private const float ReconRevealSec = 30f;   // how long a recon photo keeps a spotted enemy visible before it re-fogs
+                                                      // (generous — the player redeems at the console then walks to the map)
+        private const float PhotoRadius = 4f;        // grid-units around the dialed recon target a scout photo can spot
         private static readonly Dictionary<ulong, Mirror> _mirrors = new Dictionary<ulong, Mirror>();
         private static readonly List<ulong> _toRemove = new List<ulong>();
 
@@ -61,6 +66,20 @@ namespace IronNestVR
         private static int _sent, _spawned, _moved;
         private static bool _turretPlaced;   // pinned my turret to MyGrid this match?
         private static float _placeTurretAt;  // when to attempt placement (settle delay after entering the arena)
+
+#if !PUBLIC_BUILD
+        // RECON FOOTPRINT TELEMETRY (dev only) — after a scout-plane run, capture WHERE the photos actually land so the
+        // reveal can match the real footprint instead of a guessed circle. Logs, in grid space: fog tiles that get
+        // cleared, the plane clone's flight path, and recon handle/clearer counts. Pure observation; doesn't reveal.
+        private static float _reconWatchUntil;
+        private static float _nextReconLog;
+        private static Transform _reconFmr;
+        private static string _planeName;
+        private static readonly Dictionary<int, Vector2> _fogSnap = new Dictionary<int, Vector2>();   // fog tile id -> grid at run start
+        private static readonly HashSet<int> _fogCleared = new HashSet<int>();                          // tiles gone since start
+        private static readonly HashSet<int> _handleSnap = new HashSet<int>();                          // recon handle ids present at run start
+        private static readonly HashSet<int> _handleSeen = new HashSet<int>();                          // NEW handles already logged this run
+#endif
 
         // ---------------- per-frame ----------------
 
@@ -99,6 +118,9 @@ namespace IronNestVR
                 PruneNonCaptainMirrors();   // reap a non-captain's stale mirror once the roster is known
                 CheckMatchEnd();            // declare win/lose from the team-health state
                 ApplyMirrorVisibility();    // ACQUISITION: enemy is fog-hidden until a recon card reveals it (OnReconReveal)
+#if !PUBLIC_BUILD
+                if (_reconWatchUntil > 0f) ReconWatchTick(now);   // capture the REAL photo footprint after a scout run
+#endif
             }
             catch (Exception e) { Log.LogWarning("[pvp] tick: " + e.Message); }
         }
@@ -193,7 +215,7 @@ namespace IronNestVR
             try { ImpactTracker.RegisterEntity(loc); } catch (Exception ex) { Log.LogWarning("[pvp] RegisterEntity: " + ex.Message); }
 
             CanvasGroup vis = null; try { vis = loc.VisibilityGroup; } catch { }
-            _mirrors[origin] = new Mirror { Origin = origin, ID = id, Go = go, Loc = loc, Entity = e, Grid = grid, Health = health, Vis = vis };
+            _mirrors[origin] = new Mirror { Origin = origin, ID = id, Go = go, Loc = loc, Entity = e, Grid = grid, RevealedGrid = grid, HasRevealedPos = false, Health = health, Vis = vis };
             _spawned++;
             // (render-state dump retired — marker rendering is confirmed; RevealMirrors keeps it through fog)
             Log.LogInfo($"[pvp] spawned player mirror '{id}' at grid ({grid.x:0.0},{grid.y:0.0}) hp={health} <- peer {origin}");
@@ -202,11 +224,22 @@ namespace IronNestVR
         private static void MoveMirror(Mirror m, Vector2 grid)
         {
             if ((m.Grid - grid).sqrMagnitude < 0.0001f) return;   // unchanged
-            m.Grid = grid;
-            try { if (m.Entity != null) m.Entity.Position = new Vector3(grid.x, grid.y, 0f); } catch { }
-            try { if (m.Go != null) m.Go.transform.localPosition = new Vector3(grid.x, grid.y, 0f); } catch { }
-            try { if (m.Loc != null) m.Loc.RecalculateAndRegister(false); } catch { }
+            m.Grid = grid;   // LIVE position only — drives hit adjudication. The on-map ICON is NOT moved here: it stays
+                             // frozen at the last scouted position (RevealedGrid) until a recon re-snapshots it. Re-scout
+                             // to see where they went. (SnapshotRevealPos is the only place the icon transform moves.)
             _moved++;
+        }
+
+        // Freeze the on-map icon at the enemy's CURRENT live position — called when a recon reveal spots this mirror, so
+        // the marker shows where they were AT SCOUT TIME and holds there (it doesn't track their live movement). Re-
+        // scouting calls this again to refresh the snapshot to their new position.
+        private static void SnapshotRevealPos(Mirror m)
+        {
+            if (m == null) return;
+            m.RevealedGrid = m.Grid; m.HasRevealedPos = true;
+            try { if (m.Entity != null) m.Entity.Position = new Vector3(m.Grid.x, m.Grid.y, 0f); } catch { }
+            try { if (m.Go != null) m.Go.transform.localPosition = new Vector3(m.Grid.x, m.Grid.y, 0f); } catch { }
+            try { if (m.Loc != null) m.Loc.RecalculateAndRegister(false); } catch { }
         }
 
         // Reflect the victim's authoritative health (rode in on their POS keyframe) onto their mirror on THIS map.
@@ -241,26 +274,254 @@ namespace IronNestVR
             }
         }
 
-        // Harmony POSTFIX target (registered in CoopSim) on the recon fog-clear — MapReconClearer.ClearAll /
-        // MapReconClearHandle.DestroyAll. A player redeemed a recon requisition card → its (card-gated) scout plane swept
-        // → fog cleared → spot every enemy mirror for ReconRevealSec. There's one mirror per enemy team (the captain), so
-        // "all" = the enemy team(s). They re-fog after the window → recon again (or after they've relocated) to re-acquire.
-        // In a bare PvP arena the ONLY thing that clears recon fog is a player recon card (scripted scout planes are
-        // suppressed), so an unconditional reveal here is safe. Inert outside a live PvP mission.
-        private static float _nextReconLog;
+        // Harmony POSTFIX target (registered in CoopSim) on State_SpawnScoutPlane.OnEnter — a SCOUT-PLANE recon card just
+        // launched its photo run. A scout plane spots only the units INSIDE its photo footprint, so we reveal just the
+        // enemy mirrors near the player's DIALED recon target (CoopPunchcards.TryGetReconTarget reads the Coordinate the
+        // player set on the requisition console), not a blanket reveal. Gated to a PvP card window so a mission-scripted
+        // plane can't trigger it. The FORWARD OBSERVER uses a DIFFERENT node (State_SpawnMapEntity), so it never reaches
+        // here — it correctly does NOT reveal the enemy on the map; it only reports its spotting to the teleprinter.
+        public static void OnScoutPlanePhoto(SleepyNodes.State_SpawnScoutPlane __instance)
+        {
+            try
+            {
+                if (!Active() || _mirrors.Count == 0) return;
+                bool card = false; try { card = PvpMatch.CardGraphActive(); } catch { }
+                if (!card) return;   // mission-scripted plane, not a player recon card — ignore
+
+#if !PUBLIC_BUILD
+                try { ArmReconWatch(__instance); } catch (Exception e) { Log.LogWarning("[pvp-recon] arm: " + e.Message); }
+#endif
+
+                // Where did the plane photograph? Prefer the player's DIALED recon coordinate (a Coordinate
+                // PunchcardVariable). If the card carried no dialed coordinate, fall back to the node's own
+                // LocationToSpawn (the scripted/inline spawn grid the plane flies over).
+                bool have = CoopPunchcards.TryGetReconTarget(out Vector2 center);
+                if (!have || center == Vector2.zero)
+                {
+                    if (TryGetNodeGrid(__instance, out Vector2 nodeGrid))
+                    {
+                        center = nodeGrid; have = true;
+#if !PUBLIC_BUILD
+                        Log.LogInfo($"[pvp] scout-plane: using node LocationToSpawn grid ({center.x:0.#},{center.y:0.#}) (dial gave nothing usable)");
+#endif
+                    }
+                }
+
+                if (!have)
+                {
+                    Log.LogWarning("[pvp] scout-plane recon: no recon coordinate found (no Coordinate variable dialed, no inline node grid) — nothing spotted");
+                    return;
+                }
+
+                int n = RevealMirrorsNear(center, PhotoRadius);
+#if !PUBLIC_BUILD
+                foreach (var kv in _mirrors) { var m = kv.Value; if (m == null) continue; float d = Vector2.Distance(m.Grid, center); Log.LogInfo($"[pvp]   photo vs mirror '{m.ID}' grid ({m.Grid.x:0.0},{m.Grid.y:0.0}) dist={d:0.0} r={PhotoRadius:0.0} -> {(d <= PhotoRadius ? "SPOTTED" : "not in photo")}"); }
+#endif
+                Log.LogInfo($"[pvp] scout-plane recon photo @ ({center.x:0.0},{center.y:0.0}) r={PhotoRadius:0.0} -> spotted {n} unit(s) for {ReconRevealSec:0}s");
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] scout photo: " + e.Message); }
+        }
+
+        // Fallback recon target: read the scout-plane node's own LocationToSpawn. When it's an INLINE grid we use it
+        // directly; a CONTEXT location is logged but can't be resolved without the live mission graph (the dialed
+        // PunchcardVariable is the right source in that case). Best-effort + diagnostic; wrapped so any interop quirk
+        // just disables the fallback rather than throwing.
+        private static bool TryGetNodeGrid(SleepyNodes.State_SpawnScoutPlane node, out Vector2 grid)
+        {
+            grid = Vector2.zero;
+            try
+            {
+                var loc = node != null ? node.LocationToSpawn : null;
+                if (loc == null) return false;
+                int lt = (int)loc.LocationType;   // 0 = GridLocation, 1 = ContextLocation
+#if !PUBLIC_BUILD
+                Log.LogInfo($"[pvp]   node LocationToSpawn type={lt}");
+#endif
+                if (lt == 0)
+                {
+                    var gl = loc.GridLocation;
+                    if (gl != null)
+                    {
+                        int sel = (int)gl.SelectionType;   // 0 = Inline, 1 = Context
+                        if (sel == 0)
+                        {
+                            var v = gl.Value;
+                            if (v != null) { grid = new Vector2(v.X, v.Y);
+#if !PUBLIC_BUILD
+                                Log.LogInfo($"[pvp]   node inline grid ({grid.x:0.#},{grid.y:0.#})");
+#endif
+                                return grid != Vector2.zero; }
+                        }
+#if !PUBLIC_BUILD
+                        else { string ck = null; try { ck = gl.ContextKey; } catch { } Log.LogInfo($"[pvp]   node GridLocation is a Context key='{ck}' (resolve via the dialed PunchcardVariable instead)"); }
+#endif
+                    }
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[pvp] node grid: " + e.Message); }
+            return false;
+        }
+
+        // Reveal enemy mirrors within `radius` grid-units of `center` (the photo footprint) for ReconRevealSec; returns
+        // how many were in the photo. Mirrors outside it stay fogged (the scout plane only spots what it photographed).
+        private static int RevealMirrorsNear(Vector2 center, float radius)
+        {
+            float until = Time.unscaledTime + ReconRevealSec;
+            float r2 = radius * radius; int n = 0;
+            foreach (var kv in _mirrors) { var m = kv.Value; if (m == null) continue; if ((m.Grid - center).sqrMagnitude <= r2) { m.RevealUntil = until; SnapshotRevealPos(m); n++; } }
+            return n;
+        }
+
+#if !PUBLIC_BUILD
+        // ---------------- recon footprint telemetry (dev only) ----------------
+
+        // Snapshot the fog/recon state at the moment a scout plane launches, so ReconWatchTick can diff against it and
+        // report WHERE the photos actually clear/land (in grid space) over the plane's flight. Observation only.
+        private static void ArmReconWatch(SleepyNodes.State_SpawnScoutPlane node)
+        {
+            _reconFmr = ResolveParent();
+            _fogSnap.Clear(); _fogCleared.Clear(); _planeName = null;
+            try { var pf = node != null ? node.PlanePrefab : null; if (pf != null) _planeName = pf.name; } catch { }
+
+            int tiles = 0;
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearChild>(), FindObjectsSortMode.None);
+                if (arr != null) for (int i = 0; i < arr.Length; i++)
+                {
+                    var c = arr[i].TryCast<MapReconClearChild>(); if (c == null) continue;
+                    var go = c.gameObject; if (go == null) continue;
+                    _fogSnap[go.GetInstanceID()] = ReconToGrid(c.transform.position); tiles++;
+                }
+            }
+            catch { }
+
+            int handles = 0, active = 0;
+            _handleSnap.Clear(); _handleSeen.Clear();
+            try
+            {
+                var hs = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearHandle>(), FindObjectsSortMode.None);
+                if (hs != null) { handles = hs.Length; for (int i = 0; i < hs.Length; i++) { var h = hs[i].TryCast<MapReconClearHandle>(); if (h == null) continue; var go = h.gameObject; if (go != null) _handleSnap.Add(go.GetInstanceID()); } }
+            }
+            catch { }
+            try { var cl = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearer>(), FindObjectsSortMode.None); if (cl != null) for (int i = 0; i < cl.Length; i++) { var c = cl[i].TryCast<MapReconClearer>(); if (c != null) { try { active += c.ActiveCount; } catch { } } } } catch { }
+
+            _reconWatchUntil = Time.unscaledTime + 8f;
+            _nextReconLog = 0f;
+            Log.LogInfo($"[pvp-recon] watch armed: plane='{_planeName}' fogTiles={tiles} reconHandles={handles} clearerActive={active} fmr={(_reconFmr != null)}");
+            foreach (var kv in _mirrors) { var m = kv.Value; if (m != null) Log.LogInfo($"[pvp-recon]   enemy mirror '{m.ID}' at grid ({m.Grid.x:0.0},{m.Grid.y:0.0})"); }
+        }
+
+        // Dump a recon handle's footprint in grid space: its own transform position + each managed child (the cells the
+        // photo covers). The NEW handle created by a scout run IS the photographed region — its children's grids are the
+        // exact footprint we want the reveal to match.
+        private static void DumpHandle(MapReconClearHandle h, string tag)
+        {
+            if (h == null) return;
+            Vector2 hg = Vector2.zero; try { hg = ReconToGrid(h.transform.position); } catch { }
+            int cc = 0; string pts = "";
+            try
+            {
+                var ch = h._allChildren;
+                if (ch != null)
+                {
+                    cc = ch.Count;
+                    for (int i = 0; i < ch.Count && i < 16; i++)
+                    {
+                        var c = ch[i]; if (c == null) continue;
+                        Vector2 g = Vector2.zero; try { g = ReconToGrid(c.transform.position); } catch { }
+                        pts += $" ({g.x:0.0},{g.y:0.0})";
+                    }
+                }
+            }
+            catch { }
+            Log.LogInfo($"[pvp-recon]   {tag} handle @ grid ({hg.x:0.0},{hg.y:0.0}) children={cc}:{pts}");
+        }
+
+        // Each poll during the watch: report fog tiles that have disappeared (cleared = photographed) with their grid,
+        // the plane clone's path, and live handle/clearer counts. The union of cleared-tile grids is the real footprint.
+        private static void ReconWatchTick(float now)
+        {
+            if (now >= _reconWatchUntil) { _reconWatchUntil = 0f; Log.LogInfo($"[pvp-recon] watch done: {_fogCleared.Count} fog tile(s) cleared total"); return; }
+            if (now < _nextReconLog) return;
+            _nextReconLog = now + 0.5f;
+
+            var present = new HashSet<int>();
+            int tilesNow = 0;
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearChild>(), FindObjectsSortMode.None);
+                if (arr != null) for (int i = 0; i < arr.Length; i++)
+                {
+                    var c = arr[i].TryCast<MapReconClearChild>(); if (c == null) continue;
+                    var go = c.gameObject; if (go == null) continue;
+                    present.Add(go.GetInstanceID()); tilesNow++;
+                }
+            }
+            catch { }
+
+            int newly = 0;
+            foreach (var kv in _fogSnap)
+            {
+                if (!present.Contains(kv.Key) && !_fogCleared.Contains(kv.Key))
+                {
+                    _fogCleared.Add(kv.Key); newly++;
+                    Log.LogInfo($"[pvp-recon]   fog CLEARED @ grid ({kv.Value.x:0.0},{kv.Value.y:0.0})");
+                }
+            }
+
+            // NEW recon handle(s) = the region(s) this scout run revealed. Dump each once — its children's grids are the
+            // exact photo footprint the reveal should match (fog tiles don't get destroyed, so this is the real signal).
+            try
+            {
+                var hs = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapReconClearHandle>(), FindObjectsSortMode.None);
+                if (hs != null) for (int i = 0; i < hs.Length; i++)
+                {
+                    var h = hs[i].TryCast<MapReconClearHandle>(); if (h == null) continue;
+                    var go = h.gameObject; if (go == null) continue;
+                    int id = go.GetInstanceID();
+                    if (_handleSnap.Contains(id) || _handleSeen.Contains(id)) continue;
+                    _handleSeen.Add(id);
+                    DumpHandle(h, "NEW");
+                }
+            }
+            catch { }
+
+            // plane clone flight path (best-effort name match — there's no dedicated scout-plane component)
+            if (!string.IsNullOrEmpty(_planeName))
+            {
+                try
+                {
+                    var clone = GameObject.Find(_planeName + "(Clone)");
+                    if (clone == null) clone = GameObject.Find(_planeName);
+                    if (clone != null) { var g = ReconToGrid(clone.transform.position); Log.LogInfo($"[pvp-recon]   plane @ grid ({g.x:0.0},{g.y:0.0})"); }
+                }
+                catch { }
+            }
+
+            if (newly > 0 || tilesNow != _fogSnap.Count)
+                Log.LogInfo($"[pvp-recon] tilesNow={tilesNow} (snap={_fogSnap.Count}) clearedTotal={_fogCleared.Count}");
+        }
+
+        private static Vector2 ReconToGrid(Vector3 world)
+        {
+            try { if (_reconFmr != null) { var l = _reconFmr.InverseTransformPoint(world); return new Vector2(l.x, l.y); } } catch { }
+            return new Vector2(world.x, world.y);
+        }
+
+        // DEV force-spot ALL enemy mirrors (Ctrl+Shift+R) — exercise the move/hit lane without flying a real recon photo.
         public static void OnReconReveal()
         {
             try
             {
                 if (!Active() || _mirrors.Count == 0) return;
-                float now = Time.unscaledTime;
-                float until = now + ReconRevealSec;
-                foreach (var kv in _mirrors) { var m = kv.Value; if (m != null) m.RevealUntil = until; }
-                // A sweep clears many fog handles in one frame (this postfix fires per handle) — throttle the log.
-                if (now >= _nextReconLog) { _nextReconLog = now + 1f; Log.LogInfo($"[pvp] RECON sweep — enemy spotted for {ReconRevealSec:0}s ({_mirrors.Count} mirror(s))"); }
+                float until = Time.unscaledTime + ReconRevealSec;
+                foreach (var kv in _mirrors) { var m = kv.Value; if (m != null) { m.RevealUntil = until; SnapshotRevealPos(m); } }
+                Log.LogInfo($"[pvp] DEV reveal-all — {_mirrors.Count} mirror(s) spotted for {ReconRevealSec:0}s");
             }
-            catch (Exception e) { Log.LogWarning("[pvp] recon reveal: " + e.Message); }
+            catch (Exception e) { Log.LogWarning("[pvp] dev reveal: " + e.Message); }
         }
+#endif
 
         // ---------------- damage (Phase 2 shot lane, victim-authoritative) ----------------
 

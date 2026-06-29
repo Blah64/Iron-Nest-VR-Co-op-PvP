@@ -557,23 +557,12 @@ namespace IronNestVR
                 // mod-spawned mirror in OnRequisitionTrigger when the redeem confirms success.
                 if (Config.PvpActive)
                 {
+                    // Each player redeems locally; arm the card-graph window (lets this card's State_MoveTurret /
+                    // State_SpawnScoutPlane / forward-observer State_SpawnMapEntity node run). The scout-plane RECON
+                    // reveal is handled where State_SpawnScoutPlane fires (PvpPlayers.OnScoutPlanePhoto, area-limited to
+                    // the photo footprint) — NOT here — so the forward observer (a different node) never reveals the map;
+                    // it only reports to the teleprinter, exactly like base game.
                     try { PvpMatch.NoteCardRedeem(); } catch { }
-                    // RECON card → SPOT the enemy on our map. The native scout-plane photo reveals native fog only (no
-                    // native enemy exists in a duel), so we reveal our mod-spawned mirror ourselves. Done in THIS PREFIX
-                    // (guaranteed to run on lever-pull — the success postfix OnRequisitionTrigger did NOT fire for these
-                    // redeems, so the reveal never happened). The forward observer has its own native spotter; this is
-                    // mainly what makes the one-shot scout PLANE actually spot the enemy. Logs the card id + IsRecon.
-                    try
-                    {
-                        var c = SafeCurrentCard(__instance);
-                        var d = c != null ? c.CurrentDefinition : null;
-                        bool recon = d != null && d.IsRecon;
-#if !PUBLIC_BUILD
-                        Log.LogInfo($"[pvp] requisition redeem: card='{(d != null ? d.ID : "?")}' isRecon={recon}");
-#endif
-                        if (recon) PvpPlayers.OnReconReveal();
-                    }
-                    catch (Exception e) { Log.LogWarning("[pvp] recon stage: " + e.Message); }
                     return true;
                 }
                 if (!Config.CoopPunchcardSync || !Config.CoopPunchcardRedeemSync) return true;
@@ -671,6 +660,42 @@ namespace IronNestVR
         {
             try { if (!slot.HasCard) return null; } catch { }
             try { return slot.CurrentCard; } catch { return null; }
+        }
+
+        // PvP scout-plane recon: the grid coordinate the player DIALED on the requisition console (a Coordinate
+        // PunchcardVariable, VariableType==Coordinate(3)) = where the scout photo looks. PvpPlayers.OnScoutPlanePhoto
+        // reveals enemy mirrors near it. (X,Y) is integer map-grid space — the SAME space the mirror grids use
+        // (Team0/Team1Spawn live in this range), so a radius compare is valid.
+        //
+        // IMPORTANT: every PunchcardVariable carries a non-null VariableCoordinate GridReference regardless of its
+        // type, defaulting to (0,0). The old code grabbed the FIRST one and read (0,0) off a non-coordinate var. We
+        // now filter to Coordinate-typed variables and prefer a DIALED (non-zero) one.
+        public static bool TryGetReconTarget(out Vector2 grid)
+        {
+            grid = Vector2.zero;
+            bool found = false;          // any Coordinate-typed variable at all (even un-dialed (0,0))
+            try
+            {
+                var arr = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<PunchcardVariable>(), FindObjectsSortMode.None);
+                if (arr == null) return false;
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    var pv = arr[i].TryCast<PunchcardVariable>(); if (pv == null) continue;
+                    int vtype = -1; try { vtype = (int)pv.VariableType; } catch { }
+                    string vid = null; try { vid = pv.VariableID; } catch { }
+                    Vector2 c = Vector2.zero; bool hasCoord = false;
+                    try { var gr = pv.VariableCoordinate; if (gr != null) { c = new Vector2(gr.X, gr.Y); hasCoord = true; } } catch { }
+#if !PUBLIC_BUILD
+                    Log.LogInfo($"[punch]   var '{vid}' type={vtype} coord=({c.x:0.#},{c.y:0.#}){(vtype == 3 ? " [COORDINATE]" : "")}");
+#endif
+                    if (vtype != 3 || !hasCoord) continue;   // only Coordinate-typed vars hold a dialed recon target
+                    found = true;
+                    if (c != Vector2.zero) { grid = c; return true; }   // a dialed (non-zero) target — use it
+                    grid = c;                                            // remember (0,0) coordinate as a last resort
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[punch] recon target: " + e.Message); }
+            return found;   // true even if only an un-dialed (0,0) coordinate exists, so the caller can tell "dialed nothing" from "no recon card"
         }
 
         private static List<VarSnap> CaptureVariables()
@@ -1033,20 +1058,6 @@ namespace IronNestVR
         {
             _lastTrigger = success;
             _lastTriggerSet = true;
-
-            // PvP RECON: a successful recon-card redemption SPOTS the enemy on OUR map. The native scout plane reveals
-            // native fog (no native entity exists in a duel arena, and it doesn't drive MapReconClearer per the test
-            // log), so we reveal our mod-spawned mirror ourselves. Runs LOCALLY on whoever reconned (PvP cards run
-            // locally) → host and client each spot their own opponent. Consume the staging either way.
-            try
-            {
-                if (_pvpReconStaged)
-                {
-                    _pvpReconStaged = false;
-                    if (success && Config.PvpActive) PvpPlayers.OnReconReveal();
-                }
-            }
-            catch (Exception e) { Log.LogWarning("[punch] pvp recon: " + e.Message); }
 
             // RESULT replication: this fires synchronously inside AttemptRequisition with the verdict, for the host's
             // own redeem AND a client-forwarded one (RunRedeem). If it succeeded, broadcast the staged card + vars so

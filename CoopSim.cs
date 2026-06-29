@@ -237,22 +237,21 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[sim] requestfire hook: " + e.Message); }
 
-            // PvP ACQUISITION (recon-card spotting): in PvP the enemy turret mirror is fog-hidden until reconned. A recon
-            // requisition card spawns a scout plane (State_SpawnScoutPlane, card-gated above) whose sweep CLEARS the recon
-            // fog overlay by destroying its GameObjects — MapReconClearer.ClearAll iterates handles, MapReconClearHandle.
-            // DestroyAll clears one region. We postfix BOTH (whichever the plane drives) so the instant fog is cleared we
-            // reveal the enemy mirror for a spell (PvpPlayers.OnReconReveal — inert unless PvpActive). Reveal is OURS, not
-            // the native fog's, so it doesn't depend on whether a mod-spawned clone participates in the fog system.
+            // PvP ACQUISITION (scout-plane recon): the enemy turret mirror is fog-hidden until a SCOUT PLANE photographs it.
+            // When a scout-plane card launches its photo run (State_SpawnScoutPlane.OnEnter, card-gated above), a POSTFIX
+            // → PvpPlayers.OnScoutPlanePhoto reveals only the enemy mirrors INSIDE the photo footprint (near the player's
+            // dialed recon target), not a blanket reveal. The reveal is OURS (we own the mirror's visibility) so it doesn't
+            // depend on a mod-spawned clone participating in the native fog system. The FORWARD OBSERVER uses a different
+            // node (State_SpawnMapEntity) so it never reaches here — it correctly does NOT reveal the map, only the
+            // teleprinter, exactly like base game. (The earlier MapReconClearer.ClearAll/DestroyAll hooks never fired —
+            // the plane doesn't drive them — so they're replaced by this node postfix.)
             try
             {
-                int rn = 0;
-                var ca = AccessTools.Method(typeof(MapReconClearer), "ClearAll");
-                if (ca != null) { _harmony.Patch(ca, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnReconReveal))); rn++; }
-                var da = AccessTools.Method(typeof(MapReconClearHandle), "DestroyAll");
-                if (da != null) { _harmony.Patch(da, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnReconReveal))); rn++; }
-                Log.LogInfo($"[sim] PvP recon-reveal capture patched ({rn}/2 recon-clear method(s) — reveals enemy mirror on a recon sweep)");
+                var sp = AccessTools.Method(AccessTools.TypeByName("SleepyNodes.State_SpawnScoutPlane"), "OnEnter");
+                if (sp != null) { _harmony.Patch(sp, postfix: new HarmonyMethod(typeof(PvpPlayers), nameof(PvpPlayers.OnScoutPlanePhoto))); Log.LogInfo("[sim] PvP scout-plane recon patched (State_SpawnScoutPlane.OnEnter postfix — area reveal of photographed enemies)"); }
+                else Log.LogWarning("[sim] State_SpawnScoutPlane.OnEnter not found — scout-plane recon reveal off");
             }
-            catch (Exception e) { Log.LogWarning("[sim] recon-reveal patch: " + e.Message); }
+            catch (Exception e) { Log.LogWarning("[sim] scout-plane recon patch: " + e.Message); }
 
             // SCORE / OUTCOME: the host replays mission complete/fail onto the client so the result screens match.
             // CoopScore broadcasts (host-only); the client's replay re-hits these postfixes but bails on !IsHost.
