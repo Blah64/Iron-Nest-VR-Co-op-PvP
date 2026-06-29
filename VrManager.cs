@@ -64,9 +64,7 @@ namespace IronNestVR
             try { PvpEffects.DrawFlat(); } catch { }  // PvP damage red-flash (under the HUD/toast; shipping game-feel)
             try { Notify.DrawFlat(); } catch { }   // non-focus-pulling "X joined" toast (flatscreen)
             try { PvpHud.DrawFlat(); } catch { }   // dev PvP duel readout (non-public builds, in a PvP mission)
-#if !PUBLIC_BUILD
-            try { PvpTeams.DrawPanel(); } catch { }  // dev flatscreen team roster / slot picker (PvP lobby; the VR teams view is VrRosterPanel.BuildPvp)
-#endif
+            try { PvpTeams.DrawPanel(); } catch { }  // flatscreen PvP team roster / slot picker (PvP lobby; VR counterpart is VrRosterPanel.BuildPvp)
         }
 
         // The game is an FPS that locks the OS cursor to centre for mouselook, so the flatscreen lobby
@@ -85,9 +83,7 @@ namespace IronNestVR
             bool testLink = !_xrReady && Config.CoopLoopback && LoopbackTransport.Active;
             bool freeCursor = lobbyFlat || (testLink && (LoopbackTransport.FreeCursor || AltHeld()));
             CoopRoster.FlatInteractive = freeCursor;   // co-op roster kick/lock clicks work whenever the cursor is free
-#if !PUBLIC_BUILD
             PvpTeams.FlatInteractive = freeCursor;   // team-panel clicks work whenever the cursor is actually free (F7 OR loopback Alt/Ctrl+F5)
-#endif
             if (freeCursor)
             {
                 try { UnityEngine.Cursor.lockState = UnityEngine.CursorLockMode.None; UnityEngine.Cursor.visible = true; } catch { }
@@ -434,9 +430,7 @@ namespace IronNestVR
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
             try { CoopRoster.HandleInput(); } catch { }   // co-op roster kick/lock clicks (while the F7 panel frees the cursor)
-#if !PUBLIC_BUILD
             try { PvpTeams.HandleInput(); } catch { }   // flatscreen team-slot clicks (while the F7 panel frees the cursor)
-#endif
 
             // Phase 2 co-op: P2P pose channel + remote avatar. Tick (peer discovery + receive) and the
             // avatar update run in BOTH modes; the VR head+hand send happens in the frame loop below, the

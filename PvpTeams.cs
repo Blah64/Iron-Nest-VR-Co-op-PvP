@@ -264,8 +264,7 @@ namespace IronNestVR
 
         public static string Status() => $"pvpTeams: known={RosterKnown} myTeam={(MyTeam >= 0 ? (MyTeam + 1).ToString() : "-")} roster=[{RosterSummary()}]";
 
-#if !PUBLIC_BUILD
-        // ---------------- flatscreen roster GUI (dev/testing; the VR world-space teams view is VrRosterPanel.BuildPvp) ----------------
+        // ---------------- flatscreen roster GUI (VR world-space teams view is VrRosterPanel.BuildPvp) ----------------
         // Two team columns: filled names + open slots. Click an OPEN slot on the OTHER team to switch into it. IMGUI
         // button returns are dead under the new Input System (see LobbyGui), so we DRAW in OnGUI and DETECT CLICKS
         // ourselves in Update against the same rects — and only while the F7 panel has freed the cursor. Appears in
@@ -403,6 +402,5 @@ namespace IronNestVR
                 ry += rowH;
             }
         }
-#endif
     }
 }
