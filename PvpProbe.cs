@@ -1,3 +1,4 @@
+#if !PUBLIC_BUILD
 using System;
 using System.Collections.Generic;
 using BepInEx.Logging;
@@ -614,3 +615,4 @@ namespace IronNestVR
         public static string Status() => $"pvpprobe: {(Config.PvpProbe ? "ARMED" : "off")} patched={_patched} probes={_spawned.Count} lastImpact={(_haveImpact ? "yes" : "no")}";
     }
 }
+#endif

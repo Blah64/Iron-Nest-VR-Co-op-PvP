@@ -1,3 +1,4 @@
+#if !PUBLIC_BUILD
 using System;
 using System.Collections.Generic;
 using BepInEx.Logging;
@@ -243,3 +244,4 @@ namespace IronNestVR
         }
     }
 }
+#endif

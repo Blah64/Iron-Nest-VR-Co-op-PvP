@@ -1331,7 +1331,7 @@ namespace IronNestVR
                              || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
                              || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_CONSUME
                              || type == CoopPunchcards.MSG_PUNCH_GRAPH || type == CoopPunchcards.MSG_PUNCH_DIAL) CoopPunchcards.OnPacket(type, origin, a, len);
-                    else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, a, len);
+                    else if (type == CoopNetDiag.MSG_DIGEST) CoopNetDiag.OnPacket(type, origin, a, len);
                     else if (type == PvpPlayers.MSG_PVP_POS || type == PvpPlayers.MSG_PVP_SPAWN) PvpPlayers.OnPacket(type, origin, a, len);
                     else if (type == PvpCombat.MSG_PVP_HIT) PvpCombat.OnPacket(type, origin, a, len);
                     else if (type == PvpTeams.MSG_PVP_TEAM) PvpTeams.OnPacket(type, origin, a, len);

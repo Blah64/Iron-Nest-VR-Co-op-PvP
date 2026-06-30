@@ -421,10 +421,10 @@ namespace IronNestVR
             AutoLowSpecTick();   // weak-system relief: latch the LowSpec eye profile if fps stays low while focused
             ScanSceneOnce();
             Diagnostics.Tick();
-            MapToolsProbe.Tick();  // F1 dump / Shift+F1 live-test: decouple map-tools palette from the focus camera
-            PvpProbe.Tick();       // PvP plan Phase 0 probes (Ctrl+Shift+1/2/3/4/0/9; inert unless Config.PvpProbe)
             CoopBallistics.SweepTick();   // Bug 2: backstop sweep of any orphaned per-side fire intent (rare; CanFire gate is primary)
 #if !PUBLIC_BUILD
+            MapToolsProbe.Tick();  // F1 dump / Shift+F1 live-test: decouple map-tools palette from the focus camera
+            PvpProbe.Tick();       // PvP plan Phase 0 probes (Ctrl+Shift+1/2/3/4/0/9; inert unless Config.PvpProbe)
             CoopFireProbe.Tick();   // reload-state timeline probe (inert unless Config.FireProbe) — answers R1-R3 for the reload-sync design
 #endif
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)

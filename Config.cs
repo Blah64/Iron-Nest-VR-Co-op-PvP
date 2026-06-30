@@ -435,7 +435,9 @@ namespace IronNestVR
         // feature code. OFF by default on every build flavor (it mutates the live scene on chorded keypresses) —
         // set "PvpProbe=true" in IronNestVR.cfg to arm it; the keys + impact-logger patch are inert otherwise, so a
         // normal co-op/flatscreen session is untouched. See PvpProbe.cs and PLAN-pvp.md §5.
+#if !PUBLIC_BUILD
         public static bool PvpProbe = false;
+#endif
 
         // FIRE-STATE PROBE (CoopFireProbe). DEV-ONLY, read/log-only: hooks GunController.RequestFire/FireShell +
         // ShellVisual.Initialize to answer the PLAN-host §6.0 questions (RequestFire<->FireShell 1:1 ordering per gun,
@@ -1042,7 +1044,9 @@ namespace IronNestVR
                 case "LowSpecForceQualityLevel": LowSpecForceQualityLevel = PB(v, LowSpecForceQualityLevel); break;
                 case "LowSpecQualityLevel": LowSpecQualityLevel = PI(v, LowSpecQualityLevel); break;
                 case "CrashHeartbeat": CrashHeartbeat = PB(v, CrashHeartbeat); break;
+#if !PUBLIC_BUILD
                 case "PvpProbe": PvpProbe = PB(v, PvpProbe); break;
+#endif
                 case "FireProbe": FireProbe = PB(v, FireProbe); break;
                 case "SnapTurn": SnapTurn = PB(v, SnapTurn); break;
                 case "TurnSpeedDegPerSec": TurnSpeedDegPerSec = PF(v, TurnSpeedDegPerSec); break;

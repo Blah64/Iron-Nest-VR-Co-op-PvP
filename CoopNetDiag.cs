@@ -18,6 +18,8 @@ namespace IronNestVR
     /// "busy" bit): a turret mid-slew legitimately reads different on the two machines across a laggy link. Counts
     /// are always compared — a persistent entity/marker-count mismatch is a real lost-spawn / lost-line. The digest
     /// rides the same Steam P2P channel (type byte MSG_DIGEST), reliable, ~1/s. Gate with Config.CoopDesyncDetect.
+    /// Host-as-reference model: only clients send digests; the host compares each client's digest against its own
+    /// state, keyed per origin (steam id), so 3+ player lobbies get per-client divergence tracking.
     /// </summary>
     internal static class CoopNetDiag
     {
@@ -31,15 +33,16 @@ namespace IronNestVR
         private static Il2CppStructArray<byte> _buf;
         private static float _nextSend;
 
-        // Per-field consecutive-divergence counters (reset when a field is back in tolerance) + an "already logged
-        // this episode" flag so we warn on the crossing and note the recovery, not every single digest.
-        private static int _dRot, _dElevL, _dElevR, _dPowder, _dEnt, _dMarker;
-        private static bool _flRot, _flElevL, _flElevR, _flPowder, _flEnt, _flMarker;
+        // Per-origin consecutive-divergence counters (keyed by sender steam id). Each Counters instance tracks one
+        // client's per-field divergence counters + "already logged this episode" flags.
+        private sealed class Counters { public int dRot, dElevL, dElevR, dPowder, dEnt, dMarker; public bool flRot, flElevL, flElevR, flPowder, flEnt, flMarker; }
+        private static readonly System.Collections.Generic.Dictionary<ulong, Counters> _byOrigin = new System.Collections.Generic.Dictionary<ulong, Counters>();
 
         public static void Tick(float dt)
         {
             if (!Config.CoopDesyncDetect) return;
             if (!SteamNet.InLobby || !CoopP2P.HasPeer) { ResetState(); return; }
+            if (CoopP2P.IsHost) return;   // host-as-reference: clients send, host compares on receive
             float now = Time.unscaledTime;
             if (now < _nextSend) return;
             _nextSend = now + Mathf.Max(0.25f, Config.CoopDesyncIntervalSec);
@@ -72,11 +75,14 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[diag] send digest: " + e.Message); }
         }
 
-        public static void OnPacket(byte type, Il2CppStructArray<byte> a, int len)
+        public static void OnPacket(byte type, ulong origin, Il2CppStructArray<byte> a, int len)
         {
             if (type != MSG_DIGEST || !Config.CoopDesyncDetect) return;
+            if (!CoopP2P.IsHost) return;   // only the host (reference) compares
             try
             {
+                if (!_byOrigin.TryGetValue(origin, out var c)) { c = new Counters(); _byOrigin[origin] = c; }
+
                 var r = new CoopWire.Reader(a, len, 1);
                 byte flags = r.Byte();
                 bool remHasT = (flags & FLAG_HAS_TURRET) != 0;
@@ -86,7 +92,7 @@ namespace IronNestVR
                 int rEnt = r.Int(), rMarker = r.Int();
                 if (r.Bad) return;
 
-                // Our own current digest to compare against the peer's.
+                // Host's own current digest is the reference to compare each client against.
                 bool locHasT = CoopControls.TryGetTurretDigest(out float lRot, out float lEL, out float lER, out int lPL, out int lPR);
                 bool locBusy = false; try { locBusy = CoopControls.AnyLocalOwnership; } catch { }
                 int lEnt = SafeEntityCount(), lMarker = SafeMarkerCount();
@@ -96,21 +102,21 @@ namespace IronNestVR
 
                 if (compareTurret)
                 {
-                    Check(ref _dRot, ref _flRot, Mathf.Abs(Mathf.DeltaAngle(lRot, rRot)) > tol, "turret rotation", lRot, rRot);
-                    Check(ref _dElevL, ref _flElevL, Mathf.Abs(lEL - rEL) > tol, "gun-L elevation", lEL, rEL);
-                    Check(ref _dElevR, ref _flElevR, Mathf.Abs(lER - rER) > tol, "gun-R elevation", lER, rER);
-                    Check(ref _dPowder, ref _flPowder, lPL != rPL || lPR != rPR, "powder", lPL + lPR, rPL + rPR);
+                    Check(ref c.dRot, ref c.flRot, Mathf.Abs(Mathf.DeltaAngle(lRot, rRot)) > tol, "turret rotation", lRot, rRot, origin);
+                    Check(ref c.dElevL, ref c.flElevL, Mathf.Abs(lEL - rEL) > tol, "gun-L elevation", lEL, rEL, origin);
+                    Check(ref c.dElevR, ref c.flElevR, Mathf.Abs(lER - rER) > tol, "gun-R elevation", lER, rER, origin);
+                    Check(ref c.dPowder, ref c.flPowder, lPL != rPL || lPR != rPR, "powder", lPL + lPR, rPL + rPR, origin);
                 }
-                Check(ref _dEnt, ref _flEnt, lEnt != rEnt, "entity count", lEnt, rEnt);
-                Check(ref _dMarker, ref _flMarker, lMarker != rMarker, "marker count", lMarker, rMarker);
+                Check(ref c.dEnt, ref c.flEnt, lEnt != rEnt, "entity count", lEnt, rEnt, origin);
+                Check(ref c.dMarker, ref c.flMarker, lMarker != rMarker, "marker count", lMarker, rMarker, origin);
             }
             catch (Exception e) { Log.LogWarning("[diag] recv digest: " + e.Message); }
         }
 
         // Track one field: bump its divergence counter while out of tolerance; warn once it persists (and again
         // every CoopDesyncPersist digests so a stuck desync keeps a heartbeat), and note recovery. local/remote
-        // are only for the log line.
-        private static void Check(ref int counter, ref bool flagged, bool divergent, string label, float local, float remote)
+        // are only for the log line. origin identifies which client diverged (for 3+ player host logs).
+        private static void Check(ref int counter, ref bool flagged, bool divergent, string label, float local, float remote, ulong origin)
         {
             int persist = Mathf.Max(1, Config.CoopDesyncPersist);
             if (divergent)
@@ -120,20 +126,22 @@ namespace IronNestVR
                 {
                     flagged = true;
                     float secs = counter * Mathf.Max(0.25f, Config.CoopDesyncIntervalSec);
-                    Log.LogWarning($"[diag] DESYNC {label}: local={local:0.0} peer={remote:0.0} (persisted {counter} digests ~{secs:0.0}s)");
+                    Log.LogWarning($"[diag] DESYNC {label} (client {origin}): local={local:0.0} peer={remote:0.0} (persisted {counter} digests ~{secs:0.0}s)");
                 }
             }
             else
             {
-                if (flagged) Log.LogInfo($"[diag] {label} re-converged (local={local:0.0} peer={remote:0.0})");
+                if (flagged) Log.LogInfo($"[diag] {label} re-converged (client {origin}, local={local:0.0} peer={remote:0.0})");
                 counter = 0; flagged = false;
             }
         }
 
         public static string Status()
         {
-            int open = (_flRot ? 1 : 0) + (_flElevL ? 1 : 0) + (_flElevR ? 1 : 0) + (_flPowder ? 1 : 0) + (_flEnt ? 1 : 0) + (_flMarker ? 1 : 0);
-            return $"desync-detector: {(Config.CoopDesyncDetect ? "on" : "off")} open-divergences={open}";
+            int open = 0;
+            foreach (var c in _byOrigin.Values)
+                open += (c.flRot ? 1 : 0) + (c.flElevL ? 1 : 0) + (c.flElevR ? 1 : 0) + (c.flPowder ? 1 : 0) + (c.flEnt ? 1 : 0) + (c.flMarker ? 1 : 0);
+            return $"desync-detector: {(Config.CoopDesyncDetect ? "on" : "off")} clients={_byOrigin.Count} open-divergences={open}";
         }
 
         private static int SafeEntityCount() { try { return CoopEntities.LocalEntityCount; } catch { return 0; } }
@@ -141,8 +149,7 @@ namespace IronNestVR
 
         private static void ResetState()
         {
-            _dRot = _dElevL = _dElevR = _dPowder = _dEnt = _dMarker = 0;
-            _flRot = _flElevL = _flElevR = _flPowder = _flEnt = _flMarker = false;
+            _byOrigin.Clear();
             _nextSend = 0f;
         }
 
