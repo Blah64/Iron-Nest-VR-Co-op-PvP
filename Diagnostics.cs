@@ -25,6 +25,16 @@ namespace IronNestVR
         // One-time lifecycle logs and warnings call Log.LogInfo/LogWarning directly and are NOT gated.
         internal static void V(string msg) { if (Config.CoopVerboseLog) { try { Log.LogInfo(msg); } catch { } } }
 
+        // Throttled failure surfacing: logs a warning the FIRST time a given key fails, then stays silent for that
+        // key. Use in catch blocks on behavior-affecting paths so a real regression leaves a breadcrumb instead of
+        // vanishing — without spamming every frame. ALWAYS prints (a real failure, not a verbose breadcrumb); the
+        // key must be a STABLE per-site string (no per-frame data) or it will spam.
+        private static readonly System.Collections.Generic.HashSet<string> _warnedOnce = new System.Collections.Generic.HashSet<string>();
+        internal static void WarnOnce(string key, string message)
+        {
+            try { if (_warnedOnce.Add(key)) Log.LogWarning("[once] " + message); } catch { }
+        }
+
         private static bool _banner;
         private static bool _hadPeer;
         private static float _next;

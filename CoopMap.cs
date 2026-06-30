@@ -649,7 +649,7 @@ namespace IronNestVR
         {
             if (_placer == null)   // a received ADD can beat the 2s placer scan — resolve it on demand
             {
-                try { var pls = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapMarkerPlacer>(), FindObjectsSortMode.None); _placer = (pls != null && pls.Length > 0) ? pls[0].TryCast<MapMarkerPlacer>() : null; if (_placer != null) _placerIid = _placer.GetInstanceID(); } catch { }
+                try { var pls = UnityEngine.Object.FindObjectsByType(Il2CppType.Of<MapMarkerPlacer>(), FindObjectsSortMode.None); _placer = (pls != null && pls.Length > 0) ? pls[0].TryCast<MapMarkerPlacer>() : null; if (_placer != null) _placerIid = _placer.GetInstanceID(); } catch (Exception e) { Diagnostics.WarnOnce("coomap.placer-resolve", "[map] placer on-demand resolve: " + e.Message); }
             }
             if (_placer == null) { Log.LogWarning($"[map] marker add (id={netId}) but no MapMarkerPlacer in scene"); return; }
             try
@@ -1016,12 +1016,7 @@ namespace IronNestVR
             return sb.ToString();
         }
 
-        private static int Fnv(string s)
-        {
-            uint h = 2166136261u;
-            for (int i = 0; i < s.Length; i++) { h ^= (byte)s[i]; h *= 16777619u; }
-            return unchecked((int)h);
-        }
+        private static int Fnv(string s) => CoopIds.Fnv1A32(s);
 
         private static bool EnsureBuf()
         {

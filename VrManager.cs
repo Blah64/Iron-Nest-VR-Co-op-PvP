@@ -429,7 +429,7 @@ namespace IronNestVR
 #endif
             SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
-            try { CoopRoster.HandleInput(); } catch { }   // co-op roster kick/lock clicks (while the F7 panel frees the cursor)
+            try { CoopRoster.HandleInput(); } catch (Exception e) { Diagnostics.WarnOnce("vrmgr.roster-input", "[vrmgr] CoopRoster.HandleInput: " + e.Message); }   // co-op roster kick/lock clicks (while the F7 panel frees the cursor)
             try { PvpTeams.HandleInput(); } catch { }   // flatscreen team-slot clicks (while the F7 panel frees the cursor)
 
             // Phase 2 co-op: P2P pose channel + remote avatar. Tick (peer discovery + receive) and the

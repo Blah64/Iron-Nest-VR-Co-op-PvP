@@ -241,7 +241,7 @@ namespace IronNestVR
                     c.T.position = anchor.TransformPoint(c.RemoteLocal);
                     c.T.rotation = anchor.rotation * c.RemoteRot;
                 }
-                catch { }
+                catch (Exception e) { Diagnostics.WarnOnce("cooppunch.late-apply-pose", "[punch] LateApply card pose: " + e.Message); }
             }
         }
 
@@ -1279,11 +1279,6 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[punch] buf: " + e.Message); return false; }
         }
 
-        private static int Fnv(string s)
-        {
-            uint h = 2166136261u;
-            for (int i = 0; i < s.Length; i++) { h ^= (byte)s[i]; h *= 16777619u; }
-            return unchecked((int)h);
-        }
+        private static int Fnv(string s) => CoopIds.Fnv1A32(s);
     }
 }

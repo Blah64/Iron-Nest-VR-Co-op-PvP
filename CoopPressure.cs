@@ -352,12 +352,7 @@ namespace IronNestVR
         private static int Sib(Transform t) { try { return t.GetSiblingIndex(); } catch { return 0; } }
 
         // FNV-1a 32-bit — deterministic across processes (same as CoopControls.Fnv).
-        private static int Fnv(string s)
-        {
-            uint h = 2166136261u;
-            for (int i = 0; i < s.Length; i++) { h ^= (byte)s[i]; h *= 16777619u; }
-            return unchecked((int)h);
-        }
+        private static int Fnv(string s) => CoopIds.Fnv1A32(s);
 
         private static bool EnsureBuf()
         {

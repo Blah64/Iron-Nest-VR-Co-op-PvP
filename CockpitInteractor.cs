@@ -229,7 +229,7 @@ namespace IronNestVR
 
             _mgr.sanitizeClickStateEachFrame = false;
             _mgr.emitPrimaryClickEvents = true;
-            try { _mgr.SwitchToFPSLocked(); } catch { }
+            try { _mgr.SwitchToFPSLocked(); } catch (Exception e) { Diagnostics.WarnOnce("cockpit.engage-fps-locked", "[interact] SwitchToFPSLocked: " + e.Message); }
             var vc = _mgr.virtualCursor;
             if (vc != null) vc.lockToCenterWhenFPSLocked = true;
 
@@ -314,7 +314,7 @@ namespace IronNestVR
                         int id = p.GetInstanceID();
                         _placers[id] = p;
                         found++;
-                        try { if (!_origPlacerCam.ContainsKey(id)) _origPlacerCam[id] = p.mainCamera; if (p.mainCamera != cam) p.mainCamera = cam; } catch { }
+                        try { if (!_origPlacerCam.ContainsKey(id)) _origPlacerCam[id] = p.mainCamera; if (p.mainCamera != cam) p.mainCamera = cam; } catch (Exception e) { Diagnostics.WarnOnce("cockpit.mapcam-repoint", "[interact] map placer cam repoint: " + e.Message); }
                         try { if (!_origPlacerHover.ContainsKey(id)) _origPlacerHover[id] = p.enableHover; if (!p.enableHover) p.enableHover = true; } catch { }
                         try { PinCursor(p.virtualCursor); } catch { }
                         try { RepointCanvas(p.mapCanvas, cam); } catch { }

@@ -324,8 +324,8 @@ namespace IronNestVR
                     if (r.Bad) return;
                     if (_mirrors.TryGetValue(key, out var m))
                     {
-                        if (m.IsClone) { try { if (m.Go != null) UnityEngine.Object.Destroy(m.Go); } catch { } }
-                        else { try { if (m.Go != null) UnityEngine.Object.Destroy(m.Go); } catch { } }   // adopted scene entity also dies when the host says so
+                        if (m.IsClone) { try { if (m.Go != null) UnityEngine.Object.Destroy(m.Go); } catch (Exception e) { Diagnostics.WarnOnce("coopent.despawn-clone", "[ent] destroy clone: " + e.Message); } }
+                        else { try { if (m.Go != null) UnityEngine.Object.Destroy(m.Go); } catch (Exception e) { Diagnostics.WarnOnce("coopent.despawn-adopt", "[ent] destroy adopted entity: " + e.Message); } }   // adopted scene entity also dies when the host says so
                         _mirrors.Remove(key);
                         Log.LogInfo($"[ent] despawned '{m.ID}' <- peer");
                     }
@@ -771,11 +771,6 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[ent] buf: " + e.Message); return false; }
         }
 
-        private static int Fnv(string s)
-        {
-            uint h = 2166136261u;
-            for (int i = 0; i < s.Length; i++) { h ^= (byte)s[i]; h *= 16777619u; }
-            return unchecked((int)h);
-        }
+        private static int Fnv(string s) => CoopIds.Fnv1A32(s);
     }
 }
