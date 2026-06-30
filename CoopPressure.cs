@@ -10,7 +10,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Co-op sync for the cockpit STEAM/PRESSURE chain (PLAN-valve.md / memory ironnest-steam-pressure).
+    /// Co-op sync for the cockpit STEAM/PRESSURE chain.
     ///
     /// (1) VALVES — per-valve <c>ValveController.currentDamage01</c> (0 fine … 1 broken). The probe proved damage
     /// is dial-coupled (<c>currentDamage01 == NormalizeDamage(CurrentDialValue)</c>) AND that <c>SetDamage01(x)</c>
@@ -23,7 +23,7 @@ namespace IronNestVR
     /// REPAIRS are symmetric (either crew member turns a valve dial → damage drops); BREAKS are host-authoritative
     /// (RNG via <c>ValveAutoAddDamageOnEnable</c>; if the client ran its own roll it would break a DIFFERENT valve
     /// than the host = union desync). We can't gate the break component with Harmony — patching it (especially its
-    /// <c>BurstRoutine</c> coroutine) HARD-CRASHES this IL2CPP build (rev3). So the gate is RECONCILE-not-prevent,
+    /// <c>BurstRoutine</c> coroutine) HARD-CRASHES this IL2CPP build. So the gate is RECONCILE-not-prevent,
     /// implemented in pure data with zero Harmony:
     ///   - The CLIENT authors only DECREASES (a dial-drag repair). It NEVER sends an increase — a local RNG break
     ///     is left unsent, so it can't propagate to the host.
@@ -35,14 +35,14 @@ namespace IronNestVR
     /// or a client's repair never reaches the OTHER clients at N>2. Echo-guarded (_echoUntil + Prev-adopt) exactly
     /// like the powder/aim edge-replicators.
     ///
-    /// (2) ENGINE (Phase 2 — DORMANT until tested) — host-authoritative <c>DieselEngineController.EnginesRunning</c>
+    /// (2) ENGINE (DORMANT until tested) — host-authoritative <c>DieselEngineController.EnginesRunning</c>
     /// via <c>ForceStart()</c>/<c>ForceStop()</c>. <c>EnginePowerController.Power</c> is deterministic smoothing off
     /// the running state → never synced (it converges on its own). Gated behind <c>Config.CoopEngineSync</c>, which
-    /// defaults OFF: PLAN-valve §5 wants a 2-player test FIRST (the client's engine may already track the host purely
+    /// defaults OFF: a 2-player test is wanted FIRST (the client's engine may already track the host purely
     /// from the synced fuel/timing dials, since the controller polls them). Flip the flag on only if it diverges.
     ///
     /// The valve repair dials are EXCLUDED from CoopControls (it would mark the turret group remotely-owned and its
-    /// dial-visual stream wouldn't update the hidden damage anyway — see CoopControls.Scan + PLAN-valve §2/§4.1).
+    /// dial-visual stream wouldn't update the hidden damage anyway — see CoopControls.Scan).
     /// </summary>
     internal static class CoopPressure
     {

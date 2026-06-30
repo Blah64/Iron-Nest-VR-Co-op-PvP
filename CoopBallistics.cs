@@ -55,7 +55,7 @@ namespace IronNestVR
         // The old global flag (6 s, not per-gun) mis-tagged a LOCAL shot as a peer replay whenever the OTHER player
         // was active, hijacking it onto the peer's target ("wild, not dispersion"). Instead every shot that WILL fire
         // is tagged at RequestFire time and queued PER SIDE; OnShellVisualPost consumes FIFO, so each shell gets
-        // exactly its own author's decision. Probe-verified (PLAN-host §6.0, run 2026-06-28): RequestFire→FireShell is
+        // exactly its own author's decision. Probe-verified: RequestFire→FireShell is
         // 1:1 ordered per gun (Q1) and a no-op RequestFire is synchronously detectable via CanFire (Q2), so we never
         // enqueue a phantom. fireDelay is ~0.01 s (Q3) — useless as a deadline — so the orphan backstop is a fixed 2 s.
         internal struct FireIntent

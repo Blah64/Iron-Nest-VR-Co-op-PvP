@@ -21,8 +21,8 @@ namespace IronNestVR
     ///     the test stalled. Mislearned as "gate everything."
     ///   • v2 (replaced): FULL gate — Harmony-suppress <c>MissionGraph</c>/<c>MissionPassiveGraph</c> Run+Update
     ///     on the client. That made the client a PURE VIEWER: it ran NONE of the mission sim, so gun/reload/AMMO/
-    ///     objectives were all dead and only explicitly-replicated state appeared. Co-op completeness became
-    ///     whack-a-mole (ammo empty, etc.). See the coop-mod-sourcemap memory.
+    ///     objectives were all dead and only explicitly-replicated state appeared. Achieving co-op completeness
+    ///     this way required replicating every subsystem piecemeal (ammo empty, etc.). See the coop-mod-sourcemap memory.
     ///   • v3 (CURRENT, per user direction 2026-06-20): NARROW gate — suppress ONLY the spawn node's action
     ///     (<c>State_SpawnMapEntity.OnEnter</c>) on a co-op client. The rest of the mission graph runs normally,
     ///     so the client drives its own gun/reload/ammo/objectives/teleprinter LOCALLY. Enemies/targets are

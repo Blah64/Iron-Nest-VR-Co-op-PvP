@@ -49,7 +49,7 @@ namespace IronNestVR
         private static bool _readySent;            // client: send READY once per mission entry
 
         // Client: a received MISSION_START is retried until the scene's OperationLoadRelay is actually available
-        // (REVIEW-fix P1 — the relay may not exist on the receive frame during a scene/hub transition). We keep
+        // (the relay may not exist on the receive frame during a scene/hub transition). We keep
         // trying for a bounded window rather than dropping the command on the first miss.
         private static float _pendingStartUntil;   // 0 = no pending start; else deadline (unscaledTime)
         private static float _nextStartTry;        // next retry time
@@ -177,10 +177,10 @@ namespace IronNestVR
                     if (!CoopP2P.IsHost) return;   // only the host answers a joiner's readiness
                     Log.LogInfo($"[scene] MISSION_READY <- {origin} — re-sending world snapshot to that peer");
                     // Target the resync to the joiner that asked — don't re-burst it onto every existing client each
-                    // time someone reports ready (REVIEW-fix P2a). The joiner is now in the mission cockpit, so the
+                    // time someone reports ready. The joiner is now in the mission cockpit, so the
                     // map table + requisition console objects finally exist: re-send the map and punchcard layout
                     // here too. The original join snapshot sent them before the joiner had loaded the scene, so they
-                    // were dropped and never re-sent (REVIEW-fix P2 — late-join map/punchcard sequencing).
+                    // were dropped and never re-sent (late-join map/punchcard sequencing).
                     try { CoopP2P.SendSnapshotTo(origin, () => CoopEntities.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->entities: " + e.Message); }
                     try { CoopP2P.SendSnapshotTo(origin, () => CoopMap.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->map: " + e.Message); }
                     try { CoopP2P.SendSnapshotTo(origin, () => CoopPunchcards.SendSnapshot()); } catch (Exception e) { Log.LogWarning("[scene] ready->punch: " + e.Message); }

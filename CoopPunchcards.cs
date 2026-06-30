@@ -1025,7 +1025,7 @@ namespace IronNestVR
             float v; try { v = rd.D.AccumulatedValue; } catch { return; }
             if (!CoopWire.Finite(v)) return;
             // Trailing flag byte (index 9) marks the release/final edge so the host relay can keep live turns
-            // unreliable but forward the release reliably (REVIEW-fix P1 — see CoopControls.IsMixedFinalStream).
+            // unreliable but forward the release reliably (see CoopControls.IsMixedFinalStream).
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_PUNCH_DIAL); w.Int(rd.Key); w.Float(v); w.Bool(reliable);
             CoopP2P.Send(_buf, w.Length, reliable);
@@ -1274,7 +1274,7 @@ namespace IronNestVR
         {
             if (_buf != null) return true;
             // Sized to the shared transport limit so a punchcard packet can never exceed what a peer can receive
-            // (REVIEW-fix P1 — the buffer used to be 2048 while the receiver only read 1200).
+            // (the buffer used to be 2048 while the receiver only read 1200).
             try { _buf = new Il2CppStructArray<byte>(CoopP2P.MaxInnerPayload); return true; }
             catch (Exception e) { Log.LogWarning("[punch] buf: " + e.Message); return false; }
         }

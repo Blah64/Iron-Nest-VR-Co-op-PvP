@@ -10,7 +10,6 @@ namespace IronNestVR
     /// <summary>
     /// Top-level driver attached to a persistent GameObject. Lazily brings up the D3D11 bridge and
     /// OpenXR session (retrying until a headset/runtime is present), then runs the per-frame loop.
-    /// Phase 2: bring up the session and log head pose. Phase 3 adds the stereo camera rig.
     /// </summary>
     public class VrManager : MonoBehaviour
     {
@@ -47,7 +46,7 @@ namespace IronNestVR
         private float _lowSpecSlowAccum;   // continuous seconds spent below LowSpecFpsTrigger while focused
         private int _savedQualityLevel = -1; // game QualitySettings level LowSpec lowered (-1 = untouched, restore in TeardownVr)
 
-        // Phase 1 scene probe (still handy).
+        // Scene probe: logs the main camera + turret/gun once.
         private float _nextScan;
         private bool _loggedScene;
 
@@ -100,7 +99,7 @@ namespace IronNestVR
                 _lookFrozen = false;
             }
 
-            // Phase 3: apply the peer's control visuals + snap turret/gun state here, AFTER the game's Update
+            // Apply the peer's control visuals + snap turret/gun state here, AFTER the game's Update
             // (so our snap wins the frame); re-applies the turret transform immediately so the visible
             // rotating cockpit matches. Map token positions are applied here too (after the game's drag logic).
             CoopControls.LateApply();
@@ -416,23 +415,23 @@ namespace IronNestVR
             PerfProbe.UpdateBegin();
             LogEnvironmentOnce();
             AutoTuneOnce();
-            RenderThreadProbe.Tick();   // PLANXR feasibility test (self-terminating; logs one [rtprobe] RESULT)
+            RenderThreadProbe.Tick();   // render-thread copy feasibility probe; inert unless Config.RenderThreadProbeTest (default off); self-terminating, logs one [rtprobe] RESULT
             PerfTick();
             AutoLowSpecTick();   // weak-system relief: latch the LowSpec eye profile if fps stays low while focused
             ScanSceneOnce();
             Diagnostics.Tick();
             CoopBallistics.SweepTick();   // Bug 2: backstop sweep of any orphaned per-side fire intent (rare; CanFire gate is primary)
 #if !PUBLIC_BUILD
-            MapToolsProbe.Tick();  // F1 dump / Shift+F1 live-test: decouple map-tools palette from the focus camera
-            PvpProbe.Tick();       // PvP plan Phase 0 probes (Ctrl+Shift+1/2/3/4/0/9; inert unless Config.PvpProbe)
-            CoopFireProbe.Tick();   // reload-state timeline probe (inert unless Config.FireProbe) — answers R1-R3 for the reload-sync design
+            MapToolsProbe.Tick();  // F1 dump / Shift+F1 live-test: map-tools palette vs the focus camera (non-public builds)
+            PvpProbe.Tick();       // PvP probes (Ctrl+Shift+1/2/3/4/0/9; inert unless Config.PvpProbe)
+            CoopFireProbe.Tick();   // reload-state timeline probe (inert unless Config.FireProbe)
 #endif
-            SteamNet.Tick();   // Phase 1 co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
+            SteamNet.Tick();   // co-op: Steam lobby create/browse/join (F9/F10/F11/F12)
             LobbyGui.HandleInput();  // flatscreen panel clicks via the new Input System (legacy is off)
             try { CoopRoster.HandleInput(); } catch (Exception e) { Diagnostics.WarnOnce("vrmgr.roster-input", "[vrmgr] CoopRoster.HandleInput: " + e.Message); }   // co-op roster kick/lock clicks (while the F7 panel frees the cursor)
             try { PvpTeams.HandleInput(); } catch { }   // flatscreen team-slot clicks (while the F7 panel frees the cursor)
 
-            // Phase 2 co-op: P2P pose channel + remote avatar. Tick (peer discovery + receive) and the
+            // Co-op: P2P pose channel + remote avatar. Tick (peer discovery + receive) and the
             // avatar update run in BOTH modes; the VR head+hand send happens in the frame loop below, the
             // flatscreen camera-pose send happens here. F6 toggles the solo render self-test.
             if (KeyDown(UnityEngine.InputSystem.Key.F6)) { CoopP2P.SelfTest = !CoopP2P.SelfTest; Log.LogInfo("[p2p] self-test " + (CoopP2P.SelfTest ? "ON" : "OFF")); }
@@ -451,18 +450,18 @@ namespace IronNestVR
                 try { Log.LogInfo($"[loop] state focused={Application.isFocused} runInBackground={Application.runInBackground} timeScale={Time.timeScale:0.##} mode={Screen.fullScreenMode} res={Screen.width}x{Screen.height} connected={LoopbackTransport.Connected}"); } catch { }
             }
             CoopP2P.Tick(Time.unscaledDeltaTime);
-            CoopControls.Tick(Time.unscaledDeltaTime);   // Phase 3: detect local control drags + transmit
-            CoopClipboard.Tick(Time.unscaledDeltaTime);  // Phase 3: replicate HUD clipboard contents
-            CoopMap.Tick(Time.unscaledDeltaTime);        // Phase 3: replicate tactical-map token placements
-            CoopEntities.Tick(Time.unscaledDeltaTime);   // Phase 4: replicate host mission entities to the client
-            CoopScene.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate mission/scene transitions (host drives)
-            CoopScore.Tick(Time.unscaledDeltaTime);      // Phase 4: replicate score/requisition (host-authoritative, applied out-of-mission)
-            CoopPressure.Tick(Time.unscaledDeltaTime);   // steam/pressure: per-valve damage sync (reconcile gate); engine host-auth (Phase 2, dormant)
-            CoopPunchcards.Tick(Time.unscaledDeltaTime); // Phase 4: host-authoritative punchcard deck + redemption
-            CoopNetDiag.Tick(Time.unscaledDeltaTime);    // REVIEW-fix: cross-machine desync detector (diagnostic only)
+            CoopControls.Tick(Time.unscaledDeltaTime);   // detect local control drags + transmit
+            CoopClipboard.Tick(Time.unscaledDeltaTime);  // replicate HUD clipboard contents
+            CoopMap.Tick(Time.unscaledDeltaTime);        // replicate tactical-map token placements
+            CoopEntities.Tick(Time.unscaledDeltaTime);   // replicate host mission entities to the client
+            CoopScene.Tick(Time.unscaledDeltaTime);      // replicate mission/scene transitions (host drives)
+            CoopScore.Tick(Time.unscaledDeltaTime);      // replicate score/requisition (host-authoritative, applied out-of-mission)
+            CoopPressure.Tick(Time.unscaledDeltaTime);   // steam/pressure: per-valve damage sync (reconcile gate); engine host-auth dormant
+            CoopPunchcards.Tick(Time.unscaledDeltaTime); // host-authoritative punchcard deck + redemption
+            CoopNetDiag.Tick(Time.unscaledDeltaTime);    // cross-machine desync detector (diagnostic only)
             PvpTeams.Tick(Time.unscaledDeltaTime);       // PvP teams: host-authoritative roster (inert unless Config.PvpActive)
-            PvpMatch.Tick(Time.unscaledDeltaTime);       // PvP Phase 1: match-mode coordinator (inert unless Config.PvpActive)
-            PvpPlayers.Tick(Time.unscaledDeltaTime);     // PvP Phase 1: player-as-entity presence + position sync
+            PvpMatch.Tick(Time.unscaledDeltaTime);       // PvP: match-mode coordinator (inert unless Config.PvpActive)
+            PvpPlayers.Tick(Time.unscaledDeltaTime);     // PvP: player-as-entity presence + position sync
             if (!_xrReady)
             {
                 var fcam = Camera.main;
@@ -833,7 +832,7 @@ namespace IronNestVR
             _prevMenu = menu;
         }
 
-        // --- Phase 2 co-op pose helpers ---
+        // --- co-op pose helpers ---
         private static Vector3 PoseWorldPos(Posef p, Transform origin)
         { var lp = new Vector3(p.Position.X, p.Position.Y, -p.Position.Z); return origin.TransformPoint(lp); }
 

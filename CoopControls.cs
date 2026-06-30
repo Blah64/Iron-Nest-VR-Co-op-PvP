@@ -9,7 +9,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 3 co-op: cockpit-control replication with TRANSIENT, PER-CONTROL ownership, plus turret/gun
+    /// Co-op: cockpit-control replication with TRANSIENT, PER-CONTROL ownership, plus turret/gun
     /// physical-state sync. Both players are free-walking crew who can operate ANY dial/lever/switch and
     /// either gun — so ownership is per-control and per-moment, not a static seat split.
     ///
@@ -25,9 +25,9 @@ namespace IronNestVR
     ///   machines run the turret sim locally and slew CurrentAngle/CurrentElevation toward the shared desired,
     ///   so EITHER player can drive and the other follows — symmetric, no host authority. Rate-driven motion
     ///   ("turn a wheel, release, the turret keeps moving") mirrors for free: it's just the local slew to the
-    ///   shared DesiredRotation. (Matches the reference mod's Turrets.cs; we sync CurrentAngle exactly ONCE, in
-    ///   the JIP snapshot, for a tight start — never in the live stream, which is what made the host fight and
-    ///   override the client when we streamed physical state continuously.)
+    ///   shared DesiredRotation. We sync CurrentAngle exactly ONCE, in the JIP snapshot, for a tight start —
+    ///   never in the live stream, which is what made the host fight and override the client when we streamed
+    ///   physical state continuously.
     /// • Presence: each operated dial/lever also streams its visual value so you SEE the other player turning
     ///   it (the turret state alone wouldn't move a flavor dial or a valve).
     ///
@@ -38,9 +38,6 @@ namespace IronNestVR
     /// Riding the same Steam P2P channel as the pose stream (<see cref="CoopP2P"/>), distinguished by the
     /// first packet byte. Grabs/releases go reliable (a lost one would strand ownership); the continuous
     /// value/state stream is unreliable-no-delay and rate-capped to <see cref="Config.CoopSendHz"/>.
-    ///
-    /// DEFERRED: faithful reload-animation replay (we sync powder + reload READINESS, not the rammer theatre)
-    /// and entity/mission/shell sync (Phase 4). Combat isn't unlocked in the demo yet.
     /// </summary>
     internal static class CoopControls
     {
@@ -54,12 +51,11 @@ namespace IronNestVR
         private const byte MSG_CLICK = 6;    // [t][netId i32]               reliable   LookAtTarget click
         private const byte MSG_FIRE = 7;     // [t][side u8][tgtX f32][tgtY f32][startX f32][startY f32][travelTime f32]  reliable  gun discharge (0=L,1=R) + the SHOOTER's full ShellVisual flight (crater + launch point + travel time); the peer forces it onto its own shell so the whole arc + crater match regardless of pre-shot desync (see CoopBallistics)
         private const byte MSG_SNAP = 13;    // [t][9×f32]                   reliable   join-in-progress turret/gun state
-        private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile (REVIEW-fix P3)
+        private const byte MSG_RECON = 25;   // [t][9×f32]                   reliable   recurring host current-state reconcile
         private const byte MSG_POWDER = 39;  // [t][side u8][charges i32]    reliable   per-gun powder/charge state, EITHER→peer (symmetric, last-writer-wins)
-        private const byte MSG_AIM = 41;     // [t][desRot f32][turretElev f32][gunLElev f32][gunRElev f32]  reliable  EITHER→peer, symmetric firing-solution edge-replicate (40=entities ENTSET). The FDC graph resolves the aim with NO drag, so it never rides the drag-owned MSG_GROUP stream → the peer kept its stale default and missed.
-        // 42-44 = PvP (PVP_POS/PVP_HIT/PVP_TEAM); 50 = PVP_SPAWN (host->all randomized team spawn grids).
-        private const byte MSG_TURRET_POS = 45;  // [t][gridX f32][gridY f32]  reliable  HOST→client, host-authoritative turret MAP ORIGIN (turretBase.anchoredPosition). Edge-on-change (throttled) + ~2s heal beat. NOT client-authored (never relayed): the host is the sole author and Send() already fans out to every client. Bug 1 (cross-player divergence): identical aim/range lands at a different MAP point when each machine's turret sits at a different origin.
-        private const byte MSG_RELOAD_STATE = 46;  // [t][side u8][stateIdx u8][loaded u8 (0/1)][powder i32]  reliable  EITHER→peer, symmetric per-gun reload state. The reload is animation-gated (click-replay can't drive a remote one — it stalls), so we replicate the AUTHORITATIVE state and the peer reaches it through the game's OWN paced AdvanceState() path (never pokes internals — eject corrupts). PLAN-reload §5. Co-op + same-team PvP LOAD direction.
+        private const byte MSG_AIM = 41;     // [t][desRot f32][turretElev f32][gunLElev f32][gunRElev f32]  reliable  EITHER→peer, symmetric firing-solution edge-replicate. The FDC graph resolves the aim with NO drag, so it never rides the drag-owned MSG_GROUP stream → the peer kept its stale default and missed.
+        private const byte MSG_TURRET_POS = 45;  // [t][gridX f32][gridY f32]  reliable  HOST→client, host-authoritative turret MAP ORIGIN (turretBase.anchoredPosition). Edge-on-change (throttled) + ~2s heal beat. NOT client-authored (never relayed): the host is the sole author and Send() already fans out to every client. Cross-player divergence: identical aim/range lands at a different MAP point when each machine's turret sits at a different origin.
+        private const byte MSG_RELOAD_STATE = 46;  // [t][side u8][stateIdx u8][loaded u8 (0/1)][powder i32]  reliable  EITHER→peer, symmetric per-gun reload state. The reload is animation-gated (click-replay can't drive a remote one — it stalls), so we replicate the AUTHORITATIVE state and the peer reaches it through the game's OWN paced AdvanceState() path (never pokes internals — eject corrupts). Co-op + same-team PvP LOAD direction.
 
         // How long remote ownership / streamed state survives without a refresh. The stream runs at
         // CoopSendHz (~30/s), so 2s easily rides minor packet loss but recovers fast if the peer vanishes
@@ -134,11 +130,11 @@ namespace IronNestVR
         private const float AimEps = 0.05f;   // deg threshold: ignore sub-tenth jitter so we don't spam the stream
         private static readonly int AimKey = Fnv("__coop_aim__");
 
-        // Per-gun RELOAD-state edge-replication (PLAN-reload §5; mirrors the powder/aim pattern). The reload is a
-        // 10-state animation-gated machine (HandManipulator.cs:724) — replaying the cockpit CLICKS to a remote gun
+        // Per-gun RELOAD-state edge-replication (mirrors the powder/aim pattern). The reload is a
+        // 10-state animation-gated machine — replaying the cockpit CLICKS to a remote gun
         // stalls it (the clip sub-state never lines up). So we replicate the AUTHORITATIVE (stateIdx, loaded, powder),
         // and the peer DRIVES its own gun to that target via the game's legit AdvanceState()/SetPowderCharge, paced by
-        // the controller's `working` flag (Step-0-validated), NEVER poking chamber/eject/SetState (those corrupt).
+        // the controller's `working` flag, NEVER poking chamber/eject/SetState (those corrupt).
         // Symmetric last-writer-wins + echo-suppress + heartbeat, exactly like powder. EMPTY/fired direction is owned
         // by the MSG_FIRE replay in co-op (deferred in same-team PvP) — we never drive a gun empty here.
         private static readonly int ReloadKeyL = Fnv("__coop_reload_L"), ReloadKeyR = Fnv("__coop_reload_R");
@@ -151,7 +147,7 @@ namespace IronNestVR
             public int  PrevIdx;      // last sampled CurrentStateIndex (int.MinValue = unseeded, seed silently)
             public bool PrevLoaded;   // last sampled ChamberedShellBlueprint != null
             public bool Authored;     // we own re-asserting this gun's reload until we adopt the peer's
-            // paced driver (the §5.3 converger toward a LoadedRest/Reloading target)
+            // paced driver (the converger toward a LoadedRest/Reloading target)
             public bool  Driving;
             public int   TgtPowder;
             public float Deadline;    // unscaledTime hard stop
@@ -170,11 +166,11 @@ namespace IronNestVR
         // LOCALLY on both machines — replicating it would make the peer redundantly drive its own guns ("host started
         // loading both cannons on spawn"). So for a few seconds after the turret resolves we SEED baselines silently
         // (track current, never send) — only PLAYER-driven changes after the gun has settled get replicated. Deliberate
-        // join-time state will ride the §5.6 JIP reseed (Step 4), not this noisy spawn window.
+        // join-time state will ride the JIP reseed, not this noisy spawn window.
         private static float _reloadStartupUntil;
         private const float ReloadStartupGraceSec = 6f;
 
-        // ===== Host-side RELOAD-CLICK PACING (2026-06-28) — the actual fix for the intermittent reload desync. =====
+        // ===== Host-side RELOAD-CLICK PACING — fixes the intermittent reload desync. =====
         // The reload syncs by REPLAYING the operator's lever/button clicks; the peer LAGS (each step's animation + net
         // latency), so a click the operator sent at reload state N arrives while the peer is still at N-1. Applying it
         // immediately lands it at the WRONG state and breaks the sequence — observed: a 'Charge Rammer' click applied at
@@ -216,7 +212,7 @@ namespace IronNestVR
 
         private static float _nextScan;
         private static float _nextSend;
-        private static float _nextRecon;   // host: next current-state reconcile broadcast (REVIEW-fix P3)
+        private static float _nextRecon;   // host: next current-state reconcile broadcast
         private static float _nextElevDiag;     // throttle for the "applied peer elevation" (receiver) diagnostic
         private static float _nextElevSendDiag;  // throttle for the "streaming elevation" (sender) diagnostic
         // ALL requisition-console dials are EXCLUDED from this path-hash registry: their PathOf hash collides with the
@@ -227,13 +223,13 @@ namespace IronNestVR
         private static int _reconExcluded;
         // Pressure-valve repair dials are owned by CoopPressure (MSG_VALVE / SetDamage01), not the dial-visual stream
         // (the valve reads its dial via an event SetAccumulatedValueUnlimited won't fire; and a valve grab would mark
-        // the turret group remotely-owned). Excluded from the registry — counted per scan for the log. See PLAN-valve §4.1.
+        // the turret group remotely-owned). Excluded from the registry — counted per scan for the log.
         private static int _valveExcluded;
 
         // Reusable send buffer (control packets are tiny: 1+4+4 max). Lazily created on the Unity thread.
         private static Il2CppStructArray<byte> _buf;
         // Scratch for strict group-packet parsing: read into here, validate every float finite, then publish to
-        // gs.V only if the whole frame is intact (REVIEW-fix P2 — no partial/non-finite turret state).
+        // gs.V only if the whole frame is intact (no partial/non-finite turret state).
         private static readonly float[] _tmpGroup = new float[5];
         // Per-tick scratch: which groups WE own this frame. Cleared each Tick instead of reallocated. _grp is
         // initialized above (source order), so sizing off _grp.Length here is safe at field-init time.
@@ -326,11 +322,11 @@ namespace IronNestVR
                 DetectPowder(now);
                 DetectAim(now);
                 DetectTurretPos(now);
-                DetectReload(now);        // (dormant) reload state mirror — parked; reload syncs via paced click replay
-                DriveReloadTick(now);     // (dormant) AdvanceState driver — parked alongside the mirror
+                DetectReload(now);        // reload state mirror — ships and is called every frame, but no-ops at runtime (ReloadStateMirrorEnabled=false, not #if-stripped); reload syncs via paced click replay
+                DriveReloadTick(now);     // AdvanceState driver — ships and is called every frame, but no-ops at runtime alongside the mirror
                 DrainReloadClicks(now);   // pace replayed reload clicks so each lands at the right state (the intermittent-desync fix)
 
-                // REVIEW-fix (P3): host broadcasts a low-rate CURRENT-state reconcile so the client can correct any
+                // Host broadcasts a low-rate CURRENT-state reconcile so the client can correct any
                 // accumulated CurrentAngle/elevation drift (framerate-dependent slew, a missed reliable packet).
                 if (CoopP2P.IsHost && Config.CoopTurretReconcile && now >= _nextRecon)
                 {
@@ -397,7 +393,7 @@ namespace IronNestVR
         {
             // Gate on the FIRE feature (CoopBallistics.Active() = CoopDeterministicFire + lobby + peer + mission + !PvP),
             // NOT CoopClickSync — fire is no longer a click event, so turning click sync off must not silently kill the
-            // shell-flight sync (REVIEW-host v4 P1). CoopClickSync still gates the OTHER cockpit clicks.
+            // shell-flight sync. CoopClickSync still gates the OTHER cockpit clicks.
             if (!CoopBallistics.Active()) return;
             byte side = ((object)gun == (object)_gunR) ? (byte)1 : (byte)0;
             SendFire(side, tgt, start, time);
@@ -496,18 +492,19 @@ namespace IronNestVR
             CoopP2P.Send(_buf, w.Length, true);   // reliable: a discrete firing-solution change, must not be lost
         }
 
-        // ===== Per-gun RELOAD-state replication (PLAN-reload §5) — mirrors powder/aim. Detect+send on the operating
-        // machine; the peer DRIVES its own gun to the target via the game's legit AdvanceState path (§5.3). =====
+        // ===== Per-gun RELOAD-state replication — mirrors powder/aim. Detect+send on the operating
+        // machine; the peer DRIVES its own gun to the target via the game's legit AdvanceState path. =====
 
-        // DORMANT kill-switch (2026-06-28): the reload syncs via CLICK replication (re-enabled in ScanSwitches). The
-        // MSG_RELOAD_STATE mirror could not drive a non-operated gun (animation-gated) and is parked — kept (not deleted)
-        // because it may return as a self-healing RECONCILER (re-fire the missing step toward the peer's state target) once
-        // the intermittent dropped-click is understood. `readonly` (not const) so the dead body doesn't trip CS0162.
+        // Runtime kill-switch: the reload syncs via CLICK replication instead. The MSG_RELOAD_STATE mirror could not
+        // drive a non-operated gun (animation-gated). This whole mirror/driver still COMPILES INTO EVERY BUILD and is
+        // CALLED EVERY FRAME — it is NOT #if-stripped — but no-ops at runtime while this flag is false. Kept (not deleted)
+        // because it may return as a self-healing RECONCILER (re-fire the missing step toward the peer's state target).
+        // `readonly` (not const) so the runtime-dead branch doesn't trip CS0162.
         private static readonly bool ReloadStateMirrorEnabled = false;
 
         private static void DetectReload(float now)
         {
-            if (!Config.CoopControlSync || !ReloadStateMirrorEnabled) return;   // mirror parked → emit nothing (don't interfere with click sync)
+            if (!Config.CoopControlSync || !ReloadStateMirrorEnabled) return;   // mirror disabled → emit nothing (don't interfere with click sync)
             DetectReloadGun(ref _rsL, _gunL, 0, ReloadKeyL, now);
             DetectReloadGun(ref _rsR, _gunR, 1, ReloadKeyR, now);
 
@@ -590,20 +587,20 @@ namespace IronNestVR
                 return;
             }
 
-            // APPLY PATH PARKED (2026-06-28 loopback run): the AdvanceState driver CANNOT load a gun nobody is operating.
-            // The chamber transfer is fired by the reload CLIP's animation event (AnimationEvent_TransferShellToChamber),
-            // which only runs while the gun is actively operated; programmatic AdvanceState() on the peer ripped through
-            // the state indices with working=False and gunChamber=False FOREVER (never loaded), and the 2s "loaded"
-            // heartbeat re-armed the drive each cycle → the host "stuck in a shell loading loop". So we DO NOT drive here.
-            // We log the target but leave the gun untouched (DetectReload keeps tracking its REAL state — PrevIdx/PrevLoaded
-            // unchanged, so we never re-broadcast). A working apply path (AutoReloadManager.StartAutoReload / direct chamber
-            // set — under probe test, CoopFireProbe Ctrl+Alt+5/6) will replace this. Until then the LOAD direction is inert
-            // (the peer gun looks unloaded); shots still arrive via the §5.5 MSG_FIRE fallback (Step 3).
-            rs.Driving = false; rs.Deadline = now + ReloadDriveTimeoutSec;   // (Deadline kept assigned: driver scaffold is dormant, not removed)
+            // LOAD-DRIVE SKIPPED: the AdvanceState driver CANNOT load a gun nobody is operating. This method still runs
+            // on any received MSG_RELOAD_STATE; it just doesn't drive here. The chamber transfer is fired by the reload
+            // CLIP's animation event (AnimationEvent_TransferShellToChamber), which only runs while the gun is actively
+            // operated; programmatic AdvanceState() on the peer ripped through the state indices with working=False and
+            // gunChamber=False FOREVER (never loaded), and the 2s "loaded" heartbeat re-armed the drive each cycle → the
+            // host "stuck in a shell loading loop". So we DO NOT drive here. We log the target but leave the gun untouched
+            // (DetectReload keeps tracking its REAL state — PrevIdx/PrevLoaded unchanged, so we never re-broadcast). Until
+            // a working apply path replaces this the LOAD direction is inert (the peer gun looks unloaded); shots still
+            // arrive via the MSG_FIRE fallback.
+            rs.Driving = false; rs.Deadline = now + ReloadDriveTimeoutSec;
             Diagnostics.V($"[ctrl] remote reload gun {side}: load target idx={idx} powder={powder} — apply path PARKED, not driving");
         }
 
-        // The §5.3 paced driver — runs every frame while a side is Driving. Takes ONE legit action per spacing window
+        // The paced driver — runs every frame while a side is Driving. Takes ONE legit action per spacing window
         // when not `working`, until the gun is loaded+CanFire (or a guard trips). Never pokes chamber/eject/SetState.
         private static void DriveReloadTick(float now)
         {
@@ -763,7 +760,7 @@ namespace IronNestVR
         }
 
         // Push a group's stored floats onto the turret/guns. Caller decides WHEN (the live stream gates on remote
-        // ownership; the reliable release applies once regardless — REVIEW-fix P2). Always skips a group we own
+        // ownership; the reliable release applies once regardless). Always skips a group we own
         // locally; that check is the caller's (ApplyGroup gates it; the release path checks before calling).
         private static void ApplyGroupValues(Group g, GroupState gs)
         {
@@ -789,8 +786,7 @@ namespace IronNestVR
                         _turret.DesiredElevation = gs.V[0];
                         if (_gunL != null) _gunL.SetDesiredElevation(gs.V[1]);
                         if (_gunR != null) _gunR.SetDesiredElevation(gs.V[2]);
-                        // DIAG: with the fix, gunL.cur should now SLEW toward gunL.des across successive samples
-                        // (before, des stuck at the target while cur stayed 0 — the physics tracked a different field).
+                        // Throttled diagnostic: the applied peer elevation and the resulting gun des/cur slew.
                         if (Time.unscaledTime >= _nextElevDiag)
                         {
                             _nextElevDiag = Time.unscaledTime + 1f;
@@ -811,7 +807,7 @@ namespace IronNestVR
             int powder = Mathf.RoundToInt(gs.V[0]);
             try { if (gun.PowderCharges != powder) gun.SetPowderCharge(powder); } catch { }
             // gs.V[1] = reload-in-progress flag. We sync powder + readiness; faithful rammer-animation replay
-            // is deferred (Phase 3 follow-up), so we don't force the reload coroutine state here.
+            // is deferred, so we don't force the reload coroutine state here.
         }
 
         // While we ADOPT the peer's elevation we force the turret controller to stop re-deriving the gun targets
@@ -900,7 +896,7 @@ namespace IronNestVR
             catch (Exception e) { Log.LogWarning("[ctrl] apply snapshot: " + e.Message); }
         }
 
-        // ---------------- current-state reconcile (REVIEW-fix P3) ----------------
+        // ---------------- current-state reconcile ----------------
 
         // Host → client: the CURRENT turret/gun physical state, broadcast on a low-rate reliable heartbeat. Same
         // 9-float layout as the JIP snapshot, but a SEPARATE type so the client applies it softly (drift-gated)
@@ -975,7 +971,7 @@ namespace IronNestVR
 
         // ---------------- receive ----------------
 
-        // Relay ACL (PLAN.md §2.4): the packet types a client may author, which the host relays to the OTHER
+        // Relay ACL: the packet types a client may author, which the host relays to the OTHER
         // clients. These are the bidirectional, player-operated subsystems — cockpit controls, clipboard edits,
         // map tokens — plus the join-readiness ack. Everything NOT listed is host-authored (the host is the sole
         // source — never relayed) or a host-consumed diagnostic (MSG_DIGEST). CoopP2P relays MSG_POSE itself.
@@ -1000,15 +996,15 @@ namespace IronNestVR
                 || type == CoopScene.MSG_MISSION_READY
                 || type == CoopCards.MSG_CARD   // fire-mission cards are bidirectional — fan out to the other clients (N>2)
                 // Requisition punchcards are peer/either-authored: any crew member may grab/move/place a card or turn
-                // a recon dial, so the host must relay them to the OTHER clients (REVIEW-fix P1 — without this a
-                // client's punchcard action reached the host but never the other clients at N>2). Host-only types
+                // a recon dial, so the host must relay them to the OTHER clients (without this a client's punchcard
+                // action reached the host but never the other clients at N>2). Host-only types
                 // (MSG_PUNCH_DECK/CONSUME/GRAPH) stay off this list.
                 || type == CoopPunchcards.MSG_PUNCH_GRAB || type == CoopPunchcards.MSG_PUNCH_POS
                 || type == CoopPunchcards.MSG_PUNCH_PLACE || type == CoopPunchcards.MSG_PUNCH_DIAL
                 || type == PvpPlayers.MSG_PVP_POS    // PvP player position — either player authors it; host relays to other clients (N>2)
                 || type == PvpCombat.MSG_PVP_HIT     // PvP hit report — attacker authors it, host relays; addressed to the victim's id in-payload
                 // Pressure-valve damage is symmetric (either crew member repairs a valve), so a client's repair must
-                // reach the OTHER clients at N>2 (PLAN-valve §4.4 / REVIEW P1). MSG_ENGINE stays OFF — host-authored.
+                // reach the OTHER clients at N>2. MSG_ENGINE stays OFF — host-authored.
                 || type == CoopPressure.MSG_VALVE;
         }
 
@@ -1026,8 +1022,8 @@ namespace IronNestVR
         // Mixed-mode stream types: the SAME packet carries unreliable LIVE updates and a reliable FINAL/RELEASE
         // edge, distinguished by a flag byte at payload index 9 (flags&1 = final/release). The host relay must read
         // that flag instead of classifying by type alone, or the reliable final is silently downgraded to
-        // unreliable on the host→client leg and a dropped final leaves the piece/dial stuck off (REVIEW-fix P1 —
-        // mixed live/final relay reliability). Both layouts put the flag at index 9: [t][i32][i32-or-f32][flags].
+        // unreliable on the host→client leg and a dropped final leaves the piece/dial stuck off.
+        // Both layouts put the flag at index 9: [t][i32][i32-or-f32][flags].
         public static bool IsMixedFinalStream(byte type)
         {
             return type == CoopMap.MSG_PIECE_MOVE || type == CoopPunchcards.MSG_PUNCH_DIAL;
@@ -1093,7 +1089,7 @@ namespace IronNestVR
                 {
                     if (len < 5) return;
                     int id = r.Int();
-                    // Optional settled group state rides this reliable packet (REVIEW-fix P1). Apply it ONCE,
+                    // Optional settled group state rides this reliable packet. Apply it ONCE,
                     // before clearing ownership, so the dial lands on the final value even if the live unreliable
                     // stream's last frame was lost. Strict-framed + finite-checked like MSG_GROUP.
                     if (r.Pos < len)
@@ -1103,7 +1099,7 @@ namespace IronNestVR
                         if (gi > 0 && gi < _grp.Length)
                         {
                             // Only honor a settled-final from the group's owner — a non-owner's release must not
-                            // settle the dial (REVIEW-fix P1a). Ownership is still set here (we clear it below).
+                            // settle the dial. Ownership is still set here (we clear it below).
                             var gsOwn = _grp[gi];
                             bool ownerOk = !gsOwn.RemoteOwned || now >= gsOwn.Until || gsOwn.RemoteOwner == origin;
                             int n = GroupFloatCount(g);
@@ -1133,7 +1129,7 @@ namespace IronNestVR
                     int id = r.Int();
                     float v = r.Float();
                     // Only the control's current owner may move it. A non-owner's late value (simultaneous-grab
-                    // contention at N>2) must not drag a control another origin already won (REVIEW-fix P1a).
+                    // contention at N>2) must not drag a control another origin already won.
                     if (_byId.TryGetValue(id, out var c))
                     {
                         bool ownerMatch = c.RemoteOwner == origin;
@@ -1150,7 +1146,7 @@ namespace IronNestVR
                     if (gi <= 0 || gi >= _grp.Length) return;
                     var gsOwn = _grp[gi];
                     // Only the group's current owner may stream it. Reject a non-owner's contention frame (N>2);
-                    // accept if nobody owns it yet (stream beat the grab) — matches the pre-cap behavior. (P1a)
+                    // accept if nobody owns it yet (stream beat the grab) — matches the pre-cap behavior.
                     if (gsOwn.RemoteOwned && now < gsOwn.Until && gsOwn.RemoteOwner != origin) return;
                     int n = GroupFloatCount(g);
                     if (len != r.Pos + 4 * n) return;                 // strict framing: exactly n floats, no more/less
@@ -1253,7 +1249,7 @@ namespace IronNestVR
 
                 case MSG_RELOAD_STATE:
                 {
-                    // Strict validation (PLAN-reload §5.3): t + side u8 + idx u8 + loaded u8 + powder i32 = 8 bytes.
+                    // Strict validation: t + side u8 + idx u8 + loaded u8 + powder i32 = 8 bytes.
                     if (len < 8) return;
                     byte side = r.Byte();
                     int idx = r.Byte();
@@ -1346,7 +1342,7 @@ namespace IronNestVR
         private static void ReplayClick(LookAtTarget sw)
         {
 #if !PUBLIC_BUILD
-            CoopFireProbe.InClickReplay = true;   // Q4 (PLAN-host §6.0): tag any RequestFire reached via a replayed fire-button click
+            CoopFireProbe.InClickReplay = true;   // tag any RequestFire reached via a replayed fire-button click (probe only)
 #endif
             try
             {
@@ -1498,7 +1494,7 @@ namespace IronNestVR
         private static void SendRelease(Ctrl c)
         {
             if (!EnsureBuf()) return;
-            // REVIEW-fix (P1): carry the SETTLED group state INSIDE the reliable release, instead of a separate
+            // Carry the SETTLED group state INSIDE the reliable release, instead of a separate
             // unreliable group packet that could be lost or arrive after the release (which clears RemoteOwned and
             // would freeze the dial at its last streamed value). Now release + final value land together, ordered.
             var w = new CoopWire.Writer(_buf); w.Byte(MSG_RELEASE); w.Int(c.NetId);
@@ -1552,11 +1548,7 @@ namespace IronNestVR
             var w = new CoopWire.Writer(_buf); w.Byte(MSG_GROUP); w.Byte((byte)g);
             try { WriteGroupFloats(ref w, g); } catch { return; }
             CoopP2P.Send(_buf, w.Length, false);
-            // DIAG (elevation desync hunt, sender side — self-sufficient on ONE log since host logs keep getting
-            // overwritten): what we actually STREAM for elevation. If gunL.des is ~0 while gunL.cur is raised, the
-            // control updates CURRENT not the DESIRED we send (capture bug → we must send current). If gunL.des
-            // carries the raised value but the peer's gun stays at 0 (per the [diag] DESYNC peer= field), the peer
-            // isn't adopting/slewing (apply bug).
+            // Throttled diagnostic: the elevation values we actually STREAM (turret/gun des + gun cur).
             if (g == Group.Elevation && Time.unscaledTime >= _nextElevSendDiag)
             {
                 _nextElevSendDiag = Time.unscaledTime + 1f;
@@ -1566,7 +1558,7 @@ namespace IronNestVR
         }
 
         // Serialize a group's GroupFloatCount floats at offset o. Shared by the live MSG_GROUP stream and the
-        // settled-state payload folded into the reliable MSG_RELEASE (REVIEW-fix P1).
+        // settled-state payload folded into the reliable MSG_RELEASE.
         private static void WriteGroupFloats(ref CoopWire.Writer w, Group g)
         {
             switch (g)
@@ -1662,9 +1654,9 @@ namespace IronNestVR
                 if (dial && path.IndexOf("Requisition Console", StringComparison.OrdinalIgnoreCase) >= 0) { _reconExcluded++; continue; }
                 // PRESSURE VALVES: every repair dial is a DialInteractable, but its damage is replicated by
                 // CoopPressure (MSG_VALVE / SetDamage01), NOT the dial-visual stream (the valve recomputes damage from
-                // an OnValueChanged EVENT that SetAccumulatedValueUnlimited(...,fireValueChangedEvent:false) won't fire
-                // — PLAN-valve §2). Excluding them also stops a valve grab marking the turret group remotely-owned
-                // (PLAN-valve §1.5). Path shape matches the probe: '…/PressureValve[ (n)]/Dial'.
+                // an OnValueChanged EVENT that SetAccumulatedValueUnlimited(...,fireValueChangedEvent:false) won't fire).
+                // Excluding them also stops a valve grab marking the turret group remotely-owned.
+                // Path shape matches the probe: '…/PressureValve[ (n)]/Dial'.
                 if (dial && path.IndexOf("PressureValve", StringComparison.OrdinalIgnoreCase) >= 0) { _valveExcluded++; continue; }
                 int id = Fnv(path);
                 if (_byId.TryGetValue(id, out var exist))
@@ -1700,7 +1692,7 @@ namespace IronNestVR
         // lighting) all pass. The EXCEPTION is each gun's fireButton: GunController.Awake wires it
         // `fireButton.RegisterOnClickDown(RequestFire)`, so replicating its click would call the peer's
         // RequestFire on the generic click lane — outside CoopBallistics.ReplayShot's _replaying guard — enqueuing
-        // a false LOCAL intent and echoing the shot back (REVIEW-host P1). Firing is owned by the dedicated
+        // a false LOCAL intent and echoing the shot back. Firing is owned by the dedicated
         // MSG_FIRE lane, so the fire button is excluded here (closes the send AND the apply side at one point;
         // local fire still works via its own RegisterOnClickDown).
         private static int ScanSwitches()
@@ -1713,11 +1705,11 @@ namespace IronNestVR
                 LookAtTarget sw = null;
                 try { sw = arr[i].TryCast<LookAtTarget>(); } catch { }
                 if (sw == null) continue;
-                if (IsFireButton(sw)) continue;                                   // REVIEW-host P1: fire button fires via MSG_FIRE, never the click lane
-                // (2026-06-28) Reload buttons are BACK on the click lane. The reload syncs by REPLAYING the lever/button
-                // clicks (the mechanism that worked MOST of the time); the MSG_RELOAD_STATE driver that this exclusion was
-                // protecting can't drive a non-operated gun (animation-gated) and is retired. The real bug is an
-                // INTERMITTENT dropped step in click replication — diagnosed/fixed at the click level, not by excluding it.
+                if (IsFireButton(sw)) continue;                                   // fire button fires via MSG_FIRE, never the click lane
+                // Reload buttons stay on the click lane (paced): the reload syncs by REPLAYING the lever/button clicks.
+                // The MSG_RELOAD_STATE driver that excluding them once protected can't drive a non-operated gun
+                // (animation-gated). The real bug is an INTERMITTENT dropped step in click replication — fixed at the
+                // click level (pacing), not by excluding it.
                 Transform tr = sw.transform;
                 if (tr == null || HasInParent<PickUpZoomTarget>(tr)) continue;     // manual read-zoom — skip
                 string path = PathOf(tr);
@@ -1775,7 +1767,7 @@ namespace IronNestVR
         // immediately before ScanSwitches in EnsureRegistry, and _byId is cleared on every new turret, so the
         // gun refs are always current when this is consulted — a name/path fallback would be both fragile and
         // unnecessary here (if guns fail to resolve at all, the whole co-op fire path is already dark). See
-        // ScanSwitches for why the fire button must not be a generic click control (REVIEW-host P1).
+        // ScanSwitches for why the fire button must not be a generic click control.
         private static bool IsFireButton(LookAtTarget sw)
         {
             if (sw == null) return false;
