@@ -89,7 +89,7 @@ namespace IronNestVR
                 var poses = CoopP2P.RemotePoses;
 
                 // Drive (or spawn) an avatar for every present peer. In PvP, render ONLY teammates — opponents are
-                // isolated (Phase B) and appear solely as a map mirror, never as an in-world body. (IsTeammate is
+                // isolated and appear solely as a map mirror, never as an in-world body. (IsTeammate is
                 // false until the roster is known, so opponents — and, briefly, teammates — stay hidden until then.)
                 bool pvp = Config.PvpActive;
                 foreach (var kv in poses)

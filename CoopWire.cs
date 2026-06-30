@@ -5,7 +5,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Shared co-op packet codec (PLAN-codec.md). Replaces the per-subsystem copy-pasted Put*/Get* helpers with one
+    /// Shared co-op packet codec. Replaces the per-subsystem copy-pasted Put*/Get* helpers with one
     /// bounds-checked Writer/Reader. The on-wire encoding is BYTE-IDENTICAL to the old helpers — little-endian 4-byte
     /// int, IEEE-754 float via SingleToInt32Bits, string = [int32 byte-length][utf8 bytes], Vector3 = 3 floats,
     /// Quaternion = 4 floats, bool = 1 byte — so migrating a subsystem changes no packet on the wire.
@@ -56,7 +56,7 @@ namespace IronNestVR
             public void Float(float v) { Int(BitConverter.SingleToInt32Bits(v)); }
             public void Vec(Vector3 v)   { Float(v.x); Float(v.y); Float(v.z); }
             public void Quat(Quaternion q) { Float(q.x); Float(q.y); Float(q.z); Float(q.w); }
-            // Reserved for the optional/last CoopP2P origin-trailer migration (PLAN-codec.md): the transport still
+            // Reserved for the optional/last CoopP2P origin-trailer migration: the transport still
             // uses its own PutU64 for now, so this has no production caller yet — kept (and SelfTest-covered) so the
             // trailer can adopt CoopWire without re-adding it. NOT a sign P2P was half-migrated.
             public void U64(ulong v) { if (!Room(8)) return; for (int i=0;i<8;i++) _b[Pos+i]=(byte)(v>>(8*i)); Pos+=8; }

@@ -8,7 +8,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op (4c, second half): replicate the host's IMPACT RESULT so the client's tactical map shows
+    /// Co-op: replicate the host's IMPACT RESULT so the client's tactical map shows
     /// HIT information.
     ///
     /// THE PROBLEM (tester 2026-06-21): "field report said HIT but the map did not show the enemy hit." Maps don't

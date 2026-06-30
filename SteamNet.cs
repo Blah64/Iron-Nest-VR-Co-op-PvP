@@ -8,7 +8,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 1 co-op networking: public Steam lobby create / browse / join.
+    /// Co-op networking: public Steam lobby create / browse / join.
     ///
     /// Rides the GAME's already-running Steamworks.NET (the demo ships Heathen + Steamworks.NET and
     /// SteamAPI is initialised before we load). So we must NOT call SteamAPI.Init/Shutdown. We register
@@ -22,7 +22,7 @@ namespace IronNestVR
     /// key; the browser filters RequestLobbyList on that key so the list shows only IronNestVR lobbies.
     ///
     /// Debug triggers (keyboard): F9 create | F10 refresh list | F11 join first listed | F12 leave.
-    /// (A proper in-VR lobby browser comes in Phase 1.5; this proves the transport first.)
+    /// (A proper in-VR lobby browser comes later; this proves the transport first.)
     /// </summary>
     internal static class SteamNet
     {
@@ -31,7 +31,7 @@ namespace IronNestVR
         private const string ModKey = "invr_coop";   // lobby-data marker so the browser lists only our lobbies
         private const string ModVal = "1";
         private const string NameKey = "name";
-        private const string ModeKey = "invr_mode";   // "coop" | "pvp" — host tags the lobby; members derive Config.PvpActive (PLAN-pvp.md §1a)
+        private const string ModeKey = "invr_mode";   // "coop" | "pvp" — host tags the lobby; members derive Config.PvpActive
         private const string LockKey = "invr_locked"; // "1" while the lobby is locked — browser hides it + clients show the badge
         private static bool _pendingPvp;              // mode of the lobby we're about to create (consumed in OnLobbyCreated)
         public static int MaxMembers => Config.CoopMaxPlayers;   // lobby member cap (Config-driven; see CoopMaxPlayers)

@@ -8,19 +8,15 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// PvP Phase 1 — PLAYER PRESENCE. Each player is represented on the OTHER player's tactical map as an enemy
-    /// <see cref="MapEntity"/>, so they can be seen and (Phase 2) shelled. Uses the placement recipe proven in
-    /// Phase 0 (PvpProbe / PLAN-pvp.md §3.2): clone an EntityLocation under "Fire Mission Root", set
-    /// transform.localPosition = (gridX,gridY,0), Init, RecalculateAndRegister, ImpactTracker.RegisterEntity.
+    /// PvP PLAYER PRESENCE. Each player is represented on the OTHER player's tactical map as an enemy
+    /// <see cref="MapEntity"/>, so they can be seen and shelled. Placement recipe: clone an EntityLocation under
+    /// "Fire Mission Root", set transform.localPosition = (gridX,gridY,0), Init, RecalculateAndRegister,
+    /// ImpactTracker.RegisterEntity.
     ///
     /// FLOW (symmetric, no host authority — each machine owns its own player position):
     ///   • Each machine BROADCASTS its own player's map grid position (<c>MSG_PVP_POS</c>, byte 42) periodically.
     ///   • On receipt it spawns/moves a MIRROR MapEntity(Role=Enemy) for that origin so the sender shows up as a
     ///     target on this machine's map. Keyed by the author's SteamID (origin), so N>2 each get their own mirror.
-    ///
-    /// PHASE 1 SCOPE: presence + position only. NO damage / shot adjudication yet (that's Phase 2 PvpCombat — a
-    /// StartImpact postfix that, when MY shell's hit set contains an opponent mirror, reports the hit to that peer
-    /// who applies it to their own health). For now each player's grid is a fixed per-side placeholder spawn.
     ///
     /// Entirely gated on <see cref="Config.PvpActive"/> (a PvP lobby) + in-mission + a peer ⇒ co-op/solo untouched.
     /// </summary>
@@ -58,7 +54,7 @@ namespace IronNestVR
 
         private static Il2CppStructArray<byte> _buf;
         private static float _nextSend;
-        private const float SendIntervalSec = 0.5f;   // position is static in Phase 1 — a slow reliable keyframe is plenty
+        private const float SendIntervalSec = 0.5f;   // position is static — a slow reliable keyframe is plenty
 
         // Per-TEAM spawn grids (FMR-local grid units; 1 unit == 1 km on the demo maps — the map is 20x10 km). The HOST
         // RANDOMIZES these at match start within the arena's REAL grid bounds, guaranteeing the two team turrets spawn at
@@ -348,7 +344,7 @@ namespace IronNestVR
             SpawnMirror(origin, grid, role, health);
         }
 
-        // ---------------- spawn / move (the Phase 0 locked recipe) ----------------
+        // ---------------- spawn / move (the locked recipe) ----------------
 
         private static void SpawnMirror(ulong origin, Vector2 grid, int role, float health)
         {
@@ -391,7 +387,6 @@ namespace IronNestVR
             CanvasGroup vis = null; try { vis = loc.VisibilityGroup; } catch { }
             _mirrors[origin] = new Mirror { Origin = origin, ID = id, Go = go, Loc = loc, Entity = e, Grid = grid, RevealedGrid = grid, HasRevealedPos = false, Health = health, Vis = vis };
             _spawned++;
-            // (render-state dump retired — marker rendering is confirmed; RevealMirrors keeps it through fog)
             Log.LogInfo($"[pvp] spawned player mirror '{id}' at grid ({grid.x:0.0},{grid.y:0.0}) hp={health:0.#} <- peer {origin}");
         }
 
@@ -429,7 +424,7 @@ namespace IronNestVR
             if (health < before) { try { ReportEnemyHit(health); } catch { } }   // our team just landed a hit on this enemy
         }
 
-        // ACQUISITION (recon-card spotting, the real mechanic — replaces the old always-on RevealMirrors cheat). The
+        // ACQUISITION (recon-card spotting). The
         // enemy turret mirror is fog-hidden by DEFAULT (RevealUntil=0) and only shown while a recon sweep has it spotted
         // (OnReconReveal pushes RevealUntil forward). We OWN the mirror's on-map visibility outright rather than relying
         // on the native fog touching a mod-spawned clone: force its icon Image on while revealed, off otherwise. The
@@ -875,7 +870,7 @@ namespace IronNestVR
         }
 #endif
 
-        // ---------------- damage (Phase 2 shot lane, victim-authoritative) ----------------
+        // ---------------- damage (shot lane, victim-authoritative) ----------------
 
         // Called by PvpCombat when a peer reports their shell hit MY team. The hit is addressed to the team CAPTAIN (the
         // only member with a mirror), so this runs on the captain, who owns the shared team health: decrement it and
@@ -974,7 +969,7 @@ namespace IronNestVR
         private static int HpInt(float h) => Mathf.Max(0, Mathf.CeilToInt(h));
 
         // The map marker needs BOTH a valid Icon KEY (in EntityLocation.PossibleMapIcons) AND the resolved Sprite
-        // (MapEntity.IconRaw) — the key alone draws a blank (the Phase-1 invisible-marker bug). PossibleMapIcons maps
+        // (MapEntity.IconRaw) — the key alone draws a blank (the invisible-marker bug). PossibleMapIcons maps
         // key -> MapEntityIcon{ID, Sprite Icon}, so we pull both from it once. Prefer an artillery / fire-direction /
         // enemy icon (this is an artillery opponent), else the first. Logs the key list + whether the sprite resolved.
         private static string _iconId;

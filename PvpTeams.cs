@@ -11,7 +11,7 @@ namespace IronNestVR
     /// PvP TEAMS — team membership + roster for team PvP (up to 4 players, 2 teams ⇒ 2v2). A team IS a vehicle:
     /// teammates share the co-op stack (control sync, avatars, map) and a single turret; opponents are isolated and
     /// appear only as a map mirror to shell. This module owns ONLY the membership model; the team-scoped replication
-    /// gate (Phase B) and per-team vehicle/combat (Phase C) consume <see cref="IsTeammate"/>/<see cref="MyTeam"/>.
+    /// gate and per-team vehicle/combat consume <see cref="IsTeammate"/>/<see cref="MyTeam"/>.
     ///
     /// AUTHORITY: host-authoritative roster. The host auto-assigns each player to the SMALLER team on join (kept
     /// balanced), and broadcasts the full roster (<c>MSG_PVP_TEAM</c> kind=ROSTER) to everyone. A player may switch
@@ -165,7 +165,7 @@ namespace IronNestVR
             }
         }
 
-        // ---------------- public predicates (Phase B/C) ----------------
+        // ---------------- public predicates ----------------
 
         public static int GetTeam(ulong id) => _roster.TryGetValue(id, out var e) ? e.Team : -1;
         public static int MyTeam => GetTeam(CoopP2P.MyId);
@@ -187,7 +187,7 @@ namespace IronNestVR
             return c;
         }
 
-        // ---------------- team CAPTAIN (Phase C: one vehicle per team) ----------------
+        // ---------------- team CAPTAIN (one vehicle per team) ----------------
         // A team is ONE vehicle, so it needs ONE authoritative representative: the LOWEST SteamID on the team. Every
         // machine computes the same captain from the shared roster (no election protocol). The captain owns the team's
         // shared health and is the only member that broadcasts the team's map position — so opponents see exactly one

@@ -7,7 +7,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op: replicate the gun-console FIRE-MISSION CARD (PATH B — player-driven; the printed firing
+    /// Co-op: replicate the gun-console FIRE-MISSION CARD (PATH B — player-driven; the printed firing
     /// solution). When a player computes a solution the <c>FireMissionCardPrinter</c> spawns a <c>FireMissionCard</c>
     /// and calls <c>Apply(distance, bearing, gunElevation, powderCharge, shellType, gunSelection)</c> — six ALREADY-
     /// RESOLVED strings. The peer can't re-derive them (they read that machine's own dials / artillery computer), so

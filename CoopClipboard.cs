@@ -8,7 +8,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 3 co-op: replicate the HUD clipboard CONTENTS between the two lobby members. All displayed text
+    /// Co-op: replicate the HUD clipboard CONTENTS between the two lobby members. All displayed text
     /// lives in <c>NotepadSection</c> components keyed by a designer-assigned <c>UnityTag</c> (stable across
     /// both machines on the same build); the loggers (markers/odometer/espresso) and any mission-graph
     /// briefing text all just call <c>NotepadSection.Write(...)</c>, so syncing the section TEXT captures

@@ -7,7 +7,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op (increment 4d): replicate the TELEPRINTER "typing machine" ORDERS.
+    /// Co-op: replicate the TELEPRINTER "typing machine" ORDERS.
     ///
     /// ACTIVE even under the NARROW gate (Config.CoopOrdersSync = true). The narrow gate only suppresses the
     /// client's enemy SPAWN node — but tested 2026-06-20 the client's order text still came out EMPTY, because

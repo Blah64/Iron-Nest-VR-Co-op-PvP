@@ -6,7 +6,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op: SHOOTER-AUTHORITATIVE SHELL FLIGHT (visible arc + fall-of-shot).
+    /// Co-op: SHOOTER-AUTHORITATIVE SHELL FLIGHT (visible arc + fall-of-shot).
     ///
     /// THE PROBLEM (LAN tests 2026-06): a fired shell lands in different spots on host vs client even after aim/
     /// powder/shell sync. A long dead-end chain proved NO pre-shot input can be reliably synced, so we copy the
@@ -32,7 +32,7 @@ namespace IronNestVR
     /// matters. Dispersion is still zeroed so the shooter's own shot is itself a clean point.
     ///
     /// Adjudication stays host-authoritative via CoopImpact's MSG_IMPACT hit broadcast (we don't touch StartImpact).
-    /// SCOPE: co-op lobby + peer + MissionActive only. Solo/flatscreen fire stock. See [[ironnest-aim-desync]] [[ironnest-flatscreen-parity]].
+    /// SCOPE: co-op lobby + peer + MissionActive only. Solo/flatscreen fire stock.
     /// </summary>
     internal static class CoopBallistics
     {
@@ -55,7 +55,7 @@ namespace IronNestVR
         // The old global flag (6 s, not per-gun) mis-tagged a LOCAL shot as a peer replay whenever the OTHER player
         // was active, hijacking it onto the peer's target ("wild, not dispersion"). Instead every shot that WILL fire
         // is tagged at RequestFire time and queued PER SIDE; OnShellVisualPost consumes FIFO, so each shell gets
-        // exactly its own author's decision. Probe-verified (PLAN-host §6.0, run 2026-06-28): RequestFire→FireShell is
+        // exactly its own author's decision. Probe-verified: RequestFire→FireShell is
         // 1:1 ordered per gun (Q1) and a no-op RequestFire is synchronously detectable via CanFire (Q2), so we never
         // enqueue a phantom. fireDelay is ~0.01 s (Q3) — useless as a deadline — so the orphan backstop is a fixed 2 s.
         internal struct FireIntent

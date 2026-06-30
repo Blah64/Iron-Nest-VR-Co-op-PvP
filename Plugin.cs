@@ -50,13 +50,13 @@ namespace IronNestVR
                 catch { }
             }
 
-            // Phase 4 co-op: install the host-authoritative sim-gate (Harmony). Safe pre-scene: the patched
+            // Co-op: install the host-authoritative sim-gate (Harmony). Safe pre-scene: the patched
             // mission-graph methods only run during a mission, and the gate is inert until a client joins.
             CoopSim.ApplyPatches();
             CoopMap.Init();   // Harmony hooks for fire-mission map pieces (MapPiece3D drag) + bearing/range lines (MapMarkerLineUI finalize)
 #if !PUBLIC_BUILD
-            PvpProbe.ApplyPatches();   // PvP plan Phase 0: impact-logger patch (inert unless Config.PvpProbe; cfg-only)
-            CoopFireProbe.ApplyPatches();   // PLAN-host §6.0 fire-state probe (inert unless Config.FireProbe; dev build only)
+            PvpProbe.ApplyPatches();   // PvP: impact-logger patch (inert unless Config.PvpProbe; cfg-only)
+            CoopFireProbe.ApplyPatches();   // fire-state probe (inert unless Config.FireProbe; dev build only)
 #endif
 
             // Make our MonoBehaviour type callable from the IL2CPP runtime.

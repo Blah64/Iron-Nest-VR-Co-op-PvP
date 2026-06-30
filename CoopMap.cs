@@ -25,8 +25,7 @@ namespace IronNestVR
     /// frame drift and slot snapping are not factors on this map. We hook the game's own drag methods:
     /// <c>BeginDragFromManager</c> starts LIVE streaming (unreliable, so the peer sees the token slide rather
     /// than teleport), <c>EndDragFromManager</c> sends the authoritative final (reliable). Keyed by
-    /// FNV(hierarchy-path), applied via SetPositionAndRotation. (Matches the working reference co-op mod, plus
-    /// the live motion it lacked.)
+    /// FNV(hierarchy-path), applied via SetPositionAndRotation.
     ///
     /// (C) BEARING/RANGE LINES (<c>MapMarkerLineUI</c>) — create/destroy lifecycle, no stable id, so each side
     /// assigns its own collision-free netId. Geometry is two endpoints in <c>mapRect</c>-LOCAL space (already
@@ -37,7 +36,7 @@ namespace IronNestVR
     /// encodes color) and replays Initialize/UpdateLine/FinalizePlacement under an echo guard. DELETE is caught by
     /// polling <c>placedMarkers</c> for a tracked marker that has left the list → MSG_MARKER_DEL; the peer
     /// destroys its mirror. Either side may add or delete; both propagate. Mission-spawned MapEntity targets
-    /// are host-authoritative (Phase 4 / CoopEntities).
+    /// are host-authoritative (CoopEntities).
     /// </summary>
     internal static class CoopMap
     {
@@ -48,7 +47,7 @@ namespace IronNestVR
         public const byte MSG_PLACE = 12;       // [t][itemId i32][x,y,z f32][slotId i32]   reliable
         public const byte MSG_MARKER_ADD = 14;  // [t][netId i32][prefabName str][oX,oY,tX,tY f32] reliable  (13 = ctrl JIP snap) — (tX,tY)=ABSOLUTE target = origin+tip
         public const byte MSG_MARKER_DEL = 15;  // [t][netId i32]                           reliable
-        public const byte MSG_PIECE_MOVE = 24;  // [t][pieceId i32][seq i32][flags u8][pos 3f][rot 4f]  — live=unreliable, final(flags&1)=reliable; per-piece seq drops late/reordered live moves (REVIEW-fix P1)
+        public const byte MSG_PIECE_MOVE = 24;  // [t][pieceId i32][seq i32][flags u8][pos 3f][rot 4f]  — live=unreliable, final(flags&1)=reliable; per-piece seq drops late/reordered live moves
 
         // Harmony: fire-mission MAP PIECES (MapPiece3D) and LINES (MapMarkerLineUI) are driven by the game's own
         // drag/finalize methods, not a pollable list — so we hook them (matching the working reference co-op mod)
@@ -61,7 +60,7 @@ namespace IronNestVR
         private static float _nextDelScan;   // throttle for marker delete-detection poll
         private static float _nextAddScan;   // throttle for marker ADD-detection poll (hook-independent backstop)
 
-        // REVIEW-fix (P1): per-piece monotonic sequence so a late/reordered unreliable LIVE drag move can't
+        // Per-piece monotonic sequence so a late/reordered unreliable LIVE drag move can't
         // overwrite the reliable drag-end FINAL (or a newer live move). The sender stamps an increasing seq per
         // piece id; the receiver applies a move only if its seq beats the last it applied for that piece. The
         // FINAL always carries the highest seq of its drag, so once applied no older live move can move it back.
@@ -568,7 +567,7 @@ namespace IronNestVR
             {
                 if (!CoopWire.Finite(pos)) return;
                 if (_draggingLocal.Contains(id)) return;   // we're dragging this piece locally — local input wins, ignore the peer
-                // REVIEW-fix (P1): drop a stale/reordered move. The reliable FINAL carries the highest seq of its
+                // Drop a stale/reordered move. The reliable FINAL carries the highest seq of its
                 // drag, so once it lands no older unreliable live move can move the piece back to an in-flight spot.
                 if (_pieceSeqIn.TryGetValue(id, out var last) && seq <= last) return;
                 if (!_pieces.TryGetValue(id, out var p) || p == null) { ScanPieces(true); _pieces.TryGetValue(id, out p); }
@@ -584,7 +583,7 @@ namespace IronNestVR
         private static void SendPieceMove(int id, Vector3 pos, Quaternion rot, bool reliable, bool final)
         {
             if (!EnsureBuf() || !CoopWire.Finite(pos)) return;
-            _pieceSeqOut.TryGetValue(id, out var seq); seq++; _pieceSeqOut[id] = seq;   // per-piece monotonic (REVIEW-fix P1)
+            _pieceSeqOut.TryGetValue(id, out var seq); seq++; _pieceSeqOut[id] = seq;   // per-piece monotonic
             var w = new CoopWire.Writer(_buf);
             w.Byte(MSG_PIECE_MOVE); w.Int(id); w.Int(seq); w.Byte((byte)(final ? 1 : 0));
             w.Vec(pos); w.Quat(rot);
@@ -955,8 +954,8 @@ namespace IronNestVR
             DumpSceneObjects();
         }
 
-        // One-shot structural probe (F4): enumerate every map-related object actually live in the CURRENT scene so
-        // we can see how the fire-mission tactical map is built (vs the operations map this module was written for).
+        // Structural probe (F4): enumerate every map-related object actually live in the CURRENT scene so
+        // we can see how the tactical map is built.
         // Run on BOTH host and client and diff: tells us which token/screw/line types exist, whether they're active
         // or graph-spawned-and-absent, and what their parent frame is — the data needed to sync them correctly.
         public static void DumpSceneObjects()

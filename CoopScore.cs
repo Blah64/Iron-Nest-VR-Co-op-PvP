@@ -6,7 +6,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op: host-authoritative SCORE / mission-outcome replication so the client's win/lose result and
+    /// Co-op: host-authoritative SCORE / mission-outcome replication so the client's win/lose result and
     /// requisition currency match the host. Two pieces, split by risk:
     ///
     /// (1) MISSION OUTCOME (the result screen) — a Harmony postfix on <c>MissionManager.MarkMissionComplete</c> /

@@ -6,8 +6,8 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// PvP Phase 1/2 — MATCH COORDINATOR + LAUNCH. Owns the PvP-mode lifecycle:
-    ///   • MODE is derived in SteamNet from the lobby's invr_mode tag into Config.PvpActive (PLAN-pvp.md §1a).
+    /// PvP MATCH COORDINATOR + LAUNCH. Owns the PvP-mode lifecycle:
+    ///   • MODE is derived in SteamNet from the lobby's invr_mode tag into Config.PvpActive.
     ///   • LAUNCH: the HOST starts the duel arena from the lobby (it's not on the demo board, so we resolve the
     ///     combat MissionGraph/OperationGraph by scene name and call MissionManager.StartOperation directly). The
     ///     existing CoopScene host→client replication then carries every member into the SAME scene together — so
@@ -17,8 +17,7 @@ namespace IronNestVR
     ///     script fires early), and the counter-battery system (scripted incoming fire + its timer-expiry auto-fail)
     ///     disabled here once the arena scene is live.
     ///
-    /// Co-op is fully isolated: when PvpActive the conflicting co-op replication self-disables (Appendix B guards).
-    /// Match state (rounds, win/lose) and the shot/damage lane grow here + in PvpCombat in later phases.
+    /// Co-op is fully isolated: when PvpActive the conflicting co-op replication self-disables.
     /// </summary>
     internal static class PvpMatch
     {
@@ -117,7 +116,7 @@ namespace IronNestVR
                         Config.PvpActive = !Config.PvpActive;
                         Log.LogInfo($"[pvp] DEV toggle → Config.PvpActive={Config.PvpActive} (co-op replication {(Config.PvpActive ? "DISABLED" : "restored")})");
                     }
-                    // DEV: host launches the arena. Ctrl+Shift+L. (Eventual UI: a lobby "Launch Match" button.)
+                    // DEV: host launches the arena. Ctrl+Shift+L.
                     if (kb[UnityEngine.InputSystem.Key.L].wasPressedThisFrame) LaunchArena();
                     // DEV: force-spot the enemy (test the move/hit lane without first proving the recon-card path). Ctrl+Shift+R.
                     if (kb[UnityEngine.InputSystem.Key.R].wasPressedThisFrame) { PvpPlayers.OnReconReveal(); Log.LogInfo("[pvp] DEV force-reveal enemy (Ctrl+Shift+R)"); }
@@ -323,7 +322,7 @@ namespace IronNestVR
                 catch (Exception e) { Log.LogWarning("[pvp] clone inventory: " + e.Message); }
             }
             // SCREEN SHAKE — fire the prefab's Cinemachine impulse with an EXPLICIT strong velocity. Force/parameterless
-            // generate can resolve to ~0 if the source has no default velocity (that was v6's silent no-op). An incoming
+            // generate can resolve to ~0 if the source has no default velocity (a silent no-op). An incoming
             // round ⇒ a hard downward + lateral slam; the listener (census above) turns it into camera shake.
             try
             {

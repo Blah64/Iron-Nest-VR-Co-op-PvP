@@ -7,7 +7,7 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op FOUNDATION: host-authoritative SPAWN gating (NARROW gate).
+    /// Co-op foundation: host-authoritative SPAWN gating (NARROW gate).
     ///
     /// The mission sim is a SleepyNodes node-graph state machine. We want both players to run their OWN local
     /// machinery during a mission — gun, reload/ammo, objectives, scoring, animations, teleprinter orders — so
@@ -21,8 +21,8 @@ namespace IronNestVR
     ///     the test stalled. Mislearned as "gate everything."
     ///   • v2 (replaced): FULL gate — Harmony-suppress <c>MissionGraph</c>/<c>MissionPassiveGraph</c> Run+Update
     ///     on the client. That made the client a PURE VIEWER: it ran NONE of the mission sim, so gun/reload/AMMO/
-    ///     objectives were all dead and only explicitly-replicated state appeared. Co-op completeness became
-    ///     whack-a-mole (ammo empty, etc.). See the coop-mod-sourcemap memory.
+    ///     objectives were all dead and only explicitly-replicated state appeared. Achieving co-op completeness
+    ///     this way required replicating every subsystem piecemeal (ammo empty, etc.). See the coop-mod-sourcemap memory.
     ///   • v3 (CURRENT, per user direction 2026-06-20): NARROW gate — suppress ONLY the spawn node's action
     ///     (<c>State_SpawnMapEntity.OnEnter</c>) on a co-op client. The rest of the mission graph runs normally,
     ///     so the client drives its own gun/reload/ammo/objectives/teleprinter LOCALLY. Enemies/targets are
@@ -73,7 +73,7 @@ namespace IronNestVR
             Log.LogInfo($"[sim] host-authoritative SPAWN gate (narrow): {_patched}/1 spawn-node method patched " +
                         "(client runs its own mission machinery; only spawns are host-authoritative; host + solo run normally)");
 
-            // PvP BARE ARENA (PLAN-pvp.md Appendix A): suppress scripted PvE content on BOTH machines while PvpActive,
+            // PvP BARE ARENA: suppress scripted PvE content on BOTH machines while PvpActive,
             // so a duel scene is just map + artillery + the two players. These prefixes are inert unless PvpActive, so
             // co-op + solo are untouched. State_SpawnMapEntity is already covered (GatePrefix gained a PvpActive branch).
             // Content/entity nodes to neutralize in a PvP bare arena. State_DamageEntity is CRITICAL: the engine's
@@ -177,7 +177,7 @@ namespace IronNestVR
             }
             catch (Exception e) { Log.LogWarning("[sim] punchcard redeem patch: " + e.Message); }
 
-            // IMPACT RESULT (4c map hit-markers): capture the host's authoritative per-shell adjudication so the
+            // IMPACT RESULT (map hit-markers): capture the host's authoritative per-shell adjudication so the
             // client's ImpactIndicators light up on the map even though the client's own shell locally "missed" a
             // target the host already destroyed. Postfix reads the returned hit list; CoopImpact broadcasts HITS only.
             try

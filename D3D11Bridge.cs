@@ -10,7 +10,7 @@ namespace IronNestVR
     /// Obtains the live Direct3D 11 device/context that Unity is rendering with (without recompiling
     /// the game) by reading the native pointer behind a throwaway RenderTexture, and exposes the
     /// adapter LUID for the OpenXR graphics-requirements gate plus a GPU texture copy used to feed
-    /// OpenXR swapchains in Phase 2.5/3.
+    /// OpenXR swapchains.
     ///
     /// Requires the game to run on D3D11 (launch with <c>-force-d3d11</c>); D3D12 would need Unity's
     /// command queue, which isn't reachable from an injected plugin.

@@ -28,7 +28,8 @@ namespace IronNestVR
     ///                                   desktop mirror — NOT pixel fill — so dynamic-res won't help.
     ///
     /// Pure <see cref="Stopwatch"/> timing — no native GPU queries, no IL2CPP end-of-frame hooks. The VR
-    /// loop never executes in flatscreen, so flatscreen parity is untouched regardless. Off = fully inert.
+    /// loop never executes in flatscreen, so flatscreen parity is untouched regardless. Default OFF in public
+    /// builds, ON in tester builds; logs [probe] every PerfProbeIntervalSec when on. Off = inert.
     /// </summary>
     internal static class PerfProbe
     {

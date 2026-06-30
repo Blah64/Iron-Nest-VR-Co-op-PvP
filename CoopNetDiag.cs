@@ -17,7 +17,8 @@ namespace IronNestVR
     /// Turret-angle fields are skipped while EITHER side is actively operating a control (the digest carries a
     /// "busy" bit): a turret mid-slew legitimately reads different on the two machines across a laggy link. Counts
     /// are always compared — a persistent entity/marker-count mismatch is a real lost-spawn / lost-line. The digest
-    /// rides the same Steam P2P channel (type byte MSG_DIGEST), reliable, ~1/s. Gate with Config.CoopDesyncDetect.
+    /// rides the same Steam P2P channel (type byte MSG_DIGEST), reliable, ~1/s. Default ON in all builds; sends
+    /// reliable MSG_DIGEST ~1/s per peer and logs warnings — kept on in public for field desync diagnosis.
     /// Host-as-reference model: only clients send digests; the host compares each client's digest against its own
     /// state, keyed per origin (steam id), so 3+ player lobbies get per-client divergence tracking.
     /// </summary>

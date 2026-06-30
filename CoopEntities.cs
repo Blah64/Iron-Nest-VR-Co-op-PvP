@@ -8,31 +8,24 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Phase 4 co-op (increment 4b): replicate the host's mission ENTITIES (enemies / targets) to the client.
+    /// Replicate the host's mission ENTITIES (enemies / targets) to the client.
     ///
-    /// Pairs with <see cref="CoopSim"/> (4a): the client's enemy/target SPAWN node is gated OFF (narrow gate),
-    /// so it authors no enemies locally and instead MIRRORS the host's. (The rest of the client's mission sim
-    /// runs normally now.) Enemies are data records (<c>MapEntity</c>), each mirrored
+    /// Pairs with <see cref="CoopSim"/>: the client's enemy/target SPAWN node is gated OFF, so it authors no
+    /// enemies locally and instead MIRRORS the host's. Enemies are data records (<c>MapEntity</c>), each mirrored
     /// in-scene by an <c>EntityLocation</c> MonoBehaviour. There is NO entity registry/factory in the demo, so:
     ///   • the HOST enumerates <c>FindObjectsByType&lt;EntityLocation&gt;()</c> → <c>.Entity</c>, diffs by a
     ///     stable hash of the MapEntity's string <c>ID</c>, and broadcasts SPAWN (full record) / UPDATE
     ///     (position + state + health) / DESPAWN. Diff sends mean a static entity costs one SPAWN then silence.
     ///   • the CLIENT applies them: for an ID it doesn't have it ADOPTS a same-ID scene entity if one already
     ///     exists (shared pre-placed fire-mission targets live in both scenes), otherwise CLONES a cached
-    ///     <c>EntityLocation</c> template and binds a fresh MapEntity via the verified recipe
-    ///     <c>Init(e)</c> → <c>RecalculateAndRegister(true)</c> (see ironnest-phase4-entities memory).
+    ///     <c>EntityLocation</c> template and binds a fresh MapEntity via the recipe
+    ///     <c>Init(e)</c> → set transform.localPosition → <c>RecalculateAndRegister(true)</c>.
     ///
     /// SCOPED TO <c>GamePhase.MissionActive</c> on BOTH sides, so the validated hub co-op is never touched and
     /// no entity traffic flows outside an actual mission. Host-authoritative: the client never authors entities.
     ///
-    /// UNVERIFIED until a 2-player mission test (logged heavily so the first run tells us the truth):
-    ///   (1) a gated client in a mission scene having an EntityLocation to clone — we cache a template from any
-    ///       scene that has one (e.g. the hub's ~14) and keep it across loads, but the CLONE PARENT must be
-    ///       resolved in the live scene (EntityLocation positions itself in a root canvas).
-    ///   (2) the exact reposition call (we set MapEntity.Position + EntityLocation.LocalPosition + re-register).
-    ///   (3) damage is mirrored as raw Health/State (no ShellDefinition replay yet — that's a 4c refinement).
-    /// Also UNSOLVED companion piece: getting both players INTO the same mission scene (mission-start / scene
-    /// transition replication) — entity sync assumes they're already co-located in a MissionActive scene.
+    /// Damage is mirrored as raw Health/State (no ShellDefinition replay). Assumes both players are already
+    /// co-located in a MissionActive scene; mission-start / scene-transition replication is handled by CoopScene.
     /// </summary>
     internal static class CoopEntities
     {
@@ -42,11 +35,11 @@ namespace IronNestVR
         //                                     ^ lpos = the host EntityLocation's transform.localPosition under Fire Mission Root. The marker's
         //                                       world TRANSFORM (what the recon photo reads) is authored here; LocalPosition(grid cell) is DERIVED
         //                                       from it by RecalculateAndRegister, so the client must place the TRANSFORM, not the grid cell.
-        public const byte MSG_UPDATE = 17;   // [t][key i32][seq i32][pos 3f][state i32][hp i32]  RELIABLE — discrete state/hp change OR periodic position keyframe (REVIEW-fix P2)
+        public const byte MSG_UPDATE = 17;   // [t][key i32][seq i32][pos 3f][state i32][hp i32]  RELIABLE — discrete state/hp change OR periodic position keyframe
         public const byte MSG_DESPAWN = 18;  // [t][key i32]                              reliable
-        public const byte MSG_MOVE = 23;     // [t][key i32][seq i32][pos 3f]            UNRELIABLE — position stream; per-entity seq drops late/reordered moves (REVIEW-fix P2)
+        public const byte MSG_MOVE = 23;     // [t][key i32][seq i32][pos 3f]            UNRELIABLE — position stream; per-entity seq drops late/reordered moves
         public const byte MSG_ENTSET = 40;   // [t][count i32][key i32]×count            reliable — host's authoritative LIVE key-set; client reaps mirrors not in it (heals a lost DESPAWN). Robustness re-assert.
-        // REVIEW-fix (P1): movement is a SEPARATE position-only packet so a reordered/stale unreliable move can
+        // Movement is a SEPARATE position-only packet so a reordered/stale unreliable move can
         // never carry old state/hp and roll back a newer reliable damage/death. Discrete state/hp travels ONLY
         // on the reliable+ordered MSG_UPDATE; MSG_MOVE touches position alone (self-correcting next frame).
 
@@ -56,7 +49,7 @@ namespace IronNestVR
             public Vector3 Pos;
             public int State;
             public int Health;
-            public int Seq;            // REVIEW-fix (P2): per-entity monotonic seq across move+update (position ordering)
+            public int Seq;            // per-entity monotonic seq across move+update (position ordering)
             public float LastKeyframe; // last time we sent a reliable position keyframe for this entity
         }
 
@@ -69,7 +62,7 @@ namespace IronNestVR
             public MapEntity Entity;
             public bool IsClone;          // we instantiated it (destroy on despawn) vs adopted a scene entity
             public int LastState;
-            public int LastSeq;           // REVIEW-fix (P2): highest position seq applied (drops late/reordered moves)
+            public int LastSeq;           // highest position seq applied (drops late/reordered moves)
         }
 
         // Host: last broadcast state per entity (diff source). Client: live mirrors.
@@ -94,7 +87,7 @@ namespace IronNestVR
 
         private static float _nextSend;
         private static float _lastResync;   // host: last time the full entity-set re-assert (SPAWN re-send + key-set) ran
-        private static Il2CppArrayBase<UnityEngine.Object> _scanArr;   // cached EntityLocation set; re-enumerated at CoopEntityScanHz, not every send tick (REVIEW-fix P2)
+        private static Il2CppArrayBase<UnityEngine.Object> _scanArr;   // cached EntityLocation set; re-enumerated at CoopEntityScanHz, not every send tick
         private static float _nextScan;
         private const float MoveEpsilonSq = 0.0001f;   // ~1cm map-units; ignore sub-pixel jitter
 
@@ -131,7 +124,7 @@ namespace IronNestVR
                 return;
             }
 
-            // REVIEW-fix (P2): the scene-wide FindObjectsByType scan is expensive on weak systems, so re-enumerate
+            // The scene-wide FindObjectsByType scan is expensive on weak systems, so re-enumerate
             // only at CoopEntityScanHz instead of every send tick. The diff below reads CURRENT transforms off the
             // cached references each tick (only the entity SET changes rarely), so a new spawn/despawn is still
             // picked up within one scan interval; a destroyed entity drops out of _seen and despawns as before.
@@ -176,7 +169,7 @@ namespace IronNestVR
                 {
                     bool discrete = s.State != state || s.Health != hp;
                     bool moved = (s.Pos - pos).sqrMagnitude > MoveEpsilonSq;
-                    // REVIEW-fix (P2): a reliable position keyframe every CoopEntityKeyframeSec bounds drift after a
+                    // A reliable position keyframe every CoopEntityKeyframeSec bounds drift after a
                     // lost unreliable move; a discrete state/hp change is itself a reliable keyframe (carries pos+seq),
                     // so fold them together. Plain moves stay unreliable in between. Every send bumps the shared seq.
                     bool keyframe = Config.CoopEntityKeyframeSec > 0f && now - s.LastKeyframe >= Config.CoopEntityKeyframeSec;
@@ -299,7 +292,7 @@ namespace IronNestVR
                     int hp = r.Int();
                     if (r.Bad) return;
                     // Reliable+ordered: always apply state/hp/pos, and advance the position seq so an older unreliable
-                    // move delivered late is dropped instead of yanking the entity back (REVIEW-fix P2).
+                    // move delivered late is dropped instead of yanking the entity back.
                     if (_mirrors.TryGetValue(key, out var m)) { ApplyUpdate(m, pos, state, hp); if (seq > m.LastSeq) m.LastSeq = seq; }
                     break;
                 }
@@ -312,7 +305,7 @@ namespace IronNestVR
                     Vector3 pos = r.Vec();
                     if (r.Bad) return;
                     // Drop a stale/reordered move so a late unreliable packet can't settle the entity at an old
-                    // position (REVIEW-fix P2). Position-only either way — never touches state/hp.
+                    // position. Position-only either way — never touches state/hp.
                     if (_mirrors.TryGetValue(key, out var m) && seq > m.LastSeq) { ApplyMove(m, pos); m.LastSeq = seq; }
                     break;
                 }
@@ -396,9 +389,7 @@ namespace IronNestVR
             // spawns no native entities, so ResolveEntityParent() finds none and the clone would be unparented at
             // world origin: it still draws on the flat map (EntityLocation self-resolves a root canvas from its
             // LocalPosition) but its WORLD transform stays at (0,0,0), so it never lands near the recon-photo paper
-            // in 3-D — the photo shows no icons on the client. (Proven by the host/client recon-probe diff: host
-            // enemies par='Fire Mission Root' wp≈real; client par='<none>' wp=0, and every host-photo nearby entity
-            // Image is entirely absent on the client.)
+            // in 3-D — the photo shows no icons on the client.
             var parent = ResolveCloneParent();
             if (parent != null) { try { go.transform.SetParent(parent, false); } catch { } }
 
@@ -421,9 +412,9 @@ namespace IronNestVR
 
             // Position the GO's TRANSFORM directly from the host's parent-relative localPosition. The decompiled
             // EntityLocation contract: RecalculateAndRegister is transform→lp (recomputes the grid cell FROM the
-            // transform); the LocalPosition setter only writes the lp FIELD and never moves the GO (proven: a clone
-            // with lp set correctly snapped back to lp=0/wp=parent-origin one frame later when the per-frame recalc
-            // re-derived lp from the un-moved transform). The recon photo reads the WORLD TRANSFORM, so we author the
+            // transform); the LocalPosition setter only writes the lp FIELD and never moves the GO, so a clone
+            // reverts to lp=0/parent-origin one frame later when the per-frame recalc re-derives lp from the
+            // un-moved transform. The recon photo reads the WORLD TRANSFORM, so we author the
             // transform under the shared Fire Mission Root and let RecalculateAndRegister derive the matching lp.
             try { loc.Init(e); } catch (Exception ex) { Log.LogWarning("[ent] Init: " + ex.Message); }
             try { go.transform.localPosition = lpos; } catch { }
@@ -584,7 +575,7 @@ namespace IronNestVR
         }
 
         // High-rate position stream — unreliable, position only (no state/hp). Per-entity seq lets the receiver
-        // drop a late/reordered move (REVIEW-fix P1/P2).
+        // drop a late/reordered move.
         private static void SendMove(int key, Vector3 pos, int seq)
         {
             if (!EnsureBuf()) return;
@@ -609,8 +600,7 @@ namespace IronNestVR
             {
                 // Resources.FindObjectsOfTypeAll (NOT FindObjectsByType) so we also see INACTIVE EntityLocations and
                 // PREFAB assets. A gated client's mission scene spawns no active entities of its own, so the only
-                // clone source is the spawn prefab / an inactive template — which the active-only scan always missed
-                // (the "cannot mirror … no template" failure in the first 2-player mission test).
+                // clone source is the spawn prefab / an inactive template — which the active-only scan always missed.
                 var arr = Resources.FindObjectsOfTypeAll(Il2CppType.Of<EntityLocation>());
                 if (arr == null) return;
                 GameObject best = null;

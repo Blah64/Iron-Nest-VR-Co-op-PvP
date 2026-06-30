@@ -9,14 +9,13 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// PvP PLAN — Phase 0 instrumented feasibility probes (see PLAN-pvp.md §5 "Recommended first action").
+    /// PvP instrumented feasibility probes.
     ///
-    /// Everything in the PvP plan above design level is verified by DECOMPILATION; this harness proves the five
-    /// runtime assumptions each feature stage depends on, BEFORE any PvP feature code is written. It is read-/log-
+    /// This harness proves the five runtime assumptions each PvP feature stage depends on. It is read-/log-
     /// heavy and reversible — it spawns dev-only marker entities, nudges the turret, and logs the engine's own
-    /// impact adjudication. Nothing here ships: the whole module is inert unless <c>Config.PvpProbe</c> is set true
-    /// (cfg-only; default false, and the keys/patches early-return when off), so a normal co-op/flatscreen session
-    /// is untouched (flatscreen parity intact). All output is gated by the same flag, so a public build stays quiet.
+    /// impact adjudication. Compiled only in tester builds (#if !PUBLIC_BUILD); excluded entirely from the public
+    /// build. In tester builds it is inert unless <c>Config.PvpProbe</c>=true (default false), and the keys/patches
+    /// early-return when off, so a normal co-op/flatscreen session is untouched (flatscreen parity intact).
     ///
     /// What it answers (priority order):
     ///   P1 (keystone) — Player-as-entity HIT DETECTION. A programmatically-built MapEntity (the recipe a PvP
@@ -29,8 +28,6 @@ namespace IronNestVR
     ///       deterministic-fire patch zeros, so two machines' logs can be compared for the M1 "copied impact" claim.
     ///   P4 — Turret REPOSITION. SetTurretLocation / MoveTurret moves turretBase (the firing origin) — needed to
     ///       place two players at different map points.
-    ///   (P5 lobby-driven launch/mode is exercised by the existing CoopScene/StartOperation path + a later
-    ///       Config.PvpActive gate; not a probe here.)
     ///
     /// Keys (game window focused; chorded Left-Ctrl + Left-Shift so they can't collide with the shipped F-keys):
     ///   Ctrl+Shift+1  — spawn a test Enemy entity at the LAST shell impact (fire a ranging shot first), else (0,0).
@@ -48,12 +45,11 @@ namespace IronNestVR
     ///   Ctrl+Shift+0  — status / determinism-inputs dump (phase, turret, chambered-shell dispersion, probe set).
     ///   Ctrl+Shift+9  — destroy all probe-spawned entities (cleanup).
     ///
-    /// RUN 1 RESULT (2026-06-27): P4 ✅ (SetTurretLocation instant, MoveTurret animated), P2 ✅ (TakeDamage moved
-    /// hp 100→50/Damaged), P1 ❌ — a spawned entity at the EXACT impact (dist 0) returned hits=0. ImpactTracker has
-    /// its OWN registry (Dictionary&lt;string,EntityLocation&gt; EntityLocations + RegisterEntity) the adjudication
-    /// keys off, NOT MapEntity.Position; and RecalculateAndRegister recomputed LocalPosition from the (unmoved)
-    /// transform, so the registered grid cell ≠ the impact. Run 2 (this build) explicitly registers + places the
-    /// transform + dumps the registry/nearest so we learn the correct placement from a NATIVE target.
+    /// KNOWN LIMITATION: the engine does NOT adjudicate programmatic spawns. ImpactTracker keys its hit set off its
+    /// OWN registry (Dictionary&lt;string,EntityLocation&gt; EntityLocations + RegisterEntity) and a spatial query,
+    /// NOT MapEntity.Position; RecalculateAndRegister recomputes LocalPosition from the transform. A spawned entity
+    /// at the EXACT impact still returned hits=0 — so the probe explicitly registers + places the transform + dumps
+    /// the registry/nearest to learn the correct placement from a native target.
     ///
     /// The impact LOGGER (the read-side of P1) is a Harmony POSTFIX on State_ImpactStart.StartImpact installed by
     /// ApplyPatches(); while the flag is on it logs every shell's impact point + the returned hit set
@@ -270,7 +266,7 @@ namespace IronNestVR
             }
             catch (Exception ex) { Log.LogWarning("[pvpprobe] GetNearest: " + ex.Message); }
 
-            // (B) Direct damage path: does EntityLocation.TakeDamage move the probe's HP/state? (proven in run 1)
+            // (B) Direct damage path: does EntityLocation.TakeDamage move the probe's HP/state?
             bool tookDamage = false;
             try
             {

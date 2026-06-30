@@ -10,7 +10,7 @@ namespace IronNestVR
     /// <summary>
     /// DEV-ONLY fire-state probe: read/log-only hooks on GunController.RequestFire / GunController.FireShell /
     /// ShellVisual.Initialize. Answers four questions about the fire state machine before a per-side intent queue
-    /// is built (PLAN-host §6.0). Completely absent from the public build (#if !PUBLIC_BUILD). Zero overhead unless
+    /// is built. Completely absent from the public build (#if !PUBLIC_BUILD). Zero overhead unless
     /// Config.FireProbe = true in IronNestVR.cfg (the flag gates both installation AND every hook body).
     ///
     /// Q1 — 1:1 ordering: every RequestFire that proceeds yields exactly one FireShell then one ShellVisual.Initialize.
@@ -56,11 +56,11 @@ namespace IronNestVR
         // peer. Track it here to confirm host vs client divergence at charge-ram time.
         private static int _lastControlledGun = int.MinValue;
 
-        // ---- Step 0 mutate-test (PLAN-reload §3) — LOCAL-ONLY, dev keybinds (Ctrl+Alt+digit). ----
+        // ---- mutate-test — LOCAL-ONLY, dev keybinds (Ctrl+Alt+digit). ----
         // Answers the one question the read-only probe cannot: does ArtilleryReloadController.SetState(idx, force:true)
         // rebuild the chamber/powder when force-jumping, or do those only happen via the skipped animation events?
         // Each key snapshots (idx, gunChamber, ctrlChamber, powder) BEFORE → runs one mutation → snapshots AFTER, so
-        // the apply recipe for §5.3 falls straight out of the log. Chord = Ctrl+Alt (PvpProbe owns Ctrl+Shift).
+        // the apply recipe falls straight out of the log. Chord = Ctrl+Alt (PvpProbe owns Ctrl+Shift).
         private static int _mutTargetSide; // 0=Left, 1=Right; toggled with Ctrl+Alt+Minus.
 
         // ---- "Drive to loaded" prototype (the apply-path candidate): converge an EMPTY gun to loaded+CanFire using

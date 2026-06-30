@@ -6,11 +6,11 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// PvP Phase 2 — SHOT / DAMAGE LANE. In a PvP arena each player fires their OWN artillery locally (co-op fire
+    /// PvP — SHOT / DAMAGE LANE. In a PvP arena each player fires their OWN artillery locally (co-op fire
     /// replication is OFF when PvpActive), so every shell impact THIS machine adjudicates is THIS player's shot.
     ///
     /// HIT DETECTION: a Harmony POSTFIX on <c>State_ImpactStart.StartImpact(state, shell, impactLocation)</c> reads
-    /// the engine's returned hit set (the List&lt;MapEntity&gt; within the impact radius — the same query Phase 0
+    /// the engine's returned hit set (the List&lt;MapEntity&gt; within the impact radius — the same query the PvpProbe
     /// proved returns a programmatically-spawned entity). If a hit entity is an opponent's player-mirror (a
     /// <see cref="PvpPlayers"/> Enemy MapEntity, ID "PVPPLAYER_&lt;origin&gt;"), this player's shell hit that
     /// opponent → broadcast <c>MSG_PVP_HIT</c> addressed to that peer's SteamID.
@@ -79,7 +79,7 @@ namespace IronNestVR
 #endif
 
                 // DISTANCE-BASED adjudication (victim-authoritative). The engine's StartImpact hit set (__result) does
-                // NOT return programmatically-spawned entities (Phase 0 / PvpProbe RUN notes), so we don't rely on it:
+                // NOT return programmatically-spawned entities (per PvpProbe's findings), so we don't rely on it:
                 // we placed each opponent mirror and know its map grid, and impactLocation is in that same map space —
                 // so a shell within `radius` of a mirror is a hit on that peer.
                 if (dmg <= 0f) return;   // a non-damaging shell (STAR) — its reveal (above) is the whole effect

@@ -6,7 +6,7 @@ using UnityEngine.Rendering;
 namespace IronNestVR
 {
     /// <summary>
-    /// One-shot feasibility probe for PLANXR open question #2 (the potential veto for the whole
+    /// One-shot feasibility probe (the potential veto for the whole
     /// render-thread swapchain-copy plan): under BepInEx IL2CPP / .NET 6, can we register a native
     /// render-thread callback fired via <c>CommandBuffer.IssuePluginEvent</c> and have Unity actually call
     /// it without crashing — AND does it run on a SEPARATE thread when gfx-direct is off?

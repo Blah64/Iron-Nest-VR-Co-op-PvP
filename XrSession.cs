@@ -12,8 +12,8 @@ namespace IronNestVR
 {
     /// <summary>
     /// Owns the OpenXR lifecycle and per-frame loop, driving the runtime directly (no Unity XR
-    /// plugin). Phase 2 brings up instance/system/session/spaces, runs the canonical frame loop, and
-    /// exposes per-eye poses + FOV. Phase 3 adds swapchains and projection-layer submission inside
+    /// plugin). Brings up instance/system/session/spaces, runs the canonical frame loop, exposes
+    /// per-eye poses + FOV, and submits swapchains + the projection layer inside
     /// <see cref="BeginFrameLocateViews"/> / <see cref="EndFrame"/>.
     /// </summary>
     internal sealed unsafe class XrSession : IDisposable
@@ -46,11 +46,11 @@ namespace IronNestVR
         private long _swapchainFormat;
         private GraphicsFormat _gfxFormat = GraphicsFormat.R8G8B8A8_UNorm;
 
-        // ---- PLANXR Phase 0: render-thread copy + release (Config.RenderThreadCopy) ----
+        // ---- render-thread copy + release (Config.RenderThreadCopy) ----
         // Per eye, the raw CopyResource (reusing the proven D3D11Bridge path) and xrReleaseSwapchainImage
         // are issued as ONE CommandBuffer.IssuePluginEventAndData event, so they replay in program order on
         // whatever thread runs the render command stream: the MAIN thread while -force-gfx-direct is on
-        // (Phase 0 — no cross-thread race), the RENDER thread once it's dropped (Phase 1). Default OFF.
+        // (no cross-thread race), the RENDER thread once it's dropped. Default OFF.
         [StructLayout(LayoutKind.Sequential)]
         private struct CopyReleaseData { public IntPtr Dst; public IntPtr Src; public int Eye; }
 
@@ -72,7 +72,7 @@ namespace IronNestVR
         private UnityEngine.Rendering.CommandBuffer[] _rtcCb;
         private int _rtcNextLog;
 
-        // ---- Phase 1: render-thread xrEndFrame + completion gate ----
+        // ---- render-thread xrEndFrame + completion gate ----
         private const int RtEndFrameEvent = 0x4546;   // 'EF'
         private const int RtGateTimeoutMs = 34;        // ~2.4 frames @72Hz; proceed (frame may discard) if exceeded
         private static Session _rtcSession;
@@ -325,7 +325,7 @@ namespace IronNestVR
             LastWaitResult = Result.Success;
             if (!_running) return false;
 
-            // Phase 1 completion gate: the previous frame's render-thread xrEndFrame must finish before this
+            // Completion gate: the previous frame's render-thread xrEndFrame must finish before this
             // frame's xrBeginFrame (matched begin/end). No-op in Direct mode (endframe ran synchronously).
             if (Config.RenderThreadCopy && _rtcActive) WaitForEndframeDrain();
 
@@ -373,12 +373,12 @@ namespace IronNestVR
             return shouldRender;
         }
 
-        /// <summary>Safe overload for the no-composition-layers case (Phase 2).</summary>
+        /// <summary>Safe overload for the no-composition-layers case.</summary>
         public void EndFrame() => EndFrame(null, 0);
 
         /// <summary>
-        /// xrEndFrame. Phase 2 passes <paramref name="layers"/>=null/0 (valid). Phase 3 passes a
-        /// projection layer pointer + count.
+        /// xrEndFrame. Pass <paramref name="layers"/>=null/0 for the no-layer case (valid), or a
+        /// projection-layer pointer + count.
         /// </summary>
         public void EndFrame(CompositionLayerBaseHeader** layers, uint layerCount)
         {
@@ -398,7 +398,7 @@ namespace IronNestVR
             if (efr != Result.Success) WarnRc("xrEndFrame", efr);
         }
 
-        // -------- swapchains + stereo submission (Phase 2.5 / 3) --------
+        // -------- swapchains + stereo submission --------
 
         public bool CreateSwapchains(out string error)
         {
@@ -641,7 +641,7 @@ namespace IronNestVR
                 new UnityEngine.Rendering.CommandBuffer { name = "IronNestVR_CopyRelease1" }
             };
 
-            // Phase 1: persistent FrameEndInfo tree for the threaded xrEndFrame, wired once.
+            // Persistent FrameEndInfo tree for the threaded xrEndFrame, wired once.
             _rtcSession = _session;
             _efFei = Marshal.AllocHGlobal(sizeof(FrameEndInfo));
             _efLayerArr = Marshal.AllocHGlobal(IntPtr.Size);
@@ -688,7 +688,7 @@ namespace IronNestVR
             EndFrame(&lp, 1);
         }
 
-        // Phase 1 threaded tail: marshal the projection layer into the persistent FrameEndInfo tree and queue
+        // Threaded tail: marshal the projection layer into the persistent FrameEndInfo tree and queue
         // xrEndFrame as a render-stream event ordered AFTER both eyes' copy+release. The main thread does NOT
         // block here — the next frame's BeginFrameLocateViews gate (WaitForEndframeDrain) enforces ordering.
         private void SubmitProjectionThreaded()
@@ -769,8 +769,7 @@ namespace IronNestVR
             try
             {
                 // Stop the render-thread copy path first so no in-flight callback touches a destroyed
-                // swapchain. In Direct mode (Phase 0) callbacks are synchronous so none are pending here;
-                // a real in-flight drain is a Phase 2 hardening item (see PLANXR.md).
+                // swapchain. In Direct mode callbacks are synchronous so none are pending here.
                 _rtcActive = false;
                 _rtcXr = null; _rtcBridge = null; _rtcSwapchains = null;
                 if (_rtcCb != null) { foreach (var cb in _rtcCb) { try { cb?.Dispose(); } catch { } } _rtcCb = null; }

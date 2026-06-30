@@ -4,8 +4,8 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// PvP DEV HUD (flatscreen OnGUI) — a TEMPORARY readout to test the Phase 2 shot/damage lane before real target
-    /// acquisition is chosen (teleprinter fire mission / always-visible marker / scout recon — see PLAN-pvp.md).
+    /// PvP DEV HUD (flatscreen OnGUI) — a TEMPORARY readout to test the shot/damage lane before real target
+    /// acquisition is chosen (teleprinter fire mission / always-visible marker / scout recon).
     /// Shows my HP, the opponent's map grid + HP, where my last shell landed vs the target (so you range shells onto
     /// them), and hit counters. Non-public builds only, and only while in a live PvP mission. Replace once the real
     /// acquisition mechanic lands.
@@ -26,7 +26,7 @@ namespace IronNestVR
                 GUI.Box(new Rect(x, y, w, h), "PvP DUEL  (dev readout)");
                 float lx = x + 10f, lw = w - 20f, cy = y + 26f;
 
-                // Match result banner (Phase C) — one vehicle per team, declared from the team-health state.
+                // Match result banner — one vehicle per team, declared from the team-health state.
                 if (PvpPlayers.MatchOver)
                 {
                     var prev = GUI.contentColor; GUI.contentColor = PvpPlayers.Won ? Color.green : Color.red;

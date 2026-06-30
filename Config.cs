@@ -7,8 +7,8 @@ using UnityEngine;
 namespace IronNestVR
 {
     /// <summary>
-    /// Central tunables. These are plain constants for now; Phase 5 swaps them for a BepInEx
-    /// config file so they can be edited without rebuilding.
+    /// Central tunables. Plain static fields; values are overridden from IronNestVR.cfg at load,
+    /// so they can be edited without rebuilding.
     /// </summary>
     internal static class Config
     {
@@ -18,13 +18,15 @@ namespace IronNestVR
         // How often (seconds) to emit a frame-rate / worst-frame line to the log.
         public const float PerfLogIntervalSec = 5f;
 
-        // --- Perf probe: CPU-vs-GPU bound diagnostic for the VR frame loop ---
-        // When on, wall-clock-times the VR frame loop and attributes each frame to (a) our CPU work,
-        // (b) time BLOCKED in the OpenXR runtime waits (xrWaitFrame / xrWaitSwapchainImage / xrEndFrame =
-        // parked on the compositor/GPU), and (c) the residual (Unity's own render phase + present). Logs a
-        // [probe] verdict every PerfProbeIntervalSec. Pure Stopwatch timing, no GPU queries; the VR loop
-        // never runs in flatscreen so parity is untouched. Off = inert. See PerfProbe.
-        public static bool PerfProbe = true;
+        // Perf probe: times the VR frame loop and attributes each frame to our CPU work vs OpenXR runtime
+        // waits vs residual render; logs a [probe] verdict every PerfProbeIntervalSec. VR-only (flatscreen
+        // parity untouched). Default ON in tester builds, OFF in public (gate-diagnostics rule). See PerfProbe.
+#if PUBLIC_BUILD
+        public const bool DefaultPerfProbe = false;
+#else
+        public const bool DefaultPerfProbe = true;
+#endif
+        public static bool PerfProbe = DefaultPerfProbe;
         public static float PerfProbeIntervalSec = 3f;
 
         // How often (seconds) to retry OpenXR init while no headset/runtime is available yet.
@@ -46,67 +48,59 @@ namespace IronNestVR
 
         // Co-op: max players per lobby — the Steam lobby member cap AND the count the host-relay transport fans
         // out to. The avatar / control / map-token / ownership layers are all per-peer, so raising this works
-        // structurally. CAVEAT: >2 is compile-verified but not yet runtime-validated end-to-end (see PLAN.md §9);
+        // structurally. CAVEAT: >2 is compile-verified but not yet runtime-validated end-to-end;
         // lower back to 2 if a >2 session misbehaves. Steam allows up to 250, but the single shared turret makes
         // ~4 the practical ceiling.
         public static int CoopMaxPlayers = 4;
 
-        // Phase 3 co-op: replicate cockpit-control operation + turret/gun physical state between the two
-        // lobby members (transient per-control ownership). Off = avatars-only (Phase 2). Reuses CoopSendHz
-        // for the value/state stream rate.
+        // Co-op: replicate cockpit-control operation + turret/gun physical state between members (transient
+        // per-control ownership). Off = avatars-only. Reuses CoopSendHz for the value/state stream rate.
         public static bool CoopControlSync = true;
 
-        // Phase 3 co-op: replicate click-activated controls (LookAtTarget — reload rammers, powder dispenser,
-        // power lever, lighting, fire button) and gun discharge as events, replayed via the game's own click
-        // handler so the switch animation + effect (reload, fire) play on the peer too. Skips manuals + menus.
+        // Co-op: replicate click-activated controls (reload rammers, powder dispenser, power lever, lighting,
+        // fire button) and gun discharge as events, replayed via the game's own click handler so the switch
+        // animation + effect play on the peer too. Skips manuals + menus.
         public static bool CoopClickSync = true;
 
-        // Phase 3 co-op: replicate HUD clipboard contents (per-section text + active tool) between the two
-        // members via state-based diff keyed by NotepadSection.UnityTag. Captures player notes AND
-        // mission-graph briefing text. Pose (raised/focused/hidden) stays per-player and is NOT synced.
+        // Co-op: replicate HUD clipboard contents (per-section text + active tool) via state-based diff keyed
+        // by NotepadSection.UnityTag (player notes + mission-graph briefing text). Pose (raised/focused/hidden)
+        // stays per-player and is NOT synced.
         public static bool CoopClipboardSync = true;
 
-        // Phase 3 co-op: replicate tactical-map item placements (DraggableItem tokens) with transient
-        // per-item ownership, in MapPiece3D-board-local space (Barbet-relative, so turret rotation/sway and
-        // per-player board pan don't desync them). Dynamic markers + mission entities are separate/later.
+        // Co-op: replicate tactical-map item placements (DraggableItem tokens) with transient per-item
+        // ownership, in board-local space (so turret rotation/sway and per-player board pan don't desync them).
         public static bool CoopMapSync = true;
 
         // How often (seconds) the co-op diagnostics hub logs its status block while in a lobby. Keep it
         // frequent enough to be useful to testers but not so chatty it floods the log.
         public static float CoopDiagIntervalSec = 4f;
 
-        // Co-op join-in-progress: when a second player joins an already-running session, the HOST waits this
-        // long after first detecting them, then pushes a ONE-TIME authoritative snapshot of the current world
-        // (turret/gun aim + powder, clipboard text, map-token layout, held-control ownership) so the joiner
-        // adopts the host's state instead of a stale default. The delay lets BOTH sides resolve the peer and
-        // bring the P2P session up first — until then each side's receive gate drops packets from a not-yet-
-        // resolved peer, so an instant snapshot could be discarded. 1.5s is comfortably past lobby/session
-        // settling without a noticeable "pop-in" wait for the joiner.
+        // Co-op join-in-progress: the host waits this long after detecting a joiner, then pushes a one-time
+        // authoritative world snapshot so the joiner adopts host state instead of a stale default. The delay
+        // lets both sides resolve the peer/session first, else the receive gate drops the snapshot. 1.5s clears
+        // settling without a noticeable pop-in.
         public static float CoopSnapshotDelaySec = 1.5f;
 
-        // Phase 4 co-op: host-authoritative SPAWNS (NARROW gate). Both players run their own mission machinery
-        // (gun, reload/ammo, objectives, score, teleprinter) locally; the ONLY thing gated on a co-op CLIENT is
-        // the enemy/target SPAWN node action (Harmony-suppressed State_SpawnMapEntity.OnEnter) so it never
-        // double-spawns with its own RNG — enemies are mirrored from the host via CoopEntities instead. Active
-        // ONLY for a client connected to a peer; solo play and the host always spawn normally. The spawn node
-        // only runs during a mission, so this never touches the validated hub co-op. See CoopSim.
+        // Co-op: host-authoritative spawns (narrow gate). Both players run their own mission machinery locally;
+        // the ONLY thing gated on a client is the enemy/target SPAWN node (Harmony-suppressed
+        // State_SpawnMapEntity.OnEnter) so it never double-spawns with its own RNG — enemies are mirrored from
+        // the host via CoopEntities. Active only for a client connected to a peer; solo/host spawn normally. See CoopSim.
         public static bool CoopSimAuthority = true;
 
-        // Phase 4 co-op (4b): replicate the host's mission ENTITIES (enemies/targets) to the client. The host
-        // diffs FindObjectsByType<EntityLocation>() and broadcasts spawn/move/state/despawn; the client mirrors
-        // them (adopts a same-ID scene entity or clones a cached EntityLocation template). Scoped to an active
-        // mission (GamePhase.MissionActive) so the hub is untouched. Needs CoopSimAuthority on (gated client).
+        // Co-op: replicate the host's mission ENTITIES (enemies/targets) to the client. The host diffs
+        // FindObjectsByType<EntityLocation>() and broadcasts spawn/move/state/despawn; the client mirrors them
+        // (adopts a same-ID scene entity or clones a cached template). Scoped to GamePhase.MissionActive so the
+        // hub is untouched. Needs CoopSimAuthority on (gated client).
         public static bool CoopEntitySync = true;
 
-        // REVIEW-fix (P2): how often (seconds) the host re-sends each entity's position on the RELIABLE channel as a
-        // keyframe, so a lost unreliable move self-heals within this bound instead of leaving the mirror stale. A
-        // discrete state/hp change counts as a keyframe too (already reliable). 0 disables periodic keyframes.
+        // Co-op: how often (seconds) the host re-sends each entity's position on the RELIABLE channel as a
+        // keyframe, so a lost unreliable move self-heals within this bound. A discrete state/hp change counts as
+        // a keyframe too. 0 disables periodic keyframes.
         public static float CoopEntityKeyframeSec = 3f;
 
-        // Robustness: how often (seconds) the host re-asserts the FULL entity set — re-sends every live entity as a
-        // SPAWN (heals a SPAWN lost in a link-drop blackout, where reliable packets are dropped with no retransmit and
-        // the lobby roster is unchanged so no join-snapshot re-fires) AND sends a live-key-set so the client reaps any
-        // ghost mirror whose DESPAWN was lost. Slower than the keyframe (full records are heavier). 0 disables.
+        // Co-op: how often (seconds) the host re-asserts the FULL entity set — re-sends every live entity as a
+        // SPAWN (heals a SPAWN lost in a link-drop blackout) AND sends a live-key-set so the client reaps any
+        // ghost mirror whose DESPAWN was lost. Heavier than the keyframe. 0 disables.
         public static float CoopEntityResyncSec = 5f;
 
         // Co-op: how often (Hz) the host RE-ENUMERATES the scene for EntityLocation objects. The per-tick position
@@ -115,48 +109,42 @@ namespace IronNestVR
         // hot path cheap on weak systems. <= 0 ⇒ scan every send tick (old behavior).
         public static float CoopEntityScanHz = 5f;
 
-        // Phase 4 co-op (4b keystone): replicate the mission/scene transition so both players are co-located.
-        // The HOST broadcasts its own phase changes (→MissionActive / back out); the CLIENT follows by driving
-        // its own OperationLoadRelay.StartAssignedOperation() / ReturnToMap(). Without this, the host starting a
-        // mission leaves the client in the hub and entity sync has nothing to mirror into. See CoopScene.
+        // Co-op: replicate the mission/scene transition so both players are co-located. The host broadcasts its
+        // own phase changes (→MissionActive / back out); the client follows by driving its own
+        // OperationLoadRelay.StartAssignedOperation() / ReturnToMap(). See CoopScene.
         public static bool CoopSceneSync = true;
 
-        // Phase 4 co-op (4d): replicate the TELEPRINTER "typing machine" orders. ON even under the narrow gate.
-        // Tested 2026-06-20: the client's order text came out EMPTY — the gated spawn node (State_SpawnMapEntity)
-        // is what stores the target in a graph context variable, so a client that skips it has no target to
-        // resolve {grid}/{bearing} against and prints a blank order. So the resolved text must come from the host:
-        // the host captures every Teleprinter.SubmitLines and the client replays it on its matching printer. We do
-        // NOT gate the client's own (empty) teleprinter node — gating its OnEnter could stall the graph on
-        // State_TeleprinterText.WaitUntilComplete; its empty local submit is harmless next to the replayed text.
-        // Scoped to an active mission. See CoopOrders / CoopSim.
+        // Co-op: replicate the TELEPRINTER orders. The client's gated spawn node never stores the target, so its
+        // local order text resolves blank — the resolved text must come from the host (host captures every
+        // Teleprinter.SubmitLines; client replays it on its matching printer). The client's own (empty) teleprinter
+        // node is NOT gated — gating its OnEnter could stall the graph; its empty submit is harmless. See CoopOrders.
         public static bool CoopOrdersSync = true;
 
-        // Phase 4 co-op: replicate the gun-console FIRE-MISSION CARD (PATH B — player-driven). When a player
-        // computes a firing solution the printer spawns a FireMissionCard and Apply()s six resolved strings; we
-        // capture those and the peer spawns a mirror card from the printer's prefab. Bidirectional + echo-guarded
-        // (either player may print). See CoopCards.
+        // Co-op: replicate the gun-console FIRE-MISSION CARD (player-driven). When a player computes a firing
+        // solution the printer spawns a FireMissionCard and Apply()s six resolved strings; we capture those and
+        // the peer spawns a mirror card from the printer's prefab. Bidirectional + echo-guarded. See CoopCards.
         public static bool CoopCardSync = true;
 
-        // Phase 4 co-op: host-authoritative SCORE / outcome. The host replays MarkMissionComplete/Failed onto the
-        // client (matching win/lose result), and syncs RequisitionPoints + PowderCharges via OperationState while
-        // OUT of a mission (LoadOperationState is heavy → never applied mid-mission). See CoopScore.
+        // Co-op: host-authoritative SCORE / outcome. The host replays MarkMissionComplete/Failed onto the client
+        // (matching win/lose result), and syncs RequisitionPoints + PowderCharges via OperationState while OUT of
+        // a mission (LoadOperationState is heavy → never applied mid-mission). See CoopScore.
         public static bool CoopScoreSync = true;
 
-        // Pressure/steam co-op sync (PLAN-valve.md / CoopPressure). VALVE damage (currentDamage01) is replicated
-        // per-valve: repairs are symmetric, breaks host-authoritative via a reconcile gate (no Harmony — patching the
-        // RNG break component crashes this IL2CPP build). ENGINE (EnginesRunning) is host-authoritative but DEFAULTS
-        // OFF — PLAN-valve §5 wants a 2-player test first (the client's engine may already track from the synced
-        // fuel/timing dials); flip CoopEngineSync on only if it diverges.
+        // Pressure/steam co-op sync (CoopPressure). VALVE damage (currentDamage01) is replicated per-valve:
+        // repairs are symmetric, breaks host-authoritative via a reconcile gate (no Harmony — patching the RNG
+        // break component crashes this IL2CPP build). ENGINE (EnginesRunning) is host-authoritative but defaults
+        // OFF pending a 2-player test (the client's engine may already track from the synced fuel/timing dials);
+        // flip CoopEngineSync on only if it diverges.
         public static bool CoopValveSync = true;
         public static bool CoopEngineSync = false;
 
-        // Phase 4 co-op (4c): host-authoritative IMPACT RESULT. The host broadcasts each shell impact that HIT a
-        // target (location + hit entities + shell id) and the client replays it to its ImpactIndicators so the
-        // tactical map shows the hit — the client's own local adjudication usually misses (target already
-        // host-destroyed). Misses aren't replicated (client keeps its own fall-of-shot). See CoopImpact.
+        // Co-op: host-authoritative IMPACT RESULT. The host broadcasts each shell impact that HIT a target
+        // (location + hit entities + shell id) and the client replays it to its ImpactIndicators so the tactical
+        // map shows the hit — the client's own adjudication usually misses (target already host-destroyed).
+        // Misses aren't replicated (client keeps its own fall-of-shot). See CoopImpact.
         public static bool CoopImpactSync = true;
 
-        // Phase 4 co-op: DETERMINISTIC FIRING. GunController.FireShell rolls RANDOM dispersion (gunHorizontal/
+        // Co-op: DETERMINISTIC FIRING. GunController.FireShell rolls RANDOM dispersion (gunHorizontal/
         // VerticalDispersion + the chambered shell's horizontal/verticalDispersion + shellSpeedVariationPercent)
         // with no shared seed, so two machines firing the SAME synced aim/powder/shell still land in DIFFERENT
         // spots — input-syncing can never converge two independent random rolls. While co-op is active we zero
@@ -165,64 +153,53 @@ namespace IronNestVR
         // land identically. Cost: no scatter while in a co-op mission (solo/flatscreen untouched). See CoopBallistics.
         public static bool CoopDeterministicFire = true;
 
-        // Phase 4 co-op: host-authoritative REQUISITION PUNCHCARDS (the loadout/ability cards in the RequisitionSlot —
-        // NOT the FireMissionCard slip, see CoopCardSync). The host broadcasts its deck (card ids + remaining uses) so
+        // Co-op: host-authoritative REQUISITION PUNCHCARDS (the loadout/ability cards in the RequisitionSlot — NOT
+        // the FireMissionCard slip, see CoopCardSync). The host broadcasts its deck (card ids + remaining uses) so
         // the client's deck matches instead of being built from its own save; a client redemption sends an intent
-        // (card + chosen variables) to the host, which runs the card's PunchcardGraph authoritatively so the effect
-        // matches (entity/impact/score replication carries the result). See CoopPunchcards.
-        // 2026-06-21: now gates the PHYSICAL CARD MOVEMENT layer — each card is grab/own/stream/place synced like a
-        // CoopMap token but keyed by Fnv(CurrentDefinition.ID) (clones share a name, so a transform-path hash collides
-        // and cross-wired them) and positioned console-relative (survives a drag reparenting the card). The host sends
-        // an authoritative layout snapshot on join. Redemption sync (effects/uses) is still deferred (Layer 3) — the
-        // AttemptRequisition prefix stays UNREGISTERED, so a redemption runs locally exactly as stock. The earlier
-        // wrong abstraction (deck CATALOG/uses overlay) lives under CoopPunchcardDeckSync below and stays off.
+        // (card + chosen variables) to the host, which runs the card's PunchcardGraph authoritatively. Also syncs
+        // the PHYSICAL CARD MOVEMENT layer — each card is grab/own/stream/place synced like a CoopMap token but
+        // keyed by Fnv(CurrentDefinition.ID) (clones share a name, so a transform-path hash collides and cross-wires
+        // them) and positioned console-relative (survives a drag reparenting the card). Host sends an authoritative
+        // layout snapshot on join. See CoopPunchcards.
         public static bool CoopPunchcardSync = true;
 
-        // Punchcard REDEMPTION routing (Layer 3, the "results from using a card don't match" half). When a CLIENT
-        // pulls the requisition lever, a prefix on RequisitionSlot.AttemptRequisition forwards the card ID + the
-        // player's chosen PunchcardVariable values to the host instead of running locally (the client's enemy-spawn
-        // node is gated, so a local run spawns nothing). The host runs the graph authoritatively → revealed
-        // units/entities spawn on the host → replicate via CoopEntities. PunchcardRuntime.OnCardUsed (the real
-        // success signal — AttemptRequisition returns void) drives a host→client MSG_PUNCH_CONSUME so each client
-        // drops its matching card in lockstep. Solo + host redemptions are UNCHANGED (the prefix passes through).
-        // Separate flag so it can be disabled without touching the working card-movement layer.
+        // Co-op: punchcard REDEMPTION routing. When a CLIENT pulls the requisition lever, a prefix on
+        // RequisitionSlot.AttemptRequisition forwards the card ID + chosen PunchcardVariable values to the host
+        // instead of running locally (the client's enemy-spawn node is gated, so a local run spawns nothing). The
+        // host runs the graph authoritatively → entities spawn on the host → replicate via CoopEntities.
+        // PunchcardRuntime.OnCardUsed drives a host→client MSG_PUNCH_CONSUME so each client drops its matching card
+        // in lockstep. Solo + host redemptions are unchanged. Separate flag so it can be disabled independently.
         public static bool CoopPunchcardRedeemSync = true;
 
-        // Punchcard RESULT replication (the "host scouts but the client's map shows nothing" half). When ON, after
-        // the host runs a redemption authoritatively (its own OR a client-forwarded one) and the validator fires
-        // success, the host broadcasts MSG_PUNCH_GRAPH (card ID + the authoritative PunchcardVariable values). Each
-        // client then runs the SAME redemption locally — place card, apply those vars, AttemptRequisition — so the
-        // card's PunchcardGraph executes on the client too: recon photo / scout flyby / reveal all appear, operating
-        // on the client's own (host-mirrored) entities. Enemy/entity SPAWNS stay gated (no duplicates; the host's
-        // authored entities still arrive via CoopEntities); only the reveal/photo/flyby run locally. Because the
-        // client runs the full redemption, it consumes its OWN card + decrements its OWN use, so the host SKIPS the
-        // MSG_PUNCH_CONSUME drop (it would double-decrement). Lockstep: both machines execute the same action once,
-        // gated by host authority (the client only runs on the host's success broadcast). Default ON; turn OFF to
-        // fall back to host-runs-only + MSG_PUNCH_CONSUME (client sees no visual result).
+        // Co-op: punchcard RESULT replication. After the host runs a redemption authoritatively and the validator
+        // fires success, it broadcasts MSG_PUNCH_GRAPH (card ID + authoritative variable values); each client runs
+        // the SAME redemption locally so the card's graph executes there too (recon photo / scout flyby / reveal
+        // appear, operating on the client's host-mirrored entities). Entity SPAWNS stay gated (no duplicates).
+        // Because the client runs the full redemption it consumes its OWN card, so the host SKIPS MSG_PUNCH_CONSUME
+        // (would double-decrement). Default ON; OFF falls back to host-runs-only (client sees no visual result).
         public static bool CoopPunchcardResultSync = true;
 
-        // Punchcard DECK-COMPOSITION/uses sync (the host-authoritative "make the client's deck match the host's"
-        // overlay). DEFAULT OFF (2026-06-21): the punchcard CATALOG is already identical on both machines, and
-        // overlaying the host's per-save RemainingUses onto the client can ZERO a card the client could otherwise
-        // use (the test decks were near-empty), and the destructive RebuildDeck variant broke card placement. The
-        // real "cards don't match / don't move together" need is PHYSICAL card movement + slot sync (DraggableItem,
-        // like CoopMap tokens) — built separately. Re-enable only with the non-destructive overlay + a clear
-        // deck-authority model. See CoopPunchcards.
+        // Punchcard DECK-COMPOSITION/uses overlay ("make the client's deck match the host's"). DEFAULT OFF: the
+        // catalog is already identical on both machines, and overlaying the host's per-save RemainingUses can ZERO
+        // a card the client could otherwise use, and the destructive RebuildDeck variant broke card placement. The
+        // real need (cards moving together) is the physical-movement layer above. Re-enable only with a
+        // non-destructive overlay + a clear deck-authority model. See CoopPunchcards.
         public static bool CoopPunchcardDeckSync = false;
 
-        // REVIEW-fix (P3): turret CURRENT-state reconcile. Both machines slew their turret locally toward the shared
-        // DESIRED aim so they normally converge — but a lost reliable packet or framerate-dependent slew can leave
-        // CurrentAngle/CurrentElevation drifting. The HOST periodically broadcasts its current turret/gun state; the
-        // client snaps a group to it ONLY when it isn't operating that group itself and the drift exceeds the
-        // tolerance, so it never fights the player's hand or jumps during normal play. Active only with a peer.
+        // Turret CURRENT-state reconcile. Both machines slew locally toward the shared DESIRED aim so they normally
+        // converge — but a lost reliable packet or framerate-dependent slew can leave CurrentAngle/CurrentElevation
+        // drifting. The host periodically broadcasts its current turret/gun state; the client snaps a group to it
+        // ONLY when it isn't operating that group itself and drift exceeds the tolerance, so it never fights the
+        // player's hand or jumps during normal play. Active only with a peer.
         public static bool CoopTurretReconcile = true;
         public static float CoopTurretReconcileSec = 2.5f;     // how often the host broadcasts current turret state
         public static float CoopTurretReconcileTolDeg = 1.5f;  // min drift (deg) before the client corrects
 
-        // REVIEW-fix (desync detector): each side periodically exchanges a quantized digest of convergent state
-        // (turret aim/elevation/powder + mirrored entity/marker counts) and logs when a field stays divergent for
-        // CoopDesyncPersist consecutive digests — surfacing the silent desyncs latency/loss cause. Diagnostic only
-        // (it logs; never changes gameplay). Active only with a peer. See CoopNetDiag.
+        // Desync detector: each side periodically exchanges a quantized digest of convergent state (turret
+        // aim/elevation/powder + mirrored entity/marker counts) and logs when a field stays divergent for
+        // CoopDesyncPersist digests. Logs only, never changes gameplay; active only with a peer. Default ON in
+        // ALL builds incl. public — kept on for field desync diagnosis; adds a reliable MSG_DIGEST ~1/s per
+        // peer and may log warnings. See CoopNetDiag.
         public static bool CoopDesyncDetect = true;
         public static float CoopDesyncIntervalSec = 1f;
         public static float CoopDesyncAngleTolDeg = 2.5f;
@@ -373,18 +350,17 @@ namespace IronNestVR
         public static bool LeaderboardCamThrottle = true;
         public static float LeaderboardCamHz = 6f;
 
-        // One-shot feasibility probe for the render-thread swapchain-copy plan (PLANXR open question #2):
-        // can we register an [UnmanagedCallersOnly] callback fired via CommandBuffer.IssuePluginEvent under
-        // BepInEx IL2CPP, and does it run on the render thread? Self-terminates after ~120 frames with one
-        // [rtprobe] RESULT line. ANSWERED 2026-06-22 (✓ fires; render-thread when gfx-direct off) — default
-        // off now. See RenderThreadProbe.
+        // One-shot feasibility probe: can we register a native render callback fired via
+        // CommandBuffer.IssuePluginEvent under BepInEx IL2CPP, and does it run on the render thread?
+        // Self-terminates after ~120 frames with one [rtprobe] RESULT line. Answer: yes, it fires; render-thread
+        // when gfx-direct off — default off now. See RenderThreadProbe.
         public static bool RenderThreadProbeTest = false;
 
-        // PLANXR Phase 0: route the per-eye swapchain copy + xrReleaseSwapchainImage through a single
+        // Experimental: route the per-eye swapchain copy + xrReleaseSwapchainImage through a single
         // CommandBuffer.IssuePluginEventAndData callback (instead of the raw main-thread CopyResource +
-        // ReleaseEye). Default OFF — flatscreen/VR behavior is identical to today until proven. With
-        // -force-gfx-direct ON the callback runs on the main thread (no race); the win comes in Phase 1
-        // when the flag is dropped and the same callback lands on Unity's render thread. See PLANXR.md.
+        // ReleaseEye). Default OFF — behavior is identical until proven. With -force-gfx-direct ON the callback
+        // runs on the main thread (no race); the win comes once the flag is dropped and it lands on Unity's
+        // render thread.
         public static bool RenderThreadCopy = false;
 
         // --- Low-spec eye-render profile (CPU draw-submission relief for weak systems) ---
@@ -430,22 +406,21 @@ namespace IronNestVR
 #endif
         public static bool CrashHeartbeat = DefaultCrashHeartbeat;
 
-        // PvP PLAN — Phase 0 feasibility probes (PvpProbe). DEV-ONLY: spawns marker entities, nudges the turret,
-        // and logs the engine's shell adjudication so the PvP plan's runtime assumptions can be proven before any
-        // feature code. OFF by default on every build flavor (it mutates the live scene on chorded keypresses) —
-        // set "PvpProbe=true" in IronNestVR.cfg to arm it; the keys + impact-logger patch are inert otherwise, so a
-        // normal co-op/flatscreen session is untouched. See PvpProbe.cs and PLAN-pvp.md §5.
+        // PvP feasibility probes (PvpProbe). Tester builds only (#if !PUBLIC_BUILD — excluded from public):
+        // spawns marker entities, nudges the turret, and logs the engine's shell adjudication. OFF by default
+        // (it mutates the live scene on chorded keypresses) — set "PvpProbe=true" in IronNestVR.cfg to arm it;
+        // the keys + impact-logger patch are inert otherwise. See PvpProbe.cs.
 #if !PUBLIC_BUILD
         public static bool PvpProbe = false;
 #endif
 
-        // FIRE-STATE PROBE (CoopFireProbe). DEV-ONLY, read/log-only: hooks GunController.RequestFire/FireShell +
-        // ShellVisual.Initialize to answer the PLAN-host §6.0 questions (RequestFire<->FireShell 1:1 ordering per gun,
-        // synchronous no-op detection, reload spacing, call source) before the Phase-2 intent queue is finalized. OFF
-        // by default; set "FireProbe=true" in IronNestVR.cfg to arm it. Inert (and compiled out in the public build).
+        // FIRE-STATE PROBE (CoopFireProbe): read/log-only hooks on GunController.RequestFire/FireShell +
+        // ShellVisual.Initialize (RequestFire<->FireShell 1:1 per gun, synchronous no-op detection, reload spacing,
+        // call source). OFF by default; set "FireProbe=true" in IronNestVR.cfg to arm it. The CoopFireProbe hooks are
+        // #if !PUBLIC_BUILD, so the probe does nothing in public builds; this flag remains but is inert there.
         public static bool FireProbe = false;
 
-        // PvP MODE master switch (PLAN-pvp.md §1a, Appendix B). DERIVED at runtime, never a cfg toggle: the host's
+        // PvP MODE master switch. DERIVED at runtime, never a cfg toggle: the host's
         // lobby is tagged invr_mode=coop|pvp (SteamNet), and every member reads it on lobby-enter → PvpActive. While
         // true, the conflicting co-op replication (control/fire/impact sync, client spawn-gate, entity mirror) is
         // disabled and the PvP modules (PvpMatch/PvpPlayers) drive instead. Reset to false on leaving a lobby. A dev
@@ -453,7 +428,7 @@ namespace IronNestVR
         public static bool PvpActive = false;
 
         // --- Diagnostics / quick toggles for live tuning ---
-        // Phase 2.5 isolation: render each eye as a flat clear color (no scene) to prove the
+        // Isolation test: render each eye as a flat clear color (no scene) to prove the
         // swapchain copy + projection-layer submission path independent of scene rendering.
         public static bool SolidColorTest = false;
 
@@ -475,7 +450,7 @@ namespace IronNestVR
         // that generic instantiation, so this is the safer default for an injected plugin.
         public static bool UseEnabledCameras = true;
 
-        // --- Phase 4: motion-controller cockpit interaction ---
+        // --- Motion-controller cockpit interaction ---
         // Trigger pull fraction that counts as a click/grab "press" (rising edge).
         public static float TriggerFireThreshold = 0.6f;
         // Haptic tap on click/toggle.
@@ -782,7 +757,7 @@ namespace IronNestVR
         public static bool LogInteractGeometry = true;
         public static float InteractLogIntervalSec = 2f;
 
-        // --- Phase 6: VR hand models + physical dial/lever grab ("gravity glove") ---
+        // --- VR hand models + physical dial/lever grab ("gravity glove") ---
         // Render tracked hand models at the controller grip poses. Loaded from an AssetBundle
         // shipped beside the plugin; if the bundle or a prefab is missing, a simple primitive hand
         // is used instead so the grab mechanic still works without the art.

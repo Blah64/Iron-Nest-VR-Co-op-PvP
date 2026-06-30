@@ -10,18 +10,16 @@ namespace IronNestVR
     /// <summary>
     /// Co-op transport: a host-relay STAR over Steam P2P. Every client holds a single session with the host;
     /// the host fans out (broadcast / unicast / relay) to all clients. Streams each player's head + hand poses
-    /// (so the others see an avatar) plus the Phase 3+ subsystem traffic, distinguished by the first packet byte.
+    /// plus subsystem traffic, distinguished by the first packet byte.
     ///
-    /// ORIGIN MODEL (PLAN.md §2.2): the host derives a packet's origin from the Steam `from` (never trusts a
+    /// ORIGIN MODEL: the host derives a packet's origin from the Steam `from` (never trusts a
     /// client-supplied field). On the host→client leg an 8-byte sender SteamID is appended as a TRAILER; the
     /// receiving client strips it and dispatches the inner packet at offset 0 with the reduced length, so every
     /// parser sees the exact byte offsets it did in the 2-player build. client→host packets carry no trailer.
     ///
     /// The lobby cap is Config.CoopMaxPlayers (currently 4). With a single peer the fan-out/relay collapses to one
     /// unicast (broadcast == "send to the peer", relay is a no-op); with more peers the host fans out to every peer
-    /// and relays each client-authored packet to the OTHERS, stamped with the sender's host-derived origin. The >2
-    /// path is compile-verified and origin-attributed on the live receive path (and now through CoopNetSim too);
-    /// end-to-end WAN/loss/reorder validation with multiple real origins is the remaining open item (PLAN.md §6/§9).
+    /// and relays each client-authored packet to the OTHERS, stamped with the sender's host-derived origin.
     ///
     /// Poses are sent in WORLD space (both instances load the same scene at the same world coords). If the
     /// rotating cockpit (Barbet) makes avatars drift once turret aim is desynced, switch to Barbet-local later.
@@ -40,11 +38,11 @@ namespace IronNestVR
         private const int HandPacketLen = 2 + (12 + 16) * 3;    // + left + right hand = 86
         private const int HandCurlPacketLen = HandPacketLen + 16; // + Lindex,Lother,Rindex,Rother (4f) = 102
 
-        // Host→client origin trailer width (PLAN.md §2.2). Appended AFTER the inner packet; the client reads it
+        // Host→client origin trailer width. Appended AFTER the inner packet; the client reads it
         // from the last 8 bytes and dispatches the inner packet with the reduced length, so offsets never move.
         private const int OriginTrailerLen = 8;
 
-        // Largest INNER packet any subsystem may put on the wire (REVIEW-fix P1). The receive buffer is sized to
+        // Largest INNER packet any subsystem may put on the wire. The receive buffer is sized to
         // this + the host→client origin trailer, so a peer can always read the biggest packet a sender can build.
         // Every subsystem that allocates its own scratch buffer (e.g. CoopPunchcards._buf) caps itself to this and
         // refuses to send anything larger, rather than silently producing a packet the receiver would truncate.
@@ -69,13 +67,13 @@ namespace IronNestVR
         public static bool HasPeer => _peers.Count > 0;
         public static int PeerCount => _peers.Count;
 
-        // Role: the lobby owner is the host. Ownership tie-breaker (Phase 3) + sim-gating (Phase 4).
+        // Role: the lobby owner is the host. Used by ownership tie-break + sim-gating.
         public static bool IsHost;
         public static ulong MyId => _myId;
         public static ulong HostSteamId => _hostId.m_SteamID;   // lobby owner; used by the grab priority tie-break
 
-        // Per-peer remote pose (world space), keyed by the authoring SteamID (Phase B). RemoteAvatar pools one
-        // rig per entry, so >2 avatars render. Replaces the single-slot block. The F6 solo render test injects
+        // Per-peer remote pose (world space), keyed by the authoring SteamID. RemoteAvatar pools one
+        // rig per entry, so >2 avatars render. The F6 solo render test injects
         // under SelfTestId. Finger curl (0..1): index from the trigger, "other" from the grip; only set when the
         // peer streams it (FLAG_CURL).
         public struct RemotePose
@@ -119,8 +117,8 @@ namespace IronNestVR
         // Join-in-progress: when the host detects a new peer it schedules a one-time full-world snapshot for
         // CoopSnapshotDelaySec later. The delay lets both sides resolve the peer + bring the session up so the
         // snapshot isn't dropped by the receive-side peer gate. Each pending snapshot is tracked PER PEER so two
-        // joiners arriving within the delay window each get their own snapshot (REVIEW-fix P2 — a single pending
-        // target was overwritten by the second joiner, so the first never received the full-world snapshot).
+        // joiners arriving within the delay window each get their own snapshot (a single pending target would be
+        // overwritten by the second joiner, so the first would never receive the full-world snapshot).
         private struct PendingSnap { public CSteamID Peer; public float DueAt; }
         private static readonly List<PendingSnap> _pendingSnaps = new List<PendingSnap>();
         private static CSteamID _snapTarget;   // the peer the IN-FLIGHT snapshot is currently being unicast to
@@ -233,7 +231,7 @@ namespace IronNestVR
         // Loopback (same-machine test) counterpart of the Steam Init+UpdatePeer+Receive trio. Derives role from
         // the TCP link, gives the two sides synthetic deterministic ids (host=1, client=2) so host-priority
         // ownership works without real SteamIDs, then drains the link through the SAME deliver path the Steam
-        // receive uses. A single synthetic peer is kept in _peers; multi-client loopback is PLAN.md §8.1.
+        // receive uses. A single synthetic peer is kept in _peers; loopback is single-peer.
         private static void TickLoopback(float dt)
         {
             EnsureArrays();
@@ -270,7 +268,7 @@ namespace IronNestVR
         // the Steam path; loopback skips Init() entirely (no SteamAPI), so it allocates here instead.
         private static void EnsureArrays()
         {
-            // Same sizing policy as Init() (REVIEW-fix P1): the loopback test transport must read/stage packets as
+            // Same sizing policy as Init(): the loopback test transport must read/stage packets as
             // large as the Steam path can, or same-machine testing would reject packets real Steam would accept.
             int wire = MaxInnerPayload + OriginTrailerLen;
             if (_sendArr == null) _sendArr = new Il2CppStructArray<byte>(128);
@@ -280,7 +278,7 @@ namespace IronNestVR
         }
 
         // Size the outbound staging buffer to the fixed wire max. With the Send-side max-payload guard no caller can
-        // hand us more than MaxInnerPayload + trailer, so this never grows unbounded (REVIEW-fix P1).
+        // hand us more than MaxInnerPayload + trailer, so this never grows unbounded.
         private static void EnsureOut(int need)
         {
             int max = MaxInnerPayload + OriginTrailerLen;
@@ -402,24 +400,21 @@ namespace IronNestVR
         }
 
         // Host-only: push a one-time authoritative snapshot of the whole shared world to a freshly-joined peer.
-        // Each subsystem re-sends its current state; the joiner applies it idempotently. NOTE: at the 2-player
-        // cap the host has a single peer, so the subsystems' broadcast Send reaches exactly the joiner. Threading
-        // a per-peer target (SendTo) through every SendSnapshot is the cap-lift follow-up (PLAN.md §3A / §2.4).
+        // Each subsystem re-sends its current state; the joiner applies it idempotently.
         private static void SendJoinSnapshot()
         {
             if (_peers.Count == 0 || !IsHost) return;
             Log.LogInfo($"[p2p] host: sending join-in-progress snapshot to {_snapTarget.m_SteamID}");
             // Redirect every subsystem snapshot send to the JOINER only — a late-join catch-up must not replay
-            // onto the existing clients and snap their turret/clipboard/mission state (PLAN.md §2.4 / §3A). The
-            // subsystems still call CoopP2P.Send; while _snapActive the host unicasts it to _snapTarget. At the
-            // 2-player cap the lone peer is the joiner, so this is identical to the old broadcast.
+            // onto the existing clients and snap their turret/clipboard/mission state. The
+            // subsystems still call CoopP2P.Send; while _snapActive the host unicasts it to _snapTarget.
             _snapActive = true;
             try
             {
                 // Scene/load command FIRST so the joiner starts traversing toward the host's phase. The cockpit-
                 // dependent snapshots below (controls/map/punchcards) can't apply until the joiner has loaded the
-                // mission scene, so they're ALSO re-sent on the joiner's MISSION_READY ack (CoopScene) — see
-                // REVIEW-fix P2: map/punchcard layout arriving before the joiner has the scene objects was dropped.
+                // mission scene, so they're ALSO re-sent on the joiner's MISSION_READY ack (CoopScene)
+                // (map/punchcard layout arriving before the joiner has the scene objects is dropped).
                 try { CoopScene.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot scene: " + e.Message); }   // mission-load command first
                 try { CoopControls.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot ctrl: " + e.Message); }
                 try { CoopClipboard.SendSnapshot(); } catch (Exception e) { Log.LogWarning("[p2p] snapshot clip: " + e.Message); }
@@ -434,8 +429,7 @@ namespace IronNestVR
 
         // Host-only: run a subsystem snapshot send targeted to ONE peer instead of broadcast, by reusing the JIP
         // unicast latch. A MISSION_READY resync must reach only the joiner that asked, not re-burst every existing
-        // client (REVIEW-fix P2a). At the 2-player cap the lone peer is the target, so this is identical to the old
-        // broadcast; in loopback (single peer) targeting is moot. Re-entrancy-safe via save/restore.
+        // client. Re-entrancy-safe via save/restore.
         public static void SendSnapshotTo(ulong peer, Action sendAction)
         {
             if (!IsHost || sendAction == null) return;
@@ -520,8 +514,7 @@ namespace IronNestVR
 
         // Host relay: re-broadcast a client-authored packet (sitting in _recvArr[0..len]) to every OTHER client,
         // stamped with the original sender's id. Fired from Deliver (= at NetSim release), never at raw receive,
-        // so the host's local apply and its relay are ordered from the same event (PLAN.md §8.2). Dormant at the
-        // 2-player cap (the only peer == origin → excluded). The high-rate streams (pose / dial value / turret
+        // so the host's local apply and its relay are ordered from the same event. The high-rate streams (pose / dial value / turret
         // group / map drag / entity move) relay UNRELIABLE so they don't head-of-line-block; everything else
         // (grab/release/click/fire/snapshots/edits) relays reliable.
         private static void RelayInner(ulong origin, int innerLen)
@@ -530,7 +523,7 @@ namespace IronNestVR
             bool reliable;
             if (type == MSG_POSE) reliable = false;
             // Mixed live/final types carry their own reliability in a flag byte at payload index 9: relay the
-            // final/release edge reliably, the live stream unreliably (REVIEW-fix P1 — type-only classification
+            // final/release edge reliably, the live stream unreliably (type-only classification
             // downgraded the reliable final and a dropped final left the piece/dial stuck off on other clients).
             else if (CoopControls.IsMixedFinalStream(type)) reliable = innerLen > 9 && (_recvArr[9] & 1) != 0;
             else reliable = !CoopControls.IsUnreliableStream(type);
@@ -541,7 +534,7 @@ namespace IronNestVR
             }
         }
 
-        // Transport-boundary enforcement of the shared max-payload invariant (REVIEW-fix P1). EVERY send funnels
+        // Transport-boundary enforcement of the shared max-payload invariant. EVERY send funnels
         // through RawSendTrailer or RawSendPlain, so guarding both makes it IMPOSSIBLE for any subsystem to put an
         // inner packet larger than MaxInnerPayload (or empty) on the wire — the receiver's _recvArr is sized to
         // exactly that + the trailer. Rejected sends log a throttled warning carrying the packet type and length.
@@ -657,8 +650,7 @@ namespace IronNestVR
 
         // NetSim release path (test aid): copy a delayed managed packet back into _recvArr and run it through the
         // SAME deliver path. The packet's REAL origin (captured at ingest from the Steam `from`) is threaded through
-        // CoopNetSim, so a delayed/reordered packet is attributed to its true sender even at the >2 cap (REVIEW-fix
-        // P2 — the old code used PrimaryRemoteOrigin(), which is only correct with a single peer).
+        // CoopNetSim, so a delayed/reordered packet is attributed to its true sender even with more than one peer.
         private static void DispatchManaged(byte[] data, int len, ulong origin)
         {
             if (data == null || len < 1 || len > _recvArr.Length) return;
@@ -668,7 +660,7 @@ namespace IronNestVR
 
         // The single remote peer's id (host: the one client; client: the host). Used only by the same-machine
         // loopback test link, which is single-peer by construction; the real Steam + NetSim paths thread the
-        // true per-sender origin (REVIEW-fix P2), so this is no longer on any multi-peer attribution path.
+        // true per-sender origin, so this is no longer on any multi-peer attribution path.
         private static ulong PrimaryRemoteOrigin()
             => IsHost ? (_peers.Count > 0 ? _peers[0].m_SteamID : 0UL) : _hostId.m_SteamID;
 
@@ -696,7 +688,7 @@ namespace IronNestVR
             {
                 // In the star topology only the host sends host→client packets (carrying the origin trailer). Drop
                 // anything from another lobby member so a buggy/malicious peer can't inject a host-formatted packet
-                // with a forged origin trailer (REVIEW-fix P3). Loopback/NetSim pass _hostId here, so they pass.
+                // with a forged origin trailer. Loopback/NetSim pass _hostId here, so they pass.
                 if (hostSideOrigin != _hostId.m_SteamID) return;
                 if (read < OriginTrailerLen) return;       // malformed — must carry the origin trailer
                 innerLen = read - OriginTrailerLen;
@@ -716,8 +708,8 @@ namespace IronNestVR
             DispatchPacket(origin, (uint)innerLen);
         }
 
-        // Parse one inner packet in _recvArr (length = read). Pose populates the single-slot remote-avatar block
-        // (Phase B keys it per-origin); every other type byte fans out via CoopControls.OnPacket.
+        // Parse one inner packet in _recvArr (length = read). Pose populates the per-origin remote-avatar block;
+        // every other type byte fans out via CoopControls.OnPacket.
         private static void DispatchPacket(ulong origin, uint read)
         {
             if (read < 1) return;
