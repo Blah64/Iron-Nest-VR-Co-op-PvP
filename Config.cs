@@ -32,6 +32,22 @@ namespace IronNestVR
         // How often (seconds) to retry OpenXR init while no headset/runtime is available yet.
         public const float XrRetryIntervalSec = 5f;
 
+        // Master switch for VR bring-up. When false the mod NEVER attempts OpenXR init — the game runs purely
+        // flatscreen (exactly like unmodded, per the flatscreen-parity rule) with zero XR cost. For players who
+        // have a headset runtime installed but registered-and-idle (SteamVR/WMR/Varjo not running), which makes
+        // xrCreateInstance block on every retry (see XrRetryMaxIntervalSec), and who just want to play on the monitor.
+        public static bool VrEnabled = true;
+
+        // When xrCreateInstance itself keeps FAILING (a runtime is registered as the active OpenXR runtime but
+        // reports ErrorRuntimeUnavailable — e.g. SteamVR/WMR/Varjo installed but not running), the loader must load
+        // the runtime DLL and negotiate before returning the error, which BLOCKS the main thread ~1-2s per attempt.
+        // Retrying that at the flat XrRetryIntervalSec hitches a flatscreen player every few seconds (breaking
+        // flatscreen parity). So instance-level failures back off exponentially up to this cap, then give up for the
+        // session after XrInstanceFailLimit attempts. (The cheap "no HMD yet" case — instance up, xrGetSystem failing
+        // — keeps the fast XrRetryIntervalSec cadence, so a headset plugged in later still comes up.)
+        public const float XrRetryMaxIntervalSec = 30f;
+        public const int XrInstanceFailLimit = 5;
+
         // VR fallback: how many CONSECUTIVE failing frames (xrWaitFrame returning a runtime error, not a
         // benign not-yet-visible frame) we tolerate before abandoning VR and dropping to flatscreen for the
         // rest of the session. A present-but-broken runtime (headset not actually streaming) makes xrWaitFrame
@@ -866,6 +882,7 @@ namespace IronNestVR
                 WF(sb, "SwitchThrowDistance", SwitchThrowDistance);
                 WF(sb, "SwitchRotateActivateDegrees", SwitchRotateActivateDegrees);
                 SwitchMotions.Save(sb);   // one "SwitchMotion=" line per per-switch motion that's been tuned/seeded
+                WB(sb, "VrEnabled", VrEnabled);
                 WB(sb, "PopupVrEnabled", PopupVrEnabled);
                 WV(sb, "ClipWaistOffset", ClipWaistOffset);
                 WV(sb, "ClipWaistEuler", ClipWaistEuler);
@@ -1042,6 +1059,7 @@ namespace IronNestVR
                 case "FingerCurlAxis": FingerCurlAxis = PI(v, FingerCurlAxis); break;
                 case "FingerCurlSign": FingerCurlSign = PF(v, FingerCurlSign); break;
                 case "SwitchGrabEnabled": SwitchGrabEnabled = PB(v, SwitchGrabEnabled); break;
+                case "VrEnabled": VrEnabled = PB(v, VrEnabled); break;
                 case "PopupVrEnabled": PopupVrEnabled = PB(v, PopupVrEnabled); break;
                 case "SwitchThrowDistance": SwitchThrowDistance = PF(v, SwitchThrowDistance); break;
                 case "SwitchRotateActivateDegrees": SwitchRotateActivateDegrees = PF(v, SwitchRotateActivateDegrees); break;

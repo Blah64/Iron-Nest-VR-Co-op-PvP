@@ -36,8 +36,10 @@ namespace IronNestVR
         private bool _xrReady;
         private bool _frameActive;   // this frame's input-active state, cached for LateUpdate re-application
         private float _nextXrTry;
+        private float _xrRetryDelay = Config.XrRetryIntervalSec;   // gap until the next init attempt; grows on instance-level (runtime-unavailable) failure
+        private int _xrInstanceFailStreak;   // consecutive xrCreateInstance-level failures (runtime registered but not up)
         private int _frameFailStreak;   // consecutive failing frames (xrWaitFrame runtime error)
-        private bool _vrAbandoned;      // VR came up but the runtime kept erroring per-frame → flatscreen for the rest of this session
+        private bool _vrAbandoned;      // VR abandoned for the rest of this session (runtime kept erroring, per-frame once up OR on every init retry) → flatscreen
         private string _lastError;
         private float _nextErrLog;
         private float _nextPoseLog;
@@ -476,15 +478,17 @@ namespace IronNestVR
 
             if (!_xrReady)
             {
-                // VR was abandoned after the runtime kept failing per-frame: stay flatscreen for the rest of
-                // the session. Re-initialising would recreate the same session and re-enter the freeze, so we
-                // do NOT retry here (unlike the no-headset case below, where init quietly fails and VR can
-                // still come up later if a headset appears).
-                if (_vrAbandoned) return;
+                // VR was abandoned after the runtime kept failing (per-frame once up, OR xrCreateInstance blocking
+                // and failing on every init retry): stay flatscreen for the rest of the session. Re-initialising
+                // would re-enter the same freeze, so we do NOT retry. VrEnabled=false skips VR bring-up entirely
+                // (pure flatscreen, zero XR cost). The no-HMD case still retries below (a headset may appear later).
+                if (_vrAbandoned || !Config.VrEnabled) return;
                 if (Time.unscaledTime >= _nextXrTry)
                 {
-                    _nextXrTry = Time.unscaledTime + Config.XrRetryIntervalSec;
+                    // Schedule AFTER the attempt: TryInitVr grows _xrRetryDelay on an instance-level failure so a
+                    // registered-but-idle runtime (each attempt blocks ~1-2s) doesn't hitch flatscreen every 5s.
                     TryInitVr();
+                    _nextXrTry = Time.unscaledTime + _xrRetryDelay;
                 }
                 return;
             }
@@ -670,7 +674,7 @@ namespace IronNestVR
                 if (!_bridgeOk)
                 {
                     _bridge ??= new D3D11Bridge();
-                    if (!_bridge.TryInit(out var berr)) { ReportRetry("D3D11: " + berr); return; }
+                    if (!_bridge.TryInit(out var berr)) { ReportRetry("D3D11: " + berr); BackOffInstanceRetry(); return; }
                     _bridgeOk = true;
                     Log.LogInfo($"D3D11 device acquired. Adapter LUID 0x{_bridge.AdapterLuid:X}.");
                 }
@@ -682,6 +686,12 @@ namespace IronNestVR
                 if (!_xr.TryInitialize(_bridge, out var xerr))
                 {
                     ReportRetry("OpenXR: " + xerr);
+                    // No instance yet ⇒ loader/runtime-level failure (xrCreateInstance blocking then returning
+                    // ErrorRuntimeUnavailable, openxr_loader.dll missing, D3D11 ext not offered). Slow (~1-2s
+                    // main-thread block) and won't clear in 5s → back off. An instance that's up but only fails
+                    // xrGetSystem is the cheap "no HMD yet" case → keep the fast cadence so a later plug-in works.
+                    if (_xr.InstanceReady) _xrRetryDelay = Config.XrRetryIntervalSec;
+                    else BackOffInstanceRetry();
                     return;
                 }
 
@@ -702,6 +712,8 @@ namespace IronNestVR
                 _prevChord = false;
                 _appliedRenderScale = Config.RenderScale;
                 _frameFailStreak = 0;
+                _xrInstanceFailStreak = 0;
+                _xrRetryDelay = Config.XrRetryIntervalSec;
                 _xrReady = true;
                 LobbyGui.Shown = false;   // VR uses the in-headset menu page, not the flatscreen panel
                 _lastError = null;
@@ -712,7 +724,27 @@ namespace IronNestVR
             catch (Exception e)
             {
                 ReportRetry("init exception: " + e.Message);
+                BackOffInstanceRetry();
             }
+        }
+
+        // An instance-level init failure (runtime registered but unavailable, loader missing, D3D device failure)
+        // blocks the main thread ~1-2s per attempt. Grow the gap between attempts exponentially so a flatscreen
+        // player isn't hitched every few seconds, and give up entirely after XrInstanceFailLimit tries — staying
+        // flatscreen for the session (bringing a headset+runtime up mid-session then needs a game restart, matching
+        // the _vrAbandoned semantics). The cheap "no HMD yet" retry never comes here, so plugging in a headset while
+        // the runtime IS up still works at the fast cadence.
+        private void BackOffInstanceRetry()
+        {
+            if (++_xrInstanceFailStreak >= Config.XrInstanceFailLimit)
+            {
+                _vrAbandoned = true;
+                Log.LogInfo($"[vr-init] OpenXR runtime still unavailable after {_xrInstanceFailStreak} attempts — staying " +
+                            "flatscreen for this session. Start your headset's OpenXR runtime before launch, or set " +
+                            "VrEnabled=false in IronNestVR.cfg to skip VR bring-up (removes the periodic init stall).");
+                return;
+            }
+            _xrRetryDelay = Mathf.Min(_xrRetryDelay * 2f, Config.XrRetryMaxIntervalSec);
         }
 
         // Avoid log spam: print a retry reason only when it changes or every ~30s.

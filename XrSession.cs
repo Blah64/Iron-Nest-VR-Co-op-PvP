@@ -118,6 +118,12 @@ namespace IronNestVR
 
         private bool _instanceReady;
 
+        /// <summary>True once the OpenXR instance + D3D11 extension are created (done exactly once). While this is
+        /// false, a failed <see cref="TryInitialize"/> is a loader/runtime-level failure — the EXPENSIVE path
+        /// (xrCreateInstance can block ~1-2s before returning ErrorRuntimeUnavailable). Once true, a later failure
+        /// is only the cheap xrGetSystem "no HMD yet" retry, which is safe to poll fast.</summary>
+        public bool InstanceReady => _instanceReady;
+
         /// <summary>
         /// Resumable init. The instance + extensions are created exactly once; if no HMD is present
         /// yet, only <c>xrGetSystem</c> is retried on later calls. This avoids destroying/recreating
